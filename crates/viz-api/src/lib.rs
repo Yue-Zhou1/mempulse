@@ -1,14 +1,15 @@
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
-use replay::{replay_frames, ReplayMode};
+use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use storage::{EventStore, InMemoryStorage, TxFeaturesRecord};
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -112,12 +113,18 @@ impl VizDataProvider for InMemoryVizProvider {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS])
+        .allow_headers(Any);
+
     Router::new()
         .route("/health", get(health))
         .route("/replay", get(replay))
         .route("/propagation", get(propagation))
         .route("/features", get(features))
         .route("/stream", get(stream))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -245,8 +252,10 @@ async fn handle_socket(mut socket: WebSocket, hello: StreamHello) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use axum::http::header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN};
+    use axum::http::{HeaderValue, Method};
     use tower::util::ServiceExt;
 
     #[derive(Clone)]
@@ -303,7 +312,12 @@ mod tests {
         let app = build_router(test_state(100));
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -318,7 +332,12 @@ mod tests {
         let app = build_router(test_state(2));
 
         let response = app
-            .oneshot(Request::builder().uri("/replay").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -328,5 +347,31 @@ mod tests {
         assert_eq!(payload.len(), 2);
         assert_eq!(payload[0].seq_hi, 1);
         assert_eq!(payload[1].seq_hi, 3);
+    }
+
+    #[tokio::test]
+    async fn replay_preflight_returns_cors_headers() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/replay")
+                    .header("origin", "http://127.0.0.1:5173")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let origin = response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN);
+        assert!(origin.is_some(), "missing access-control-allow-origin");
+        assert_eq!(origin, Some(&HeaderValue::from_static("*")));
+
+        let methods = response.headers().get(ACCESS_CONTROL_ALLOW_METHODS);
+        assert!(methods.is_some(), "missing access-control-allow-methods");
     }
 }
