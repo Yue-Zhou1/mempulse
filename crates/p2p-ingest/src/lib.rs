@@ -20,6 +20,8 @@ pub struct P2pMetrics {
     pub announcements_total: u64,
     pub duplicates_dropped_total: u64,
     pub queue_dropped_total: u64,
+    pub queue_depth_current: usize,
+    pub queue_depth_peak: usize,
     pub tx_full_received_total: u64,
     pub tx_decode_emitted_total: u64,
 }
@@ -113,6 +115,8 @@ impl P2pIngestService {
                 peer_id: peer_id.clone(),
                 hashes: vec![hash],
             });
+            self.metrics.queue_depth_current = self.fetch_queue.len();
+            self.metrics.queue_depth_peak = self.metrics.queue_depth_peak.max(self.fetch_queue.len());
             events.push(self.new_event(
                 now_unix_ms,
                 now_mono_ns,
@@ -129,7 +133,9 @@ impl P2pIngestService {
     }
 
     pub fn dequeue_get_pooled_transactions(&mut self) -> Option<GetPooledTransactionsRequest> {
-        self.fetch_queue.pop_front()
+        let request = self.fetch_queue.pop_front();
+        self.metrics.queue_depth_current = self.fetch_queue.len();
+        request
     }
 
     pub fn handle_pooled_transactions(
@@ -303,5 +309,28 @@ mod tests {
         assert_eq!(service.metrics().tx_decode_emitted_total, 1);
         assert!(matches!(events[0].payload, EventPayload::TxFetched(_)));
         assert!(matches!(events[1].payload, EventPayload::TxDecoded(_)));
+    }
+
+    #[test]
+    fn burst_load_updates_queue_depth_and_drop_counters() {
+        let mut service = P2pIngestService::new(
+            P2pIngestConfig {
+                fetch_queue_capacity: 3,
+            },
+            SourceId::new("p2p"),
+        );
+
+        let hashes: Vec<TxHash> = (1_u8..=8_u8).map(hash).collect();
+        let events = service.handle_new_pooled_transaction_hashes(
+            "peer-burst".to_owned(),
+            hashes,
+            1_700_000_000_000,
+            10,
+        );
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(service.metrics().queue_depth_peak, 3);
+        assert_eq!(service.metrics().queue_depth_current, 3);
+        assert_eq!(service.metrics().queue_dropped_total, 5);
     }
 }
