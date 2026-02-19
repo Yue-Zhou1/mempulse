@@ -1,23 +1,51 @@
+use ahash::RandomState;
 use common::{Address, BlockHash, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxReorged};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
+
+type FastMap<K, V> = HashMap<K, V, RandomState>;
+type FastSet<T> = HashSet<T, RandomState>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TxLifecycleStatus {
     Pending,
-    Replaced { by: TxHash },
-    Dropped { reason: String },
-    ConfirmedProvisional { block_number: u64, block_hash: BlockHash },
-    ConfirmedFinal { block_number: u64, block_hash: BlockHash },
+    Replaced {
+        by: TxHash,
+    },
+    Dropped {
+        reason: String,
+    },
+    ConfirmedProvisional {
+        block_number: u64,
+        block_hash: BlockHash,
+    },
+    ConfirmedFinal {
+        block_number: u64,
+        block_hash: BlockHash,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateTransition {
-    Pending { hash: TxHash },
-    Replaced { old_hash: TxHash, new_hash: TxHash },
-    Dropped { hash: TxHash, reason: String },
-    ConfirmedProvisional { hash: TxHash, block_hash: BlockHash },
-    ConfirmedFinal { hash: TxHash, block_hash: BlockHash },
+    Pending {
+        hash: TxHash,
+    },
+    Replaced {
+        old_hash: TxHash,
+        new_hash: TxHash,
+    },
+    Dropped {
+        hash: TxHash,
+        reason: String,
+    },
+    ConfirmedProvisional {
+        hash: TxHash,
+        block_hash: BlockHash,
+    },
+    ConfirmedFinal {
+        hash: TxHash,
+        block_hash: BlockHash,
+    },
     ReorgReopened {
         hash: TxHash,
         old_block_hash: BlockHash,
@@ -34,9 +62,9 @@ struct TxEntry {
 
 #[derive(Clone, Debug, Default)]
 pub struct MempoolState {
-    txs: HashMap<TxHash, TxEntry>,
-    sender_nonce_index: HashMap<(Address, u64), TxHash>,
-    block_confirmations: HashMap<BlockHash, HashSet<TxHash>>,
+    txs: FastMap<TxHash, TxEntry>,
+    sender_nonce_index: FastMap<(Address, u64), TxHash>,
+    block_confirmations: FastMap<BlockHash, FastSet<TxHash>>,
 }
 
 impl MempoolState {

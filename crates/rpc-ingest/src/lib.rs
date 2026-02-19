@@ -1,8 +1,26 @@
+use ahash::RandomState;
 use anyhow::Result;
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
-use std::collections::{HashMap, HashSet, VecDeque};
+use hashbrown::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+type FastMap<K, V> = HashMap<K, V, RandomState>;
+type FastSet<T> = HashSet<T, RandomState>;
+
+#[derive(Clone, Debug)]
+pub struct RpcIngestConfig {
+    pub max_seen_hashes: usize,
+}
+
+impl Default for RpcIngestConfig {
+    fn default() -> Self {
+        Self {
+            max_seen_hashes: 250_000,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RawTransaction {
@@ -50,7 +68,9 @@ pub struct RpcIngestService<P, C> {
     provider: P,
     clock: C,
     source_id: SourceId,
-    seen_hashes: HashSet<TxHash>,
+    config: RpcIngestConfig,
+    seen_hashes: FastSet<TxHash>,
+    seen_order: VecDeque<TxHash>,
     next_seq_id: u64,
 }
 
@@ -60,11 +80,24 @@ where
     C: IngestClock,
 {
     pub fn new(provider: P, source_id: SourceId, clock: C) -> Self {
+        Self::with_config(provider, source_id, clock, RpcIngestConfig::default())
+    }
+
+    pub fn with_config(
+        provider: P,
+        source_id: SourceId,
+        clock: C,
+        config: RpcIngestConfig,
+    ) -> Self {
         Self {
             provider,
             clock,
             source_id,
-            seen_hashes: HashSet::new(),
+            config: RpcIngestConfig {
+                max_seen_hashes: config.max_seen_hashes.max(1),
+            },
+            seen_hashes: FastSet::default(),
+            seen_order: VecDeque::new(),
             next_seq_id: 1,
         }
     }
@@ -74,7 +107,7 @@ where
         let hashes = self.provider.pending_hashes()?;
 
         for hash in hashes {
-            if !self.seen_hashes.insert(hash) {
+            if !self.remember_hash(hash) {
                 continue;
             }
 
@@ -105,6 +138,20 @@ where
         Ok(events)
     }
 
+    fn remember_hash(&mut self, hash: TxHash) -> bool {
+        if !self.seen_hashes.insert(hash) {
+            return false;
+        }
+        self.seen_order.push_back(hash);
+
+        while self.seen_order.len() > self.config.max_seen_hashes {
+            if let Some(oldest) = self.seen_order.pop_front() {
+                self.seen_hashes.remove(&oldest);
+            }
+        }
+        true
+    }
+
     fn new_event(&mut self, payload: EventPayload) -> EventEnvelope {
         let seq_id = self.next_seq_id;
         self.next_seq_id += 1;
@@ -121,7 +168,7 @@ where
 
 pub struct InMemoryPendingTxProvider {
     batches: VecDeque<Vec<TxHash>>,
-    tx_by_hash: HashMap<TxHash, RawTransaction>,
+    tx_by_hash: FastMap<TxHash, RawTransaction>,
 }
 
 impl InMemoryPendingTxProvider {
@@ -228,5 +275,34 @@ mod tests {
             .collect();
 
         assert_eq!(second_seen, vec![hash(8)]);
+    }
+
+    #[test]
+    fn evicts_old_seen_hashes_when_cache_capacity_is_reached() {
+        let provider = InMemoryPendingTxProvider::new(
+            vec![vec![hash(1)], vec![hash(2)], vec![hash(3)], vec![hash(1)]],
+            vec![tx(1, 2), tx(2, 2), tx(3, 2)],
+        );
+        let clock = StepClock::default();
+        let mut service = RpcIngestService::with_config(
+            provider,
+            SourceId::new("rpc-mainnet"),
+            clock,
+            RpcIngestConfig { max_seen_hashes: 2 },
+        );
+
+        service.process_pending_batch().expect("batch one");
+        service.process_pending_batch().expect("batch two");
+        service.process_pending_batch().expect("batch three");
+        let fourth_batch = service.process_pending_batch().expect("batch four");
+
+        let seen_hashes: Vec<TxHash> = fourth_batch
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::TxSeen(seen) => Some(seen.hash),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen_hashes, vec![hash(1)]);
     }
 }

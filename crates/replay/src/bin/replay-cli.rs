@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use event_log::EventEnvelope;
-use replay::{replay_frames, ReplayMode};
+use replay::{ReplayMode, replay_frames};
 use std::env;
 use std::fs;
 
@@ -36,9 +36,7 @@ fn run_with_args(args: &[String]) -> Result<()> {
             }
             "--stride" => {
                 i += 1;
-                let raw = args
-                    .get(i)
-                    .context("--stride requires a numeric value")?;
+                let raw = args.get(i).context("--stride requires a numeric value")?;
                 stride = raw.parse::<usize>().context("invalid --stride value")?;
             }
             unknown => {

@@ -136,9 +136,11 @@ fn normalize_fees(input: &RawTxInput) -> Result<NormalizedFees, DecodeError> {
             let max_fee = input.max_fee_per_gas.ok_or(DecodeError::MissingFeeField {
                 field: "max_fee_per_gas",
             })?;
-            let priority = input.max_priority_fee_per_gas.ok_or(DecodeError::MissingFeeField {
-                field: "max_priority_fee_per_gas",
-            })?;
+            let priority = input
+                .max_priority_fee_per_gas
+                .ok_or(DecodeError::MissingFeeField {
+                    field: "max_priority_fee_per_gas",
+                })?;
             Ok(NormalizedFees {
                 gas_price: None,
                 max_fee_per_gas: Some(max_fee),
@@ -150,9 +152,11 @@ fn normalize_fees(input: &RawTxInput) -> Result<NormalizedFees, DecodeError> {
             let max_fee = input.max_fee_per_gas.ok_or(DecodeError::MissingFeeField {
                 field: "max_fee_per_gas",
             })?;
-            let priority = input.max_priority_fee_per_gas.ok_or(DecodeError::MissingFeeField {
-                field: "max_priority_fee_per_gas",
-            })?;
+            let priority = input
+                .max_priority_fee_per_gas
+                .ok_or(DecodeError::MissingFeeField {
+                    field: "max_priority_fee_per_gas",
+                })?;
             let blob_fee = input
                 .max_fee_per_blob_gas
                 .ok_or(DecodeError::MissingFeeField {

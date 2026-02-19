@@ -10,10 +10,12 @@ use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use storage::{EventStore, InMemoryStorage, TxFeaturesRecord};
+use storage::{
+    ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, NoopClickHouseSink,
+    StorageWriteHandle, StorageWriteOp, StorageWriterConfig, TxFeaturesRecord, spawn_single_writer,
+};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
@@ -101,7 +103,7 @@ impl VizDataProvider for InMemoryVizProvider {
             .storage
             .read()
             .ok()
-            .map(|storage| storage.list_events().to_vec())
+            .map(|storage| storage.list_events())
             .unwrap_or_default();
 
         replay_frames(
@@ -141,38 +143,24 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary> {
-        let events = self
-            .storage
+        self.storage
             .read()
             .ok()
-            .map(|storage| storage.list_events().to_vec())
-            .unwrap_or_default();
-
-        let mut out = Vec::new();
-        let mut seen_hashes = HashSet::new();
-
-        for event in events.iter().rev() {
-            let decoded = match &event.payload {
-                EventPayload::TxDecoded(decoded) => decoded,
-                _ => continue,
-            };
-            if !seen_hashes.insert(decoded.hash) {
-                continue;
-            }
-            out.push(TransactionSummary {
-                hash: format_bytes(&decoded.hash),
-                sender: format_bytes(&decoded.sender),
-                nonce: decoded.nonce,
-                tx_type: decoded.tx_type,
-                seen_unix_ms: event.ingest_ts_unix_ms,
-                source_id: event.source_id.0.clone(),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-
-        out
+            .map(|storage| {
+                storage
+                    .recent_transactions(limit)
+                    .into_iter()
+                    .map(|tx| TransactionSummary {
+                        hash: format_bytes(&tx.hash),
+                        sender: format_bytes(&tx.sender),
+                        nonce: tx.nonce,
+                        tx_type: tx.tx_type,
+                        seen_unix_ms: tx.seen_unix_ms,
+                        source_id: tx.source_id,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -195,6 +183,15 @@ pub fn build_router(state: AppState) -> Router {
 
 pub fn default_state() -> AppState {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
+        Ok(Some(sink)) => Arc::new(sink),
+        Ok(None) => Arc::new(NoopClickHouseSink),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to initialize clickhouse sink, falling back to noop sink");
+            Arc::new(NoopClickHouseSink)
+        }
+    };
+    let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
     let live_rpc_config = LiveRpcConfig::from_env();
     if live_rpc_config.is_none() {
         if let Ok(mut store) = storage.write() {
@@ -224,9 +221,9 @@ pub fn default_state() -> AppState {
         },
     ];
     if let Some(config) = live_rpc_config {
-        start_live_rpc_feed(storage.clone(), config);
+        start_live_rpc_feed(storage.clone(), writer.clone(), config);
     } else {
-        start_demo_event_feed(storage.clone());
+        start_demo_event_feed(storage.clone(), writer.clone());
     }
 
     AppState {
@@ -250,19 +247,27 @@ fn seed_decoded_event(seq_id: u64, hash_seed: u64, nonce: u64) -> EventEnvelope 
     }
 }
 
-fn start_demo_event_feed(storage: Arc<RwLock<InMemoryStorage>>) {
+fn start_demo_event_feed(storage: Arc<RwLock<InMemoryStorage>>, writer: StorageWriteHandle) {
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
         Err(_) => return,
     };
+
+    let start_seq = storage
+        .read()
+        .ok()
+        .and_then(|store| store.latest_seq_id())
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
 
     handle.spawn(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
         );
-        let mut seq_id = 3_u64;
-        let mut nonce = 3_u64;
+        let mut seq_id = start_seq;
+        let mut nonce = start_seq;
 
         loop {
             ticker.tick().await;
@@ -275,11 +280,7 @@ fn start_demo_event_feed(storage: Arc<RwLock<InMemoryStorage>>) {
             let category = if seq_id % 3 == 0 { "arb" } else { "swap" };
             let score = 50 + ((seq_id % 45) as u16);
 
-            let mut store = match storage.write() {
-                Ok(store) => store,
-                Err(_) => break,
-            };
-            store.append_event(EventEnvelope {
+            let event = EventEnvelope {
                 seq_id,
                 ingest_ts_unix_ms: current_unix_ms(),
                 ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
@@ -290,19 +291,31 @@ fn start_demo_event_feed(storage: Arc<RwLock<InMemoryStorage>>) {
                     sender: [9; 20],
                     nonce,
                 }),
-            });
-            store.upsert_tx_features(TxFeaturesRecord {
-                hash,
-                protocol: protocol.to_owned(),
-                category: category.to_owned(),
-                mev_score: score,
-            });
+            };
+            if writer
+                .enqueue(StorageWriteOp::AppendEvent(event))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if writer
+                .enqueue(StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
+                    hash,
+                    protocol: protocol.to_owned(),
+                    category: category.to_owned(),
+                    mev_score: score,
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
             seq_id = seq_id.saturating_add(1);
             nonce = nonce.saturating_add(1);
         }
     });
 }
-
 fn hash_from_seq(seq: u64) -> [u8; 32] {
     let mut hash = [0_u8; 32];
     hash[..8].copy_from_slice(&seq.to_be_bytes());
@@ -583,5 +596,24 @@ mod tests {
         let payload: Vec<TransactionSummary> = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0].hash, "0x01");
+    }
+
+    #[test]
+    fn in_memory_provider_recent_transactions_are_latest_first_and_deduped() {
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        {
+            let mut guard = storage.write().expect("write lock");
+            guard.append_event(seed_decoded_event(1, 1, 1));
+            guard.append_event(seed_decoded_event(2, 2, 2));
+            // Same hash as seq 1, newer nonce should replace previous recent-tx record.
+            guard.append_event(seed_decoded_event(3, 1, 3));
+        }
+
+        let provider = InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1);
+        let recent = provider.recent_transactions(10);
+
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].nonce, 3);
+        assert_eq!(recent[1].nonce, 2);
     }
 }

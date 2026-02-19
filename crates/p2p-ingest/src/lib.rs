@@ -1,16 +1,22 @@
+use ahash::RandomState;
 use common::{PeerId, SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
-use std::collections::{HashMap, HashSet, VecDeque};
+use hashbrown::HashMap;
+use std::collections::VecDeque;
+
+type FastMap<K, V> = HashMap<K, V, RandomState>;
 
 #[derive(Clone, Debug)]
 pub struct P2pIngestConfig {
     pub fetch_queue_capacity: usize,
+    pub max_seen_hashes: usize,
 }
 
 impl Default for P2pIngestConfig {
     fn default() -> Self {
         Self {
             fetch_queue_capacity: 4_096,
+            max_seen_hashes: 250_000,
         }
     }
 }
@@ -57,23 +63,26 @@ pub struct P2pIngestService {
     config: P2pIngestConfig,
     source_id: SourceId,
     seq_id: u64,
-    seen_hashes: HashSet<TxHash>,
-    first_seen: HashMap<TxHash, FirstSeen>,
+    first_seen: FastMap<TxHash, FirstSeen>,
+    seen_order: VecDeque<TxHash>,
     fetch_queue: VecDeque<GetPooledTransactionsRequest>,
-    propagation_delays_by_peer: HashMap<PeerId, Vec<u32>>,
+    propagation_delays_by_peer: FastMap<PeerId, Vec<u32>>,
     metrics: P2pMetrics,
 }
 
 impl P2pIngestService {
     pub fn new(config: P2pIngestConfig, source_id: SourceId) -> Self {
         Self {
-            config,
+            config: P2pIngestConfig {
+                fetch_queue_capacity: config.fetch_queue_capacity.max(1),
+                max_seen_hashes: config.max_seen_hashes.max(1),
+            },
             source_id,
             seq_id: 1,
-            seen_hashes: HashSet::new(),
-            first_seen: HashMap::new(),
+            first_seen: FastMap::default(),
+            seen_order: VecDeque::new(),
             fetch_queue: VecDeque::new(),
-            propagation_delays_by_peer: HashMap::new(),
+            propagation_delays_by_peer: FastMap::default(),
             metrics: P2pMetrics::default(),
         }
     }
@@ -104,19 +113,14 @@ impl P2pIngestService {
                 continue;
             }
 
-            self.seen_hashes.insert(hash);
-            self.first_seen.insert(
-                hash,
-                FirstSeen {
-                    unix_ms: now_unix_ms,
-                },
-            );
+            self.remember_hash(hash, now_unix_ms);
             self.fetch_queue.push_back(GetPooledTransactionsRequest {
                 peer_id: peer_id.clone(),
                 hashes: vec![hash],
             });
             self.metrics.queue_depth_current = self.fetch_queue.len();
-            self.metrics.queue_depth_peak = self.metrics.queue_depth_peak.max(self.fetch_queue.len());
+            self.metrics.queue_depth_peak =
+                self.metrics.queue_depth_peak.max(self.fetch_queue.len());
             events.push(self.new_event(
                 now_unix_ms,
                 now_mono_ns,
@@ -130,6 +134,22 @@ impl P2pIngestService {
         }
 
         events
+    }
+
+    fn remember_hash(&mut self, hash: TxHash, now_unix_ms: i64) {
+        self.first_seen.insert(
+            hash,
+            FirstSeen {
+                unix_ms: now_unix_ms,
+            },
+        );
+        self.seen_order.push_back(hash);
+
+        while self.seen_order.len() > self.config.max_seen_hashes {
+            if let Some(oldest) = self.seen_order.pop_front() {
+                self.first_seen.remove(&oldest);
+            }
+        }
     }
 
     pub fn dequeue_get_pooled_transactions(&mut self) -> Option<GetPooledTransactionsRequest> {
@@ -171,7 +191,7 @@ impl P2pIngestService {
         events
     }
 
-    pub fn propagation_stats_by_peer(&self) -> HashMap<PeerId, PropagationStats> {
+    pub fn propagation_stats_by_peer(&self) -> FastMap<PeerId, PropagationStats> {
         self.propagation_delays_by_peer
             .iter()
             .map(|(peer, delays)| {
@@ -181,7 +201,8 @@ impl P2pIngestService {
                 let avg_delay_ms = if sorted.is_empty() {
                     0
                 } else {
-                    sorted.iter().map(|value| *value as u64).sum::<u64>() as u32 / sorted.len() as u32
+                    sorted.iter().map(|value| *value as u64).sum::<u64>() as u32
+                        / sorted.len() as u32
                 };
                 let p99_delay_ms = if sorted.is_empty() {
                     0
@@ -236,6 +257,7 @@ mod tests {
         let mut service = P2pIngestService::new(
             P2pIngestConfig {
                 fetch_queue_capacity: 8,
+                max_seen_hashes: 128,
             },
             SourceId::new("p2p"),
         );
@@ -267,6 +289,7 @@ mod tests {
         let mut service = P2pIngestService::new(
             P2pIngestConfig {
                 fetch_queue_capacity: 1,
+                max_seen_hashes: 128,
             },
             SourceId::new("p2p"),
         );
@@ -316,6 +339,7 @@ mod tests {
         let mut service = P2pIngestService::new(
             P2pIngestConfig {
                 fetch_queue_capacity: 3,
+                max_seen_hashes: 128,
             },
             SourceId::new("p2p"),
         );
@@ -332,5 +356,51 @@ mod tests {
         assert_eq!(service.metrics().queue_depth_peak, 3);
         assert_eq!(service.metrics().queue_depth_current, 3);
         assert_eq!(service.metrics().queue_dropped_total, 5);
+    }
+
+    #[test]
+    fn evicts_old_hashes_when_dedup_cache_reaches_capacity() {
+        let mut service = P2pIngestService::new(
+            P2pIngestConfig {
+                fetch_queue_capacity: 8,
+                max_seen_hashes: 2,
+            },
+            SourceId::new("p2p"),
+        );
+
+        let first = service.handle_new_pooled_transaction_hashes(
+            "peer-a".to_owned(),
+            vec![hash(1)],
+            1_700_000_000_000,
+            10,
+        );
+        assert_eq!(first.len(), 1);
+        let _ = service.dequeue_get_pooled_transactions();
+
+        let second = service.handle_new_pooled_transaction_hashes(
+            "peer-a".to_owned(),
+            vec![hash(2)],
+            1_700_000_000_001,
+            11,
+        );
+        assert_eq!(second.len(), 1);
+        let _ = service.dequeue_get_pooled_transactions();
+
+        let third = service.handle_new_pooled_transaction_hashes(
+            "peer-a".to_owned(),
+            vec![hash(3)],
+            1_700_000_000_002,
+            12,
+        );
+        assert_eq!(third.len(), 1);
+        let _ = service.dequeue_get_pooled_transactions();
+
+        let replayed_old = service.handle_new_pooled_transaction_hashes(
+            "peer-b".to_owned(),
+            vec![hash(1)],
+            1_700_000_000_003,
+            13,
+        );
+        assert_eq!(replayed_old.len(), 1);
     }
 }

@@ -1,9 +1,38 @@
-use anyhow::{anyhow, Result};
+use ahash::RandomState;
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use common::{Address, PeerId, TxHash};
-use event_log::EventEnvelope;
+use event_log::{EventEnvelope, EventPayload};
+use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+
+pub type FastMap<K, V> = HashMap<K, V, RandomState>;
+pub type FastSet<T> = HashSet<T, RandomState>;
+
+#[derive(Clone, Debug)]
+pub struct StorageConfig {
+    pub event_capacity: usize,
+    pub recent_tx_capacity: usize,
+    pub table_capacity: usize,
+    pub write_latency_capacity: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            event_capacity: 250_000,
+            recent_tx_capacity: 25_000,
+            table_capacity: 250_000,
+            write_latency_capacity: 16_384,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxSeenRecord {
@@ -46,83 +75,135 @@ pub struct PeerStatsRecord {
     pub rtt_ms: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecentTransactionRecord {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+    pub tx_type: u8,
+    pub seen_unix_ms: i64,
+    pub source_id: String,
+}
+
 pub trait EventStore {
     fn append_event(&mut self, event: EventEnvelope);
-    fn list_events(&self) -> &[EventEnvelope];
+    fn list_events(&self) -> Vec<EventEnvelope>;
+    fn latest_seq_id(&self) -> Option<u64>;
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct InMemoryStorage {
-    events: Vec<EventEnvelope>,
-    tx_seen: Vec<TxSeenRecord>,
-    tx_full: Vec<TxFullRecord>,
-    tx_features: Vec<TxFeaturesRecord>,
-    tx_lifecycle: Vec<TxLifecycleRecord>,
-    peer_stats: Vec<PeerStatsRecord>,
-    write_latency_ns: Vec<u64>,
+    config: StorageConfig,
+    events: VecDeque<EventEnvelope>,
+    tx_seen: VecDeque<TxSeenRecord>,
+    tx_full: VecDeque<TxFullRecord>,
+    tx_features: VecDeque<TxFeaturesRecord>,
+    tx_lifecycle: VecDeque<TxLifecycleRecord>,
+    peer_stats: VecDeque<PeerStatsRecord>,
+    write_latency_ns: VecDeque<u64>,
+    recent_tx_order: VecDeque<TxHash>,
+    recent_tx_counts: FastMap<TxHash, usize>,
+    recent_tx_lookup: FastMap<TxHash, RecentTransactionRecord>,
 }
 
-impl EventStore for InMemoryStorage {
-    fn append_event(&mut self, event: EventEnvelope) {
-        let start = Instant::now();
-        self.events.push(event);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
-    }
-
-    fn list_events(&self) -> &[EventEnvelope] {
-        &self.events
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self::with_config(StorageConfig::default())
     }
 }
 
 impl InMemoryStorage {
+    pub fn with_config(config: StorageConfig) -> Self {
+        let config = StorageConfig {
+            event_capacity: config.event_capacity.max(1),
+            recent_tx_capacity: config.recent_tx_capacity.max(1),
+            table_capacity: config.table_capacity.max(1),
+            write_latency_capacity: config.write_latency_capacity.max(1),
+        };
+
+        Self {
+            config,
+            events: VecDeque::new(),
+            tx_seen: VecDeque::new(),
+            tx_full: VecDeque::new(),
+            tx_features: VecDeque::new(),
+            tx_lifecycle: VecDeque::new(),
+            peer_stats: VecDeque::new(),
+            write_latency_ns: VecDeque::new(),
+            recent_tx_order: VecDeque::new(),
+            recent_tx_counts: FastMap::default(),
+            recent_tx_lookup: FastMap::default(),
+        }
+    }
+
     pub fn upsert_tx_seen(&mut self, record: TxSeenRecord) {
         let start = Instant::now();
-        self.tx_seen.push(record);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
+        push_bounded(&mut self.tx_seen, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
     pub fn upsert_tx_full(&mut self, record: TxFullRecord) {
         let start = Instant::now();
-        self.tx_full.push(record);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
+        push_bounded(&mut self.tx_full, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
         let start = Instant::now();
-        self.tx_features.push(record);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
+        push_bounded(&mut self.tx_features, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
-        self.tx_lifecycle.push(record);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
+        push_bounded(&mut self.tx_lifecycle, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
     pub fn upsert_peer_stats(&mut self, record: PeerStatsRecord) {
         let start = Instant::now();
-        self.peer_stats.push(record);
-        self.write_latency_ns.push(start.elapsed().as_nanos() as u64);
+        push_bounded(&mut self.peer_stats, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
-    pub fn tx_seen(&self) -> &[TxSeenRecord] {
+    pub fn tx_seen(&self) -> &VecDeque<TxSeenRecord> {
         &self.tx_seen
     }
 
-    pub fn tx_full(&self) -> &[TxFullRecord] {
+    pub fn tx_full(&self) -> &VecDeque<TxFullRecord> {
         &self.tx_full
     }
 
-    pub fn tx_features(&self) -> &[TxFeaturesRecord] {
+    pub fn tx_features(&self) -> &VecDeque<TxFeaturesRecord> {
         &self.tx_features
     }
 
-    pub fn tx_lifecycle(&self) -> &[TxLifecycleRecord] {
+    pub fn tx_lifecycle(&self) -> &VecDeque<TxLifecycleRecord> {
         &self.tx_lifecycle
     }
 
-    pub fn peer_stats(&self) -> &[PeerStatsRecord] {
+    pub fn peer_stats(&self) -> &VecDeque<PeerStatsRecord> {
         &self.peer_stats
+    }
+
+    pub fn recent_transactions(&self, limit: usize) -> Vec<RecentTransactionRecord> {
+        let target = limit.max(1);
+        let mut out = Vec::with_capacity(target);
+        let mut emitted_hashes: FastSet<TxHash> = FastSet::default();
+
+        for hash in self.recent_tx_order.iter().rev() {
+            if !emitted_hashes.insert(*hash) {
+                continue;
+            }
+            if let Some(record) = self.recent_tx_lookup.get(hash) {
+                out.push(record.clone());
+                if out.len() >= target {
+                    break;
+                }
+            }
+        }
+
+        out
     }
 
     pub fn avg_write_latency_ns(&self) -> Option<u64> {
@@ -135,6 +216,270 @@ impl InMemoryStorage {
                 .sum::<u64>()
                 .saturating_div(self.write_latency_ns.len() as u64),
         )
+    }
+
+    fn track_recent_transaction(&mut self, record: RecentTransactionRecord) {
+        let hash = record.hash;
+        self.recent_tx_order.push_back(hash);
+        *self.recent_tx_counts.entry(hash).or_insert(0) += 1;
+        self.recent_tx_lookup.insert(hash, record);
+
+        while self.recent_tx_order.len() > self.config.recent_tx_capacity {
+            if let Some(old_hash) = self.recent_tx_order.pop_front() {
+                if let Some(count) = self.recent_tx_counts.get_mut(&old_hash) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.recent_tx_counts.remove(&old_hash);
+                        self.recent_tx_lookup.remove(&old_hash);
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_write_latency(&mut self, latency_ns: u64) {
+        push_bounded(
+            &mut self.write_latency_ns,
+            latency_ns,
+            self.config.write_latency_capacity,
+        );
+    }
+}
+
+impl EventStore for InMemoryStorage {
+    fn append_event(&mut self, event: EventEnvelope) {
+        let start = Instant::now();
+
+        if let EventPayload::TxDecoded(decoded) = &event.payload {
+            self.track_recent_transaction(RecentTransactionRecord {
+                hash: decoded.hash,
+                sender: decoded.sender,
+                nonce: decoded.nonce,
+                tx_type: decoded.tx_type,
+                seen_unix_ms: event.ingest_ts_unix_ms,
+                source_id: event.source_id.0.clone(),
+            });
+        }
+
+        self.events.push_back(event);
+        while self.events.len() > self.config.event_capacity {
+            let _ = self.events.pop_front();
+        }
+
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+    }
+
+    fn list_events(&self) -> Vec<EventEnvelope> {
+        self.events.iter().cloned().collect()
+    }
+
+    fn latest_seq_id(&self) -> Option<u64> {
+        self.events.back().map(|event| event.seq_id)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum StorageWriteOp {
+    AppendEvent(EventEnvelope),
+    UpsertTxSeen(TxSeenRecord),
+    UpsertTxFull(TxFullRecord),
+    UpsertTxFeatures(TxFeaturesRecord),
+    UpsertTxLifecycle(TxLifecycleRecord),
+    UpsertPeerStats(PeerStatsRecord),
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageWriterConfig {
+    pub queue_capacity: usize,
+    pub flush_batch_size: usize,
+    pub flush_interval_ms: u64,
+}
+
+impl Default for StorageWriterConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 8_192,
+            flush_batch_size: 512,
+            flush_interval_ms: 500,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StorageWriteHandle {
+    tx: mpsc::Sender<StorageWriteOp>,
+}
+
+impl StorageWriteHandle {
+    pub async fn enqueue(&self, op: StorageWriteOp) -> Result<()> {
+        self.tx
+            .send(op)
+            .await
+            .map_err(|_| anyhow!("storage writer task is not running"))
+    }
+
+    pub fn try_enqueue(&self, op: StorageWriteOp) -> Result<()> {
+        self.tx
+            .try_send(op)
+            .map_err(|err| anyhow!("storage writer queue full or closed: {err}"))
+    }
+}
+
+#[async_trait]
+pub trait ClickHouseBatchSink: Send + Sync {
+    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NoopClickHouseSink;
+
+#[async_trait]
+impl ClickHouseBatchSink for NoopClickHouseSink {
+    async fn flush_event_batch(&self, _events: Vec<EventEnvelope>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ClickHouseHttpSink {
+    client: reqwest::Client,
+    insert_url: String,
+}
+
+impl ClickHouseHttpSink {
+    pub fn new(insert_url: impl Into<String>) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("build clickhouse http client")?;
+        Ok(Self {
+            client,
+            insert_url: insert_url.into(),
+        })
+    }
+
+    pub fn from_env() -> Result<Option<Self>> {
+        let url = match std::env::var("CLICKHOUSE_EVENTS_INSERT_URL") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => return Ok(None),
+        };
+        Self::new(url).map(Some)
+    }
+}
+
+#[async_trait]
+impl ClickHouseBatchSink for ClickHouseHttpSink {
+    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut body = String::new();
+        for event in events {
+            body.push_str(&serde_json::to_string(&event).context("serialize event")?);
+            body.push('\n');
+        }
+
+        self.client
+            .post(&self.insert_url)
+            .header("content-type", "application/x-ndjson")
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {}", self.insert_url))?
+            .error_for_status()
+            .context("clickhouse insert returned error status")?;
+
+        Ok(())
+    }
+}
+
+pub fn spawn_single_writer(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    sink: Arc<dyn ClickHouseBatchSink>,
+    config: StorageWriterConfig,
+) -> StorageWriteHandle {
+    let config = StorageWriterConfig {
+        queue_capacity: config.queue_capacity.max(1),
+        flush_batch_size: config.flush_batch_size.max(1),
+        flush_interval_ms: config.flush_interval_ms.max(1),
+    };
+
+    let (tx, mut rx) = mpsc::channel::<StorageWriteOp>(config.queue_capacity);
+
+    tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(config.flush_batch_size);
+        let mut ticker = tokio::time::interval(Duration::from_millis(config.flush_interval_ms));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                maybe_op = rx.recv() => {
+                    let op = match maybe_op {
+                        Some(op) => op,
+                        None => break,
+                    };
+
+                    match storage.write() {
+                        Ok(mut guard) => apply_write_op(&mut guard, op, &mut batch),
+                        Err(_) => {
+                            tracing::error!("storage lock poisoned, stopping single-writer task");
+                            break;
+                        }
+                    }
+
+                    if batch.len() >= config.flush_batch_size {
+                        flush_batch(&sink, &mut batch).await;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        flush_batch(&sink, &mut batch).await;
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            flush_batch(&sink, &mut batch).await;
+        }
+    });
+
+    StorageWriteHandle { tx }
+}
+
+fn apply_write_op(
+    storage: &mut InMemoryStorage,
+    op: StorageWriteOp,
+    batch: &mut Vec<EventEnvelope>,
+) {
+    match op {
+        StorageWriteOp::AppendEvent(event) => {
+            storage.append_event(event.clone());
+            batch.push(event);
+        }
+        StorageWriteOp::UpsertTxSeen(record) => storage.upsert_tx_seen(record),
+        StorageWriteOp::UpsertTxFull(record) => storage.upsert_tx_full(record),
+        StorageWriteOp::UpsertTxFeatures(record) => storage.upsert_tx_features(record),
+        StorageWriteOp::UpsertTxLifecycle(record) => storage.upsert_tx_lifecycle(record),
+        StorageWriteOp::UpsertPeerStats(record) => storage.upsert_peer_stats(record),
+    }
+}
+
+async fn flush_batch(sink: &Arc<dyn ClickHouseBatchSink>, batch: &mut Vec<EventEnvelope>) {
+    if batch.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(batch);
+    if let Err(err) = sink.flush_event_batch(pending).await {
+        tracing::warn!(error = %err, "clickhouse batch flush failed");
+    }
+}
+
+fn push_bounded<T>(deque: &mut VecDeque<T>, value: T, capacity: usize) {
+    deque.push_back(value);
+    while deque.len() > capacity {
+        let _ = deque.pop_front();
     }
 }
 
@@ -160,11 +505,7 @@ pub fn export_replay_frames_csv(frames: &[ReplayFrame]) -> String {
 }
 
 pub trait ParquetExporter {
-    fn export_replay_frames_parquet(
-        &self,
-        _frames: &[ReplayFrame],
-        _path: &str,
-    ) -> Result<()> {
+    fn export_replay_frames_parquet(&self, _frames: &[ReplayFrame], _path: &str) -> Result<()> {
         Err(anyhow!(
             "parquet export is not wired in this crate yet; use adapter implementation"
         ))
@@ -188,10 +529,25 @@ fn format_hash(hash: &TxHash) -> String {
 mod tests {
     use super::*;
     use common::SourceId;
-    use event_log::{EventPayload, TxSeen};
+    use event_log::{EventPayload, TxDecoded, TxSeen};
 
     fn hash(v: u8) -> TxHash {
         [v; 32]
+    }
+
+    fn decoded_event(seq: u64, v: u8) -> EventEnvelope {
+        EventEnvelope {
+            seq_id: seq,
+            ingest_ts_unix_ms: 1_700_000_000_000 + seq as i64,
+            ingest_ts_mono_ns: seq * 10,
+            source_id: SourceId::new("test"),
+            payload: EventPayload::TxDecoded(TxDecoded {
+                hash: hash(v),
+                tx_type: 2,
+                sender: [9; 20],
+                nonce: seq,
+            }),
+        }
     }
 
     #[test]
@@ -236,6 +592,96 @@ mod tests {
         assert_eq!(store.tx_lifecycle().len(), 1);
         assert_eq!(store.peer_stats().len(), 1);
         assert!(store.avg_write_latency_ns().is_some());
+    }
+
+    #[test]
+    fn event_ring_buffer_applies_capacity() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 2,
+            recent_tx_capacity: 10,
+            ..StorageConfig::default()
+        });
+
+        store.append_event(decoded_event(1, 1));
+        store.append_event(decoded_event(2, 2));
+        store.append_event(decoded_event(3, 3));
+
+        let events = store.list_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq_id, 2);
+        assert_eq!(events[1].seq_id, 3);
+    }
+
+    #[test]
+    fn recent_transactions_is_bounded_and_latest_first() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 3,
+            ..StorageConfig::default()
+        });
+
+        store.append_event(decoded_event(1, 1));
+        store.append_event(decoded_event(2, 2));
+        store.append_event(decoded_event(3, 3));
+        store.append_event(decoded_event(4, 4));
+
+        let recent = store.recent_transactions(10);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].hash, hash(4));
+        assert_eq!(recent[2].hash, hash(2));
+    }
+
+    #[tokio::test]
+    async fn single_writer_applies_ops_and_batches_flushes() {
+        #[derive(Clone)]
+        struct RecordingSink {
+            flush_sizes: Arc<RwLock<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl ClickHouseBatchSink for RecordingSink {
+            async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
+                self.flush_sizes.write().unwrap().push(events.len());
+                Ok(())
+            }
+        }
+
+        let storage = Arc::new(RwLock::new(InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 4,
+            recent_tx_capacity: 4,
+            ..StorageConfig::default()
+        })));
+        let flush_sizes = Arc::new(RwLock::new(Vec::new()));
+        let sink = Arc::new(RecordingSink {
+            flush_sizes: flush_sizes.clone(),
+        });
+
+        let handle = spawn_single_writer(
+            storage.clone(),
+            sink,
+            StorageWriterConfig {
+                queue_capacity: 32,
+                flush_batch_size: 2,
+                flush_interval_ms: 5,
+            },
+        );
+
+        for seq in 1..=5 {
+            handle
+                .enqueue(StorageWriteOp::AppendEvent(decoded_event(seq, seq as u8)))
+                .await
+                .expect("enqueue append event");
+        }
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let events = storage.read().unwrap().list_events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].seq_id, 2);
+        assert_eq!(events[3].seq_id, 5);
+
+        let flushed = flush_sizes.read().unwrap().clone();
+        assert!(!flushed.is_empty());
     }
 
     #[test]
@@ -290,8 +736,77 @@ mod tests {
         let err = exporter
             .export_replay_frames_parquet(&frames, "/tmp/replay.parquet")
             .expect_err("should return adapter error");
-        assert!(err
-            .to_string()
-            .contains("parquet export is not wired in this crate yet"));
+        assert!(
+            err.to_string()
+                .contains("parquet export is not wired in this crate yet")
+        );
+    }
+
+    #[test]
+    fn side_tables_apply_configured_capacity() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 100,
+            table_capacity: 2,
+            write_latency_capacity: 100,
+        });
+
+        for idx in 0..4_u8 {
+            let hash = hash(idx + 1);
+            store.upsert_tx_seen(TxSeenRecord {
+                hash,
+                peer: "peer-a".to_owned(),
+                first_seen_unix_ms: 1_700_000_000_000 + idx as i64,
+                first_seen_mono_ns: idx as u64,
+                seen_count: 1,
+            });
+            store.upsert_tx_full(TxFullRecord {
+                hash,
+                sender: [9; 20],
+                nonce: idx as u64,
+                raw_tx: vec![idx],
+            });
+            store.upsert_tx_features(TxFeaturesRecord {
+                hash,
+                protocol: "uniswap-v2".to_owned(),
+                category: "swap".to_owned(),
+                mev_score: 80,
+            });
+            store.upsert_tx_lifecycle(TxLifecycleRecord {
+                hash,
+                status: "pending".to_owned(),
+                reason: None,
+                updated_unix_ms: 1_700_000_000_000 + idx as i64,
+            });
+            store.upsert_peer_stats(PeerStatsRecord {
+                peer: "peer-a".to_owned(),
+                throughput_tps: 100,
+                drop_rate_bps: 10,
+                rtt_ms: 5,
+            });
+        }
+
+        assert_eq!(store.tx_seen().len(), 2);
+        assert_eq!(store.tx_full().len(), 2);
+        assert_eq!(store.tx_features().len(), 2);
+        assert_eq!(store.tx_lifecycle().len(), 2);
+        assert_eq!(store.peer_stats().len(), 2);
+    }
+
+    #[test]
+    fn write_latency_window_is_bounded() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 100,
+            table_capacity: 100,
+            write_latency_capacity: 4,
+        });
+
+        for seq in 1..=32 {
+            store.append_event(decoded_event(seq, seq as u8));
+        }
+
+        assert_eq!(store.write_latency_ns.len(), 4);
+        assert!(store.avg_write_latency_ns().is_some());
     }
 }

@@ -1,16 +1,23 @@
+use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
 use futures::{SinkExt, StreamExt};
+use hashbrown::HashSet;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use storage::{EventStore, InMemoryStorage, TxFeaturesRecord, TxFullRecord, TxSeenRecord};
+use storage::{
+    EventStore, InMemoryStorage, StorageWriteHandle, StorageWriteOp, TxFeaturesRecord,
+    TxFullRecord, TxSeenRecord,
+};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+type FastSet<T> = HashSet<T, RandomState>;
 
 #[derive(Clone, Debug)]
 pub struct LiveRpcConfig {
@@ -55,7 +62,11 @@ impl LiveRpcConfig {
     }
 }
 
-pub fn start_live_rpc_feed(storage: Arc<RwLock<InMemoryStorage>>, config: LiveRpcConfig) {
+pub fn start_live_rpc_feed(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    writer: StorageWriteHandle,
+    config: LiveRpcConfig,
+) {
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
         Err(_) => return,
@@ -67,13 +78,13 @@ pub fn start_live_rpc_feed(storage: Arc<RwLock<InMemoryStorage>>, config: LiveRp
             .build()
             .expect("reqwest client");
 
-        let mut seen_hashes = HashSet::new();
+        let mut seen_hashes = FastSet::default();
         let mut seen_order = VecDeque::new();
         let mut next_seq_id = current_seq_hi(&storage).saturating_add(1).max(1);
 
         loop {
             let session_result = run_ws_session(
-                &storage,
+                &writer,
                 &config,
                 &client,
                 &mut next_seq_id,
@@ -91,11 +102,11 @@ pub fn start_live_rpc_feed(storage: Arc<RwLock<InMemoryStorage>>, config: LiveRp
 }
 
 async fn run_ws_session(
-    storage: &Arc<RwLock<InMemoryStorage>>,
+    writer: &StorageWriteHandle,
     config: &LiveRpcConfig,
     client: &reqwest::Client,
     next_seq_id: &mut u64,
-    seen_hashes: &mut HashSet<TxHash>,
+    seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
     let (ws_stream, _) = connect_async(config.ws_url.as_str())
@@ -121,7 +132,7 @@ async fn run_ws_session(
             Message::Text(text) => {
                 if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
                     process_pending_hash(
-                        storage,
+                        writer,
                         config,
                         client,
                         &hash_hex,
@@ -175,12 +186,12 @@ fn parse_pending_hash(payload: &str, subscription_id: &mut Option<String>) -> Op
 }
 
 async fn process_pending_hash(
-    storage: &Arc<RwLock<InMemoryStorage>>,
+    writer: &StorageWriteHandle,
     config: &LiveRpcConfig,
     client: &reqwest::Client,
     hash_hex: &str,
     next_seq_id: &mut u64,
-    seen_hashes: &mut HashSet<TxHash>,
+    seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
     let hash = match parse_fixed_hex::<32>(hash_hex) {
@@ -200,12 +211,8 @@ async fn process_pending_hash(
         }
     }
 
-    let mut store = storage
-        .write()
-        .map_err(|_| anyhow!("storage lock poisoned during live rpc ingest"))?;
-
     append_event(
-        &mut store,
+        writer,
         next_seq_id,
         &config.source_id,
         now_unix_ms,
@@ -215,17 +222,20 @@ async fn process_pending_hash(
             seen_at_unix_ms: now_unix_ms,
             seen_at_mono_ns: next_seq_id.saturating_mul(1_000_000),
         }),
-    );
-    store.upsert_tx_seen(TxSeenRecord {
-        hash,
-        peer: "rpc-ws".to_owned(),
-        first_seen_unix_ms: now_unix_ms,
-        first_seen_mono_ns: next_seq_id.saturating_mul(1_000_000),
-        seen_count: 1,
-    });
+    )
+    .await?;
+    writer
+        .enqueue(StorageWriteOp::UpsertTxSeen(TxSeenRecord {
+            hash,
+            peer: "rpc-ws".to_owned(),
+            first_seen_unix_ms: now_unix_ms,
+            first_seen_mono_ns: next_seq_id.saturating_mul(1_000_000),
+            seen_count: 1,
+        }))
+        .await?;
 
     append_event(
-        &mut store,
+        writer,
         next_seq_id,
         &config.source_id,
         now_unix_ms,
@@ -233,11 +243,12 @@ async fn process_pending_hash(
             hash,
             fetched_at_unix_ms: now_unix_ms,
         }),
-    );
+    )
+    .await?;
 
     if let Some(tx) = fetched_tx {
         append_event(
-            &mut store,
+            writer,
             next_seq_id,
             &config.source_id,
             now_unix_ms,
@@ -247,45 +258,53 @@ async fn process_pending_hash(
                 sender: tx.sender,
                 nonce: tx.nonce,
             }),
-        );
-        store.upsert_tx_full(TxFullRecord {
-            hash: tx.hash,
-            sender: tx.sender,
-            nonce: tx.nonce,
-            raw_tx: tx.input,
-        });
-        store.upsert_tx_features(TxFeaturesRecord {
-            hash: tx.hash,
-            protocol: "unknown".to_owned(),
-            category: "pending".to_owned(),
-            mev_score: 0,
-        });
+        )
+        .await?;
+        writer
+            .enqueue(StorageWriteOp::UpsertTxFull(TxFullRecord {
+                hash: tx.hash,
+                sender: tx.sender,
+                nonce: tx.nonce,
+                raw_tx: tx.input,
+            }))
+            .await?;
+        writer
+            .enqueue(StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
+                hash: tx.hash,
+                protocol: "unknown".to_owned(),
+                category: "pending".to_owned(),
+                mev_score: 0,
+            }))
+            .await?;
     }
 
     Ok(())
 }
 
-fn append_event(
-    store: &mut InMemoryStorage,
+async fn append_event(
+    writer: &StorageWriteHandle,
     next_seq_id: &mut u64,
     source_id: &SourceId,
     now_unix_ms: i64,
     payload: EventPayload,
-) {
+) -> Result<()> {
     let seq_id = *next_seq_id;
     *next_seq_id = next_seq_id.saturating_add(1);
-    store.append_event(EventEnvelope {
-        seq_id,
-        ingest_ts_unix_ms: now_unix_ms,
-        ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
-        source_id: source_id.clone(),
-        payload,
-    });
+    writer
+        .enqueue(StorageWriteOp::AppendEvent(EventEnvelope {
+            seq_id,
+            ingest_ts_unix_ms: now_unix_ms,
+            ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
+            source_id: source_id.clone(),
+            payload,
+        }))
+        .await?;
+    Ok(())
 }
 
 fn remember_hash(
     hash: TxHash,
-    seen_hashes: &mut HashSet<TxHash>,
+    seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
     max_seen_hashes: usize,
 ) -> bool {
@@ -425,7 +444,7 @@ fn current_seq_hi(storage: &Arc<RwLock<InMemoryStorage>>) -> u64 {
     storage
         .read()
         .ok()
-        .and_then(|store| store.list_events().last().map(|event| event.seq_id))
+        .and_then(|store| store.latest_seq_id())
         .unwrap_or(0)
 }
 

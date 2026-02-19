@@ -37,7 +37,11 @@ fn replay_cli_writes_output_file() {
             nonce: 1,
         }),
     }];
-    fs::write(&input_path, serde_json::to_vec(&events).expect("json events")).expect("write input");
+    fs::write(
+        &input_path,
+        serde_json::to_vec(&events).expect("json events"),
+    )
+    .expect("write input");
 
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_replay-cli"))
         .args([

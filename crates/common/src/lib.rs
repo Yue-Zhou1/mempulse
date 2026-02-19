@@ -66,7 +66,10 @@ pub struct AlertDecisions {
     pub clock_skew: bool,
 }
 
-pub fn evaluate_alerts(snapshot: &MetricSnapshot, thresholds: &AlertThresholdConfig) -> AlertDecisions {
+pub fn evaluate_alerts(
+    snapshot: &MetricSnapshot,
+    thresholds: &AlertThresholdConfig,
+) -> AlertDecisions {
     let decode_failure_bps = if snapshot.tx_decode_total == 0 {
         0
     } else {
@@ -92,7 +95,7 @@ pub fn evaluate_alerts(snapshot: &MetricSnapshot, thresholds: &AlertThresholdCon
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate_alerts, AlertThresholdConfig, MetricSnapshot, SourceId};
+    use super::{AlertThresholdConfig, MetricSnapshot, SourceId, evaluate_alerts};
 
     #[test]
     fn source_id_display_matches_inner_value() {

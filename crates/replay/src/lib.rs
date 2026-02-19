@@ -1,5 +1,5 @@
 use common::TxHash;
-use event_log::{sort_deterministic, EventEnvelope, EventPayload};
+use event_log::{EventEnvelope, EventPayload, sort_deterministic};
 use mempool_state::{MempoolState, TxLifecycleStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,14 +23,21 @@ pub struct LifecycleCheckpoint {
     pub pending_hashes: Vec<TxHash>,
 }
 
-pub fn replay_frames(events: &[EventEnvelope], mode: ReplayMode, stride: usize) -> Vec<ReplayFrame> {
+pub fn replay_frames(
+    events: &[EventEnvelope],
+    mode: ReplayMode,
+    stride: usize,
+) -> Vec<ReplayFrame> {
     match mode {
         ReplayMode::DeterministicEventReplay => replay_deterministic(events, stride.max(1)),
         ReplayMode::SnapshotReplay => replay_snapshot(events, stride.max(1)),
     }
 }
 
-pub fn lifecycle_checkpoints(events: &[EventEnvelope], checkpoint_seq_ids: &[u64]) -> Vec<LifecycleCheckpoint> {
+pub fn lifecycle_checkpoints(
+    events: &[EventEnvelope],
+    checkpoint_seq_ids: &[u64],
+) -> Vec<LifecycleCheckpoint> {
     let checkpoints: BTreeSet<u64> = checkpoint_seq_ids.iter().copied().collect();
     let mut sorted = events.to_vec();
     sort_deterministic(&mut sorted);
@@ -139,10 +146,7 @@ pub fn lifecycle_parity(
         .collect()
 }
 
-pub fn current_lifecycle(
-    events: &[EventEnvelope],
-    hash: TxHash,
-) -> Option<TxLifecycleStatus> {
+pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLifecycleStatus> {
     let mut sorted = events.to_vec();
     sort_deterministic(&mut sorted);
     let mut state = MempoolState::default();
