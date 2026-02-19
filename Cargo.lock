@@ -645,7 +645,9 @@ dependencies = [
  "common",
  "event-log",
  "feature-engine",
+ "replay",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
