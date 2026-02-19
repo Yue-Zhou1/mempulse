@@ -1,0 +1,12 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+common = { path = "../common" }
+event-log = { path = "../event-log" }
+feature-engine = { path = "../feature-engine" }
+serde = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "p2p-ingest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+event-log = { path = "../event-log" }
+serde = { workspace = true }
+tracing = { workspace = true }

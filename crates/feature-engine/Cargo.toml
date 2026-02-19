@@ -1,0 +1,8 @@
+[package]
+name = "feature-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+serde = { workspace = true }
