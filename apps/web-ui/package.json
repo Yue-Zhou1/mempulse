@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "echo 'TODO: add frontend build tooling (vite/next)'; exit 0"
+    "dev": "python3 -m http.server 5173"
   }
 }
