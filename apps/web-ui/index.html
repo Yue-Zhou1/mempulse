@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>prototype03 web-ui</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: radial-gradient(circle at top, #112240, #020617);
+        color: #f8fafc;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      #scene {
+        width: 100vw;
+        height: 100vh;
+      }
+      #hud {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        background: rgba(2, 6, 23, 0.72);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 12px;
+        padding: 12px 14px;
+        backdrop-filter: blur(5px);
+      }
+      #hud h1 {
+        margin: 0;
+        font-size: 16px;
+      }
+      #hud p {
+        margin: 6px 0 0;
+        font-size: 13px;
+        color: #cbd5e1;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="scene"></div>
+    <div id="hud">
+      <h1>Mempool 3D View (Placeholder)</h1>
+      <p>Three.js scene scaffold for propagation/replay visualizations.</p>
+    </div>
+    <script type="module" src="./src/index.js"></script>
+  </body>
+</html>

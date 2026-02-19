@@ -1,0 +1,10 @@
+[package]
+name = "mempool-state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+event-log = { path = "../event-log" }
+serde = { workspace = true }
+thiserror = { workspace = true }
