@@ -96,6 +96,8 @@ where
                 events.push(self.new_event(EventPayload::TxDecoded(TxDecoded {
                     hash: tx.hash,
                     tx_type: tx.tx_type,
+                    sender: [0_u8; 20],
+                    nonce: 0,
                 })));
             }
         }

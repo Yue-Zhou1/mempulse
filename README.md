@@ -15,3 +15,35 @@ This repository is a Rust workspace for the mempool/MEV system.
 - `crates/viz-api` API for observability/replay visualization clients
 - `crates/replay` deterministic replay capabilities
 - `apps/web-ui` custom frontend skeleton (Three.js-ready)
+
+## Operational Metrics Model
+
+Current metrics and alert-threshold primitives are defined in `crates/common`:
+
+- peer/session churn
+- ingest lag
+- decode failure rate
+- coverage collapse
+- storage write latency
+- clock skew
+
+The p2p ingest pipeline exposes queue/backpressure telemetry:
+
+- `queue_depth_current`
+- `queue_depth_peak`
+- `queue_dropped_total`
+- `duplicates_dropped_total`
+
+## Verification Workflow
+
+Run the full acceptance verification command:
+
+```bash
+./scripts/verify_phase_checks.sh
+```
+
+This command runs:
+
+- `cargo test --workspace`
+- `cargo build -p replay --bin replay-cli`
+- `cargo build -p viz-api --bin viz-api`

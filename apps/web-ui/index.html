@@ -21,6 +21,7 @@
         position: fixed;
         top: 16px;
         left: 16px;
+        width: min(360px, calc(100vw - 32px));
         background: rgba(2, 6, 23, 0.72);
         border: 1px solid rgba(148, 163, 184, 0.35);
         border-radius: 12px;
@@ -36,13 +37,43 @@
         font-size: 13px;
         color: #cbd5e1;
       }
+      #controls {
+        margin-top: 12px;
+      }
+      #controls label {
+        display: block;
+        font-size: 12px;
+        color: #e2e8f0;
+      }
+      #controls input[type="range"] {
+        width: 100%;
+        margin-top: 6px;
+      }
+      #replayMeta, #apiStatus {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #93c5fd;
+      }
+      #featureList {
+        margin-top: 8px;
+        padding-left: 16px;
+        font-size: 12px;
+        color: #e2e8f0;
+      }
     </style>
   </head>
   <body>
     <div id="scene"></div>
     <div id="hud">
-      <h1>Mempool 3D View (Placeholder)</h1>
-      <p>Three.js scene scaffold for propagation/replay visualizations.</p>
+      <h1>Mempool 3D View</h1>
+      <p>API-backed propagation graph with replay timeline controls.</p>
+      <div id="controls">
+        <label for="timeline">Replay timeline</label>
+        <input id="timeline" type="range" min="0" max="0" value="0" />
+      </div>
+      <div id="replayMeta">No replay frames loaded.</div>
+      <div id="apiStatus">Connecting to API...</div>
+      <ul id="featureList"></ul>
     </div>
     <script type="module" src="./src/index.js"></script>
   </body>

@@ -512,9 +512,12 @@ dependencies = [
 name = "replay"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "common",
  "event-log",
+ "mempool-state",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -642,7 +645,9 @@ dependencies = [
  "common",
  "event-log",
  "feature-engine",
+ "replay",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -804,6 +809,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -835,12 +841,15 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "viz-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "common",
+ "event-log",
  "futures",
  "replay",
  "serde",
  "serde_json",
+ "storage",
  "tokio",
  "tower",
  "tracing",

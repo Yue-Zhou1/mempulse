@@ -1,4 +1,4 @@
-use common::{BlockHash, PeerId, SourceId, TxHash};
+use common::{Address, BlockHash, PeerId, SourceId, TxHash};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -74,6 +74,8 @@ pub struct TxFetched {
 pub struct TxDecoded {
     pub hash: TxHash,
     pub tx_type: u8,
+    pub sender: Address,
+    pub nonce: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
