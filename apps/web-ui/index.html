@@ -60,6 +60,23 @@
         font-size: 12px;
         color: #e2e8f0;
       }
+      #txTitle {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #bfdbfe;
+      }
+      #txList {
+        margin-top: 6px;
+        padding-left: 16px;
+        font-size: 11px;
+        color: #dbeafe;
+        max-height: 140px;
+        overflow: auto;
+      }
+      #txList li {
+        margin-bottom: 4px;
+        font-family: "IBM Plex Mono", "Consolas", monospace;
+      }
     </style>
   </head>
   <body>
@@ -74,6 +91,8 @@
       <div id="replayMeta">No replay frames loaded.</div>
       <div id="apiStatus">Connecting to API...</div>
       <ul id="featureList"></ul>
+      <div id="txTitle">Recent transactions</div>
+      <ul id="txList"></ul>
     </div>
     <script type="module" src="./src/index.js"></script>
   </body>

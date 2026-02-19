@@ -47,3 +47,23 @@ This command runs:
 - `cargo test --workspace`
 - `cargo build -p replay --bin replay-cli`
 - `cargo build -p viz-api --bin viz-api`
+
+## Real Mempool Mode
+
+`viz-api` can ingest real pending transactions from an Ethereum RPC provider.
+
+Set environment variables before starting `viz-api`:
+
+- `VIZ_API_ETH_WS_URL` (required): WebSocket endpoint for `eth_subscribe newPendingTransactions`
+- `VIZ_API_ETH_HTTP_URL` (recommended): HTTP endpoint for `eth_getTransactionByHash`
+- `VIZ_API_SOURCE_ID` (optional): source label (default: `rpc-live`)
+
+Example:
+
+```bash
+export VIZ_API_ETH_WS_URL="wss://YOUR_PROVIDER_WS_URL"
+export VIZ_API_ETH_HTTP_URL="https://YOUR_PROVIDER_HTTP_URL"
+cargo run -p viz-api --bin viz-api
+```
+
+Without these variables, `viz-api` falls back to synthetic demo events.

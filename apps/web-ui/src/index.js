@@ -1,10 +1,40 @@
 import * as THREE from 'https://unpkg.com/three@0.164.1/build/three.module.js';
+import { resolveApiBase } from './api-base.js';
 
-const apiBase = `${window.location.protocol}//${window.location.hostname}:3000`;
+const storageKey = 'vizApiBase';
+const getStoredApiBase = () => {
+  try {
+    return window.localStorage.getItem(storageKey);
+  } catch {
+    return null;
+  }
+};
+const setStoredApiBase = (value) => {
+  try {
+    if (value) {
+      window.localStorage.setItem(storageKey, value);
+    }
+  } catch {
+    // Ignore storage errors for private/incognito contexts.
+  }
+};
+
+const apiConfig = resolveApiBase({
+  search: window.location.search,
+  storedApiBase: getStoredApiBase(),
+  protocol: window.location.protocol,
+  hostname: window.location.hostname,
+});
+if (apiConfig.persistApiBase) {
+  setStoredApiBase(apiConfig.persistApiBase);
+}
+const apiBase = apiConfig.apiBase;
+const refreshIntervalMs = 2000;
 const mount = document.getElementById('scene');
 const timelineInput = document.getElementById('timeline');
 const replayMeta = document.getElementById('replayMeta');
 const featureList = document.getElementById('featureList');
+const txList = document.getElementById('txList');
 const apiStatus = document.getElementById('apiStatus');
 
 const scene = new THREE.Scene();
@@ -125,6 +155,27 @@ function renderFeatures(features) {
   });
 }
 
+function shortenHex(value, head = 10, tail = 8) {
+  if (!value || value.length <= head + tail) return value;
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
+}
+
+function renderTransactions(transactions) {
+  txList.innerHTML = '';
+  if (!transactions.length) {
+    const item = document.createElement('li');
+    item.textContent = 'No mempool transactions yet';
+    txList.appendChild(item);
+    return;
+  }
+
+  transactions.slice(0, 12).forEach((tx) => {
+    const item = document.createElement('li');
+    item.textContent = `${shortenHex(tx.hash)} nonce=${tx.nonce} type=${tx.tx_type} from=${shortenHex(tx.sender, 8, 6)} src=${tx.source_id}`;
+    txList.appendChild(item);
+  });
+}
+
 async function fetchJson(path) {
   const response = await fetch(`${apiBase}${path}`);
   if (!response.ok) {
@@ -136,21 +187,31 @@ async function fetchJson(path) {
 async function loadData() {
   apiStatus.textContent = `Loading from ${apiBase} ...`;
   try {
-    const [replay, propagation, features] = await Promise.all([
+    const [txRows, replayRows, propagationRows, featureRows] = await Promise.all([
+      fetchJson('/transactions?limit=20'),
       fetchJson('/replay'),
       fetchJson('/propagation'),
       fetchJson('/features'),
     ]);
 
-    replayFrames = replay;
-    propagationEdges = propagation;
+    const previousIndex = Number(timelineInput.value || 0);
+    const previousLength = replayFrames.length;
+    const wasAtTail = previousLength === 0 || previousIndex >= previousLength - 1;
+
+    replayFrames = replayRows;
+    propagationEdges = propagationRows;
     timelineInput.max = String(Math.max(0, replayFrames.length - 1));
-    timelineInput.value = '0';
+    const nextIndex = wasAtTail
+      ? Math.max(0, replayFrames.length - 1)
+      : Math.max(0, Math.min(previousIndex, replayFrames.length - 1));
+    timelineInput.value = String(nextIndex);
 
     buildGraph(propagationEdges);
-    applyReplayFrame(0);
-    renderFeatures(features);
-    apiStatus.textContent = `Connected. replay=${replayFrames.length} propagation=${propagationEdges.length}`;
+    applyReplayFrame(nextIndex);
+    renderFeatures(featureRows);
+    renderTransactions(txRows);
+    const lastUpdated = new Date().toLocaleTimeString();
+    apiStatus.textContent = `Connected. replay=${replayFrames.length} propagation=${propagationEdges.length} tx=${txRows.length} updated=${lastUpdated}`;
   } catch (error) {
     apiStatus.textContent = `API unavailable: ${error.message}`;
   }
@@ -178,3 +239,4 @@ function animate() {
 
 loadData();
 animate();
+window.setInterval(loadData, refreshIntervalMs);
