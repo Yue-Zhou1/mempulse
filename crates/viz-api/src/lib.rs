@@ -1,7 +1,7 @@
 mod live_rpc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -100,6 +100,7 @@ pub trait VizDataProvider: Send + Sync {
     fn feature_details(&self, limit: usize) -> Vec<FeatureDetail>;
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
+    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
 }
 
 #[derive(Clone)]
@@ -255,6 +256,23 @@ impl VizDataProvider for InMemoryVizProvider {
             })
             .unwrap_or_default()
     }
+
+    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
+        let hash = parse_fixed_hex::<32>(hash)?;
+        self.storage.read().ok().and_then(|storage| {
+            let seen = storage.tx_seen().iter().rev().find(|seen| seen.hash == hash)?;
+            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+            Some(TransactionDetail {
+                hash: format_bytes(&seen.hash),
+                peer: seen.peer.clone(),
+                first_seen_unix_ms: seen.first_seen_unix_ms,
+                seen_count: seen.seen_count,
+                sender: full.map(|row| format_bytes(&row.sender)),
+                nonce: full.map(|row| row.nonce),
+                raw_tx_len: full.map(|row| row.raw_tx.len()),
+            })
+        })
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -271,6 +289,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/features/recent", get(features_recent))
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
+        .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/stream", get(stream))
         .layer(cors)
         .with_state(state)
@@ -359,6 +378,30 @@ fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
     })
 }
 
+fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    let bytes = parse_hex_bytes(value)?;
+    if bytes.len() != N {
+        return None;
+    }
+    let mut out = [0_u8; N];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    if trimmed.len() % 2 != 0 {
+        return None;
+    }
+    (0..trimmed.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&trimmed[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()
+}
+
 pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
     if values.len() <= max_points || max_points == 0 {
         return values.to_vec();
@@ -418,6 +461,17 @@ async fn transactions_all(
 ) -> Json<Vec<TransactionDetail>> {
     let limit = query.limit.unwrap_or(1_000).clamp(1, 5_000);
     Json(state.provider.transaction_details(limit))
+}
+
+async fn transaction_by_hash(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Json<TransactionDetail>, StatusCode> {
+    state
+        .provider
+        .transaction_detail_by_hash(&hash)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn stream(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -567,6 +621,12 @@ mod tests {
             ];
             values.into_iter().take(limit).collect()
         }
+
+        fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
+            self.transaction_details(100)
+                .into_iter()
+                .find(|row| row.hash == hash)
+        }
     }
 
     fn test_state(limit: usize) -> AppState {
@@ -695,6 +755,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_by_hash_route_returns_detail_row() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transactions/0x01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: TransactionDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.hash, "0x01");
+        assert_eq!(payload.sender.as_deref(), Some("0xaa"));
+    }
+
+    #[tokio::test]
+    async fn transaction_by_hash_route_returns_404_for_unknown_hash() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transactions/0xdeadbeef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn features_recent_route_returns_rows() {
         let app = build_router(test_state(100));
 
@@ -733,5 +831,36 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].nonce, 3);
         assert_eq!(recent[1].nonce, 2);
+    }
+
+    #[test]
+    fn in_memory_provider_transaction_detail_by_hash_finds_row() {
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        let hash = hash_from_seq(99);
+        {
+            let mut guard = storage.write().expect("write lock");
+            guard.upsert_tx_seen(storage::TxSeenRecord {
+                hash,
+                peer: "rpc-ws".to_owned(),
+                first_seen_unix_ms: 1_700_000_000_000,
+                first_seen_mono_ns: 1_700_000_000_000_000_000,
+                seen_count: 2,
+            });
+            guard.upsert_tx_full(storage::TxFullRecord {
+                hash,
+                sender: [7_u8; 20],
+                nonce: 42,
+                raw_tx: vec![0xaa, 0xbb, 0xcc],
+            });
+        }
+
+        let provider = InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1);
+        let detail = provider
+            .transaction_detail_by_hash(&format_bytes(&hash))
+            .expect("detail row");
+
+        assert_eq!(detail.peer, "rpc-ws");
+        assert_eq!(detail.nonce, Some(42));
+        assert_eq!(detail.raw_tx_len, Some(3));
     }
 }

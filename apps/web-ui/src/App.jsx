@@ -1,12 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { resolveApiBase } from './api-base.js';
+import { mergeTransactionHistory } from './tx-history.js';
 import { BlurFade } from './components/magicui/blur-fade.jsx';
 import { NumberTicker } from './components/magicui/number-ticker.jsx';
 import { ShineBorder } from './components/magicui/shine-border.jsx';
 import { cn } from './lib/utils.js';
 
 const refreshIntervalMs = 2000;
+const txPollLimit = 250;
+const featurePollLimit = 600;
+const maxTransactionHistory = 1500;
+const maxRenderedTransactions = 300;
 const storageKey = 'vizApiBase';
 
 function getStoredApiBase() {
@@ -118,6 +123,9 @@ export default function App() {
   const [timelineIndex, setTimelineIndex] = useState(0);
   const [followLatest, setFollowLatest] = useState(true);
   const [selectedHash, setSelectedHash] = useState(null);
+  const [dialogHash, setDialogHash] = useState(null);
+  const [dialogError, setDialogError] = useState('');
+  const [dialogLoading, setDialogLoading] = useState(false);
 
   const [replayFrames, setReplayFrames] = useState([]);
   const [propagationEdges, setPropagationEdges] = useState([]);
@@ -125,6 +133,12 @@ export default function App() {
   const [featureDetailRows, setFeatureDetailRows] = useState([]);
   const [recentTxRows, setRecentTxRows] = useState([]);
   const [transactionRows, setTransactionRows] = useState([]);
+  const [transactionDetailsByHash, setTransactionDetailsByHash] = useState({});
+  const transactionRowsRef = useRef([]);
+
+  useEffect(() => {
+    transactionRowsRef.current = transactionRows;
+  }, [transactionRows]);
 
   useEffect(() => {
     let mounted = true;
@@ -138,22 +152,28 @@ export default function App() {
       setHasError(false);
 
       try {
-        const [txRecent, txAll, replay, propagation, featureSummary, featureDetails] =
+        const [txRecent, replay, propagation, featureSummary, featureDetails] =
           await Promise.all([
-            fetchJson(apiBase, '/transactions?limit=25'),
-            fetchJson(apiBase, '/transactions/all?limit=5000'),
+            fetchJson(apiBase, `/transactions?limit=${txPollLimit}`),
             fetchJson(apiBase, '/replay'),
             fetchJson(apiBase, '/propagation'),
             fetchJson(apiBase, '/features'),
-            fetchJson(apiBase, '/features/recent?limit=500'),
+            fetchJson(apiBase, `/features/recent?limit=${featurePollLimit}`),
           ]);
 
         if (!mounted) {
           return;
         }
 
+        const nextTransactions = mergeTransactionHistory(
+          transactionRowsRef.current,
+          txRecent,
+          maxTransactionHistory,
+        );
+        transactionRowsRef.current = nextTransactions;
+
         setRecentTxRows(txRecent);
-        setTransactionRows(txAll);
+        setTransactionRows(nextTransactions);
         setReplayFrames(replay);
         setPropagationEdges(propagation);
         setFeatureSummaryRows(featureSummary);
@@ -170,15 +190,15 @@ export default function App() {
         });
 
         setSelectedHash((current) => {
-          if (current && txAll.some((row) => row.hash === current)) {
+          if (current && nextTransactions.some((row) => row.hash === current)) {
             return current;
           }
-          return txAll[0]?.hash ?? null;
+          return nextTransactions[0]?.hash ?? null;
         });
 
         const lastUpdated = new Date().toLocaleTimeString();
         setStatusMessage(
-          `Connected · replay=${replay.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${txAll.length} · ${lastUpdated}`,
+          `Connected · replay=${replay.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · ${lastUpdated}`,
         );
       } catch (error) {
         if (!mounted) {
@@ -197,6 +217,60 @@ export default function App() {
       window.clearInterval(timer);
     };
   }, [apiBase, followLatest]);
+
+  useEffect(() => {
+    if (!dialogHash) {
+      return undefined;
+    }
+    if (transactionDetailsByHash[dialogHash]) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setDialogLoading(true);
+    setDialogError('');
+
+    fetchJson(apiBase, `/transactions/${encodeURIComponent(dialogHash)}`)
+      .then((detail) => {
+        if (cancelled) {
+          return;
+        }
+        setTransactionDetailsByHash((current) => ({
+          ...current,
+          [dialogHash]: detail,
+        }));
+        setDialogLoading(false);
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setDialogLoading(false);
+        setDialogError(`Failed to load tx details: ${error.message}`);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiBase, dialogHash, transactionDetailsByHash]);
+
+  useEffect(() => {
+    if (!dialogHash) {
+      return undefined;
+    }
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setDialogHash(null);
+        setDialogError('');
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [dialogHash]);
 
   const featureByHash = useMemo(() => {
     const map = new Map();
@@ -229,6 +303,12 @@ export default function App() {
     () => transactionRows.find((row) => row.hash === selectedHash) ?? null,
     [selectedHash, transactionRows],
   );
+  const selectedDetail = useMemo(() => {
+    if (!selectedTransaction) {
+      return null;
+    }
+    return transactionDetailsByHash[selectedTransaction.hash] ?? null;
+  }, [selectedTransaction, transactionDetailsByHash]);
 
   const selectedFeature = useMemo(() => {
     if (!selectedTransaction) {
@@ -244,7 +324,29 @@ export default function App() {
     return recentTxRows.find((row) => row.hash === selectedTransaction.hash) ?? null;
   }, [recentTxRows, selectedTransaction]);
 
+  const dialogTransaction = useMemo(() => {
+    if (!dialogHash) {
+      return null;
+    }
+    return transactionRows.find((row) => row.hash === dialogHash) ?? null;
+  }, [dialogHash, transactionRows]);
+
+  const dialogDetail = useMemo(() => {
+    if (!dialogHash) {
+      return null;
+    }
+    return transactionDetailsByHash[dialogHash] ?? null;
+  }, [dialogHash, transactionDetailsByHash]);
+
+  const dialogFeature = useMemo(() => {
+    if (!dialogHash) {
+      return null;
+    }
+    return featureByHash.get(dialogHash) ?? null;
+  }, [dialogHash, featureByHash]);
+
   const currentFrame = replayFrames[timelineIndex] ?? null;
+  const visibleTransactions = filteredTransactions.slice(0, maxRenderedTransactions);
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_20%_10%,#e2e8f0_0%,#f8fafc_46%,#f1f5f9_100%)] p-4 text-zinc-900">
@@ -304,18 +406,26 @@ export default function App() {
               <div className={cn('mt-2 text-xs', hasError ? 'text-rose-600' : 'text-zinc-500')}>
                 {statusMessage}
               </div>
+              <div className="mt-1 text-[11px] text-zinc-500">
+                Retaining latest {maxTransactionHistory} transactions; rendering up to{' '}
+                {maxRenderedTransactions} rows.
+              </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto p-3">
               <AnimatePresence initial={false}>
-                {filteredTransactions.slice(0, 350).map((row, index) => {
+                {visibleTransactions.map((row, index) => {
                   const feature = featureByHash.get(row.hash);
                   const isActive = row.hash === selectedHash;
                   return (
                     <motion.button
                       type="button"
                       key={row.hash}
-                      onClick={() => setSelectedHash(row.hash)}
+                      onClick={() => {
+                        setSelectedHash(row.hash);
+                        setDialogHash(row.hash);
+                        setDialogError('');
+                      }}
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       transition={{ delay: Math.min(index * 0.015, 0.25), duration: 0.25 }}
@@ -336,7 +446,7 @@ export default function App() {
                               {shortHex(row.sender, 12, 6)}
                             </div>
                             <div className={cn('text-xs', isActive ? 'text-zinc-400' : 'text-zinc-500')}>
-                              {formatRelativeTime(row.first_seen_unix_ms)}
+                              {formatRelativeTime(row.seen_unix_ms)}
                             </div>
                           </div>
                           <div
@@ -345,7 +455,7 @@ export default function App() {
                               isActive ? 'text-zinc-300' : 'text-zinc-500',
                             )}
                           >
-                            hash {shortHex(row.hash, 16, 10)} · peer {row.peer}
+                            hash {shortHex(row.hash, 16, 10)} · source {row.source_id}
                           </div>
                           <div className="mt-2 flex flex-wrap gap-1.5">
                             <span
@@ -366,7 +476,7 @@ export default function App() {
                                   : 'border-zinc-300 text-zinc-600',
                               )}
                             >
-                              seen {row.seen_count}
+                              type {row.tx_type}
                             </span>
                             {feature ? (
                               <>
@@ -400,6 +510,12 @@ export default function App() {
                 })}
               </AnimatePresence>
 
+              {filteredTransactions.length > maxRenderedTransactions ? (
+                <div className="mb-3 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs text-zinc-500">
+                  Showing {maxRenderedTransactions} of {filteredTransactions.length} matching rows.
+                </div>
+              ) : null}
+
               {filteredTransactions.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-zinc-300 bg-white p-8 text-center text-sm text-zinc-500">
                   No rows match your search.
@@ -417,11 +533,15 @@ export default function App() {
                   </div>
                   <div className="text-xs text-zinc-500">
                     {selectedTransaction
-                      ? `Peer ${selectedTransaction.peer} · ${formatTime(selectedTransaction.first_seen_unix_ms)}`
+                      ? `${selectedDetail ? `Peer ${selectedDetail.peer}` : `Source ${selectedTransaction.source_id}`} · ${formatTime(selectedDetail?.first_seen_unix_ms ?? selectedTransaction.seen_unix_ms)}`
                       : 'Select a transaction from the middle pane'}
                   </div>
                 </div>
-                <div className="text-xs text-zinc-500">{selectedTransaction ? formatRelativeTime(selectedTransaction.first_seen_unix_ms) : ''}</div>
+                <div className="text-xs text-zinc-500">
+                  {selectedTransaction
+                    ? formatRelativeTime(selectedDetail?.first_seen_unix_ms ?? selectedTransaction.seen_unix_ms)
+                    : ''}
+                </div>
               </div>
             </div>
 
@@ -434,27 +554,43 @@ export default function App() {
                   <div className="mt-3 grid grid-cols-1 gap-3 text-sm md:grid-cols-2">
                     <div>
                       <div className="text-xs text-zinc-500">Hash</div>
-                      <div className="font-mono text-[13px] text-zinc-900">{selectedTransaction ? shortHex(selectedTransaction.hash, 18, 14) : '-'}</div>
+                      <div className="font-mono text-[13px] text-zinc-900">
+                        {selectedTransaction?.hash ?? '-'}
+                      </div>
                     </div>
                     <div>
-                      <div className="text-xs text-zinc-500">First Seen</div>
-                      <div>{selectedTransaction ? formatTime(selectedTransaction.first_seen_unix_ms) : '-'}</div>
+                      <div className="text-xs text-zinc-500">Seen At</div>
+                      <div>
+                        {selectedTransaction
+                          ? formatTime(selectedDetail?.first_seen_unix_ms ?? selectedTransaction.seen_unix_ms)
+                          : '-'}
+                      </div>
                     </div>
                     <div>
                       <div className="text-xs text-zinc-500">Sender</div>
-                      <div className="font-mono text-[13px] text-zinc-900">{selectedTransaction ? shortHex(selectedTransaction.sender, 18, 12) : '-'}</div>
+                      <div className="font-mono text-[13px] text-zinc-900">
+                        {selectedTransaction?.sender ?? selectedDetail?.sender ?? '-'}
+                      </div>
                     </div>
                     <div>
                       <div className="text-xs text-zinc-500">Nonce</div>
-                      <div>{selectedTransaction?.nonce ?? '-'}</div>
+                      <div>{selectedTransaction?.nonce ?? selectedDetail?.nonce ?? '-'}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500">Tx Type</div>
+                      <div>{selectedTransaction?.tx_type ?? '-'}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500">Source</div>
+                      <div>{selectedTransaction?.source_id ?? '-'}</div>
                     </div>
                     <div>
                       <div className="text-xs text-zinc-500">Seen Count</div>
-                      <div>{selectedTransaction?.seen_count ?? '-'}</div>
+                      <div>{selectedDetail?.seen_count ?? '-'}</div>
                     </div>
                     <div>
                       <div className="text-xs text-zinc-500">Raw Payload Size</div>
-                      <div>{selectedTransaction?.raw_tx_len ?? '-'} bytes</div>
+                      <div>{selectedDetail?.raw_tx_len ?? '-'} bytes</div>
                     </div>
                   </div>
                 </div>
@@ -553,6 +689,116 @@ export default function App() {
           </section>
         </div>
       </div>
+
+      {dialogHash ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/50 p-4 backdrop-blur-sm"
+          onClick={() => {
+            setDialogHash(null);
+            setDialogError('');
+          }}
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-2xl border border-zinc-300 bg-white p-5 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                  Transaction Detail
+                </div>
+                <div className="font-mono text-[13px] text-zinc-900">{dialogHash}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setDialogHash(null);
+                  setDialogError('');
+                }}
+                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-zinc-700 transition hover:bg-zinc-100"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-3 text-sm md:grid-cols-2">
+              <div>
+                <div className="text-xs text-zinc-500">Sender</div>
+                <div className="font-mono text-[13px]">{dialogTransaction?.sender ?? dialogDetail?.sender ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Nonce</div>
+                <div>{dialogTransaction?.nonce ?? dialogDetail?.nonce ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Tx Type</div>
+                <div>{dialogTransaction?.tx_type ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Source</div>
+                <div>{dialogTransaction?.source_id ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Seen At</div>
+                <div>
+                  {formatTime(dialogDetail?.first_seen_unix_ms ?? dialogTransaction?.seen_unix_ms)}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Peer</div>
+                <div>{dialogDetail?.peer ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Seen Count</div>
+                <div>{dialogDetail?.seen_count ?? '-'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Raw Payload Size</div>
+                <div>{dialogDetail?.raw_tx_len ?? '-'} bytes</div>
+              </div>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-zinc-300 bg-zinc-50 p-3">
+              <div className="text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                Feature Engine
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-3 text-sm">
+                <div>
+                  <div className="text-xs text-zinc-500">Protocol</div>
+                  <div>{dialogFeature?.protocol ?? '-'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-zinc-500">Category</div>
+                  <div>{dialogFeature?.category ?? '-'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-zinc-500">MEV Score</div>
+                  <div>{dialogFeature?.mev_score ?? '-'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-zinc-500">Urgency Score</div>
+                  <div>{dialogFeature?.urgency_score ?? '-'}</div>
+                </div>
+                <div className="col-span-2">
+                  <div className="text-xs text-zinc-500">Method Selector</div>
+                  <div className="font-mono text-[13px]">{dialogFeature?.method_selector ?? '-'}</div>
+                </div>
+              </div>
+            </div>
+
+            {dialogLoading ? (
+              <div className="mt-4 rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-2 text-xs text-zinc-600">
+                Loading on-demand transaction detail...
+              </div>
+            ) : null}
+            {dialogError ? (
+              <div className="mt-4 rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                {dialogError}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
