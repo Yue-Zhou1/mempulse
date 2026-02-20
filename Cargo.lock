@@ -605,6 +605,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingest"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "common",
+ "event-log",
+ "hashbrown",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -688,18 +702,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "mempool-state"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "common",
- "event-log",
- "hashbrown",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -730,18 +732,6 @@ name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
-
-[[package]]
-name = "p2p-ingest"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "common",
- "event-log",
- "hashbrown",
- "serde",
- "tracing",
-]
 
 [[package]]
 name = "percent-encoding"
@@ -908,10 +898,11 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 name = "replay"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "common",
  "event-log",
- "mempool-state",
+ "hashbrown",
  "serde",
  "serde_json",
 ]
@@ -966,20 +957,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rpc-ingest"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "common",
- "event-log",
- "hashbrown",
- "serde",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1448,16 +1425,6 @@ dependencies = [
  "sha1",
  "thiserror",
  "utf-8",
-]
-
-[[package]]
-name = "tx-decode"
-version = "0.1.0"
-dependencies = [
- "common",
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]

@@ -2,10 +2,7 @@
 members = [
   "crates/common",
   "crates/event-log",
-  "crates/rpc-ingest",
-  "crates/p2p-ingest",
-  "crates/tx-decode",
-  "crates/mempool-state",
+  "crates/ingest",
   "crates/feature-engine",
   "crates/storage",
   "crates/viz-api",

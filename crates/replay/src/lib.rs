@@ -1,8 +1,11 @@
+mod mempool_state;
+
 use common::TxHash;
 use event_log::{EventEnvelope, EventPayload, sort_deterministic};
-use mempool_state::{MempoolState, TxLifecycleStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub use mempool_state::{MempoolState, StateTransition, TxLifecycleStatus};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayMode {
