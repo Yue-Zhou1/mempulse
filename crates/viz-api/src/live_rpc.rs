@@ -7,7 +7,6 @@ use hashbrown::HashSet;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
@@ -19,46 +18,40 @@ use tokio_tungstenite::tungstenite::Message;
 
 type FastSet<T> = HashSet<T, RandomState>;
 
+const PRIMARY_PUBLIC_WS_URL: &str = "wss://eth.drpc.org";
+const PRIMARY_PUBLIC_HTTP_URL: &str = "https://eth.drpc.org";
+const FALLBACK_PUBLIC_WS_URL: &str = "wss://ethereum-rpc.publicnode.com";
+const FALLBACK_PUBLIC_HTTP_URL: &str = "https://ethereum-rpc.publicnode.com";
+
+#[derive(Clone, Debug)]
+struct RpcEndpoint {
+    ws_url: &'static str,
+    http_url: &'static str,
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveRpcConfig {
-    ws_url: String,
-    http_url: Option<String>,
+    endpoints: Vec<RpcEndpoint>,
     source_id: SourceId,
     max_seen_hashes: usize,
 }
 
-impl LiveRpcConfig {
-    pub fn from_env() -> Option<Self> {
-        let ws_url = env::var("VIZ_API_ETH_WS_URL").ok()?.trim().to_owned();
-        if ws_url.is_empty() {
-            return None;
+impl Default for LiveRpcConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: vec![
+                RpcEndpoint {
+                    ws_url: PRIMARY_PUBLIC_WS_URL,
+                    http_url: PRIMARY_PUBLIC_HTTP_URL,
+                },
+                RpcEndpoint {
+                    ws_url: FALLBACK_PUBLIC_WS_URL,
+                    http_url: FALLBACK_PUBLIC_HTTP_URL,
+                },
+            ],
+            source_id: SourceId::new("rpc-live"),
+            max_seen_hashes: 10_000,
         }
-        let http_url = env::var("VIZ_API_ETH_HTTP_URL").ok().and_then(|url| {
-            let trimmed = url.trim().to_owned();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        });
-        let source_id = SourceId::new(
-            env::var("VIZ_API_SOURCE_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "rpc-live".to_owned()),
-        );
-        let max_seen_hashes = env::var("VIZ_API_MAX_SEEN_HASHES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(10_000)
-            .max(100);
-
-        Some(Self {
-            ws_url,
-            http_url,
-            source_id,
-            max_seen_hashes,
-        })
     }
 }
 
@@ -77,15 +70,29 @@ pub fn start_live_rpc_feed(
             .timeout(Duration::from_secs(6))
             .build()
             .expect("reqwest client");
+        if config.endpoints.is_empty() {
+            tracing::error!("live rpc config has no endpoints");
+            return;
+        }
 
         let mut seen_hashes = FastSet::default();
         let mut seen_order = VecDeque::new();
         let mut next_seq_id = current_seq_hi(&storage).saturating_add(1).max(1);
+        let mut endpoint_index = 0usize;
 
         loop {
+            let endpoint = &config.endpoints[endpoint_index];
+            tracing::info!(
+                ws_url = endpoint.ws_url,
+                http_url = endpoint.http_url,
+                endpoint_index,
+                "starting live rpc websocket session"
+            );
             let session_result = run_ws_session(
                 &writer,
-                &config,
+                endpoint,
+                &config.source_id,
+                config.max_seen_hashes,
                 &client,
                 &mut next_seq_id,
                 &mut seen_hashes,
@@ -94,7 +101,15 @@ pub fn start_live_rpc_feed(
             .await;
 
             if let Err(err) = session_result {
-                tracing::warn!(error = %err, "live rpc websocket session ended");
+                let error_chain = format_error_chain(&err);
+                tracing::warn!(
+                    error = %err,
+                    error_chain = %error_chain,
+                    ws_url = endpoint.ws_url,
+                    http_url = endpoint.http_url,
+                    "live rpc websocket session ended; rotating endpoint"
+                );
+                endpoint_index = (endpoint_index + 1) % config.endpoints.len();
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -103,15 +118,17 @@ pub fn start_live_rpc_feed(
 
 async fn run_ws_session(
     writer: &StorageWriteHandle,
-    config: &LiveRpcConfig,
+    endpoint: &RpcEndpoint,
+    source_id: &SourceId,
+    max_seen_hashes: usize,
     client: &reqwest::Client,
     next_seq_id: &mut u64,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
-    let (ws_stream, _) = connect_async(config.ws_url.as_str())
+    let (ws_stream, _) = connect_async(endpoint.ws_url)
         .await
-        .with_context(|| format!("connect {}", config.ws_url))?;
+        .with_context(|| format!("connect {}", endpoint.ws_url))?;
     let (mut write, mut read) = ws_stream.split();
 
     let subscribe = json!({
@@ -124,6 +141,10 @@ async fn run_ws_session(
         .send(Message::Text(subscribe.to_string().into()))
         .await
         .context("send eth_subscribe request")?;
+    tracing::info!(
+        ws_url = endpoint.ws_url,
+        "subscribed to eth_subscribe:newPendingTransactions"
+    );
 
     let mut subscription_id: Option<String> = None;
     while let Some(frame) = read.next().await {
@@ -133,7 +154,9 @@ async fn run_ws_session(
                 if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
                     process_pending_hash(
                         writer,
-                        config,
+                        endpoint,
+                        source_id,
+                        max_seen_hashes,
                         client,
                         &hash_hex,
                         next_seq_id,
@@ -187,7 +210,9 @@ fn parse_pending_hash(payload: &str, subscription_id: &mut Option<String>) -> Op
 
 async fn process_pending_hash(
     writer: &StorageWriteHandle,
-    config: &LiveRpcConfig,
+    endpoint: &RpcEndpoint,
+    source_id: &SourceId,
+    max_seen_hashes: usize,
     client: &reqwest::Client,
     hash_hex: &str,
     next_seq_id: &mut u64,
@@ -198,23 +223,63 @@ async fn process_pending_hash(
         Some(hash) => hash,
         None => return Ok(()),
     };
-    if !remember_hash(hash, seen_hashes, seen_order, config.max_seen_hashes) {
+    if !remember_hash(hash, seen_hashes, seen_order, max_seen_hashes) {
         return Ok(());
     }
 
     let now_unix_ms = current_unix_ms();
-    let mut fetched_tx = None;
-    if let Some(http_url) = config.http_url.as_deref() {
-        match fetch_transaction_by_hash(client, http_url, hash_hex).await {
-            Ok(tx) => fetched_tx = tx,
-            Err(err) => tracing::warn!(error = %err, hash = hash_hex, "fetch tx by hash failed"),
+    let fetched_tx = match fetch_transaction_by_hash(client, endpoint.http_url, hash_hex).await {
+        Ok(tx) => tx,
+        Err(err) => {
+            let error_chain = format_error_chain(&err);
+            tracing::warn!(
+                error = %err,
+                error_chain = %error_chain,
+                hash = hash_hex,
+                http_url = endpoint.http_url,
+                "fetch tx by hash failed"
+            );
+            None
         }
+    };
+
+    if let Some(tx) = fetched_tx.as_ref() {
+        let to = format_optional_fixed_hex(tx.to.as_ref().map(|value| value.as_slice()));
+        let chain_id = format_optional_u64(tx.chain_id);
+        let gas_limit = format_optional_u64(tx.gas_limit);
+        let value_wei = format_optional_u128(tx.value_wei);
+        let gas_price_wei = format_optional_u128(tx.gas_price_wei);
+        let max_fee_per_gas_wei = format_optional_u128(tx.max_fee_per_gas_wei);
+        let max_priority_fee_per_gas_wei =
+            format_optional_u128(tx.max_priority_fee_per_gas_wei);
+        let max_fee_per_blob_gas_wei = format_optional_u128(tx.max_fee_per_blob_gas_wei);
+        tracing::info!(
+            hash = hash_hex,
+            sender = %format_fixed_hex(&tx.sender),
+            to = %to,
+            nonce = tx.nonce,
+            tx_type = tx.tx_type,
+            chain_id = %chain_id,
+            gas_limit = %gas_limit,
+            value_wei = %value_wei,
+            gas_price_wei = %gas_price_wei,
+            max_fee_per_gas_wei = %max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei = %max_priority_fee_per_gas_wei,
+            max_fee_per_blob_gas_wei = %max_fee_per_blob_gas_wei,
+            input_bytes = tx.input.len(),
+            "mempool transaction"
+        );
+    } else {
+        tracing::info!(
+            hash = hash_hex,
+            "mempool transaction (details unavailable from rpc)"
+        );
     }
 
     append_event(
         writer,
         next_seq_id,
-        &config.source_id,
+        source_id,
         now_unix_ms,
         EventPayload::TxSeen(TxSeen {
             hash,
@@ -237,7 +302,7 @@ async fn process_pending_hash(
     append_event(
         writer,
         next_seq_id,
-        &config.source_id,
+        source_id,
         now_unix_ms,
         EventPayload::TxFetched(TxFetched {
             hash,
@@ -250,7 +315,7 @@ async fn process_pending_hash(
         append_event(
             writer,
             next_seq_id,
-            &config.source_id,
+            source_id,
             now_unix_ms,
             EventPayload::TxDecoded(TxDecoded {
                 hash: tx.hash,
@@ -326,9 +391,25 @@ struct RpcTransaction {
     #[serde(default)]
     from: Option<String>,
     #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
     nonce: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    gas: Option<String>,
     #[serde(default, rename = "type")]
     tx_type: Option<String>,
+    #[serde(default, rename = "chainId")]
+    chain_id: Option<String>,
+    #[serde(default, rename = "gasPrice")]
+    gas_price: Option<String>,
+    #[serde(default, rename = "maxFeePerGas")]
+    max_fee_per_gas: Option<String>,
+    #[serde(default, rename = "maxPriorityFeePerGas")]
+    max_priority_fee_per_gas: Option<String>,
+    #[serde(default, rename = "maxFeePerBlobGas")]
+    max_fee_per_blob_gas: Option<String>,
     #[serde(default)]
     input: Option<String>,
 }
@@ -337,8 +418,16 @@ struct RpcTransaction {
 struct LiveTx {
     hash: TxHash,
     sender: [u8; 20],
+    to: Option<[u8; 20]>,
     nonce: u64,
     tx_type: u8,
+    value_wei: Option<u128>,
+    gas_limit: Option<u64>,
+    chain_id: Option<u64>,
+    gas_price_wei: Option<u128>,
+    max_fee_per_gas_wei: Option<u128>,
+    max_priority_fee_per_gas_wei: Option<u128>,
+    max_fee_per_blob_gas_wei: Option<u128>,
     input: Vec<u8>,
 }
 
@@ -374,7 +463,10 @@ async fn fetch_transaction_by_hash(
         _ => return Ok(None),
     };
     let tx: RpcTransaction = serde_json::from_value(result).context("decode rpc transaction")?;
+    Ok(Some(rpc_tx_to_live_tx(tx, hash_hex)?))
+}
 
+fn rpc_tx_to_live_tx(tx: RpcTransaction, hash_hex: &str) -> Result<LiveTx> {
     let hash = parse_fixed_hex::<32>(&tx.hash)
         .or_else(|| parse_fixed_hex::<32>(hash_hex))
         .ok_or_else(|| anyhow!("invalid transaction hash"))?;
@@ -383,6 +475,7 @@ async fn fetch_transaction_by_hash(
         .as_deref()
         .and_then(parse_fixed_hex::<20>)
         .unwrap_or([0_u8; 20]);
+    let to = tx.to.as_deref().and_then(parse_fixed_hex::<20>);
     let nonce = tx
         .nonce
         .as_deref()
@@ -398,14 +491,35 @@ async fn fetch_transaction_by_hash(
         .as_deref()
         .and_then(parse_hex_bytes)
         .unwrap_or_default();
+    let value_wei = tx.value.as_deref().and_then(parse_hex_u128);
+    let gas_limit = tx.gas.as_deref().and_then(parse_hex_u64);
+    let chain_id = tx.chain_id.as_deref().and_then(parse_hex_u64);
+    let gas_price_wei = tx.gas_price.as_deref().and_then(parse_hex_u128);
+    let max_fee_per_gas_wei = tx.max_fee_per_gas.as_deref().and_then(parse_hex_u128);
+    let max_priority_fee_per_gas_wei = tx
+        .max_priority_fee_per_gas
+        .as_deref()
+        .and_then(parse_hex_u128);
+    let max_fee_per_blob_gas_wei = tx
+        .max_fee_per_blob_gas
+        .as_deref()
+        .and_then(parse_hex_u128);
 
-    Ok(Some(LiveTx {
+    Ok(LiveTx {
         hash,
         sender,
+        to,
         nonce,
         tx_type,
+        value_wei,
+        gas_limit,
+        chain_id,
+        gas_price_wei,
+        max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei,
+        max_fee_per_blob_gas_wei,
         input,
-    }))
+    })
 }
 
 fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
@@ -440,6 +554,52 @@ fn parse_hex_u64(value: &str) -> Option<u64> {
     u64::from_str_radix(trimmed, 16).ok()
 }
 
+fn parse_hex_u128(value: &str) -> Option<u128> {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    u128::from_str_radix(trimmed, 16).ok()
+}
+
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut rendered = String::new();
+    for (index, cause) in err.chain().enumerate() {
+        if index > 0 {
+            rendered.push_str(": ");
+        }
+        rendered.push_str(&cause.to_string());
+    }
+    rendered
+}
+
+fn format_fixed_hex(bytes: &[u8]) -> String {
+    let mut out = String::from("0x");
+    out.reserve(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn format_optional_fixed_hex(bytes: Option<&[u8]>) -> String {
+    bytes
+        .map(format_fixed_hex)
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn format_optional_u128(value: Option<u128>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
 fn current_seq_hi(storage: &Arc<RwLock<InMemoryStorage>>) -> u64 {
     storage
         .read()
@@ -453,4 +613,71 @@ fn current_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use serde_json::json;
+
+    #[test]
+    fn default_live_rpc_config_has_primary_and_fallback_public_endpoints() {
+        let config = LiveRpcConfig::default();
+        assert_eq!(config.endpoints.len(), 2);
+        assert_eq!(config.endpoints[0].ws_url, PRIMARY_PUBLIC_WS_URL);
+        assert_eq!(config.endpoints[0].http_url, PRIMARY_PUBLIC_HTTP_URL);
+        assert_eq!(config.endpoints[1].ws_url, FALLBACK_PUBLIC_WS_URL);
+        assert_eq!(config.endpoints[1].http_url, FALLBACK_PUBLIC_HTTP_URL);
+        assert_eq!(config.source_id, SourceId::new("rpc-live"));
+        assert!(config.max_seen_hashes >= 100);
+    }
+
+    #[test]
+    fn format_error_chain_includes_context_and_root() {
+        let err = anyhow!("root cause")
+            .context("inner context")
+            .context("outer context");
+
+        let rendered = format_error_chain(&err);
+
+        assert_eq!(rendered, "outer context: inner context: root cause");
+    }
+
+    #[test]
+    fn rpc_tx_to_live_tx_parses_extended_fields() {
+        let hash_hex = format!("0x{}", "11".repeat(32));
+        let rpc_tx: RpcTransaction = serde_json::from_value(json!({
+            "hash": hash_hex,
+            "from": format!("0x{}", "22".repeat(20)),
+            "to": format!("0x{}", "33".repeat(20)),
+            "nonce": "0x2a",
+            "type": "0x2",
+            "input": "0xaabb",
+            "value": "0x0de0b6b3a7640000",
+            "gas": "0x5208",
+            "chainId": "0x1",
+            "gasPrice": "0x3b9aca00",
+            "maxFeePerGas": "0x4a817c800",
+            "maxPriorityFeePerGas": "0x77359400",
+            "maxFeePerBlobGas": "0x3"
+        }))
+        .expect("decode rpc tx");
+
+        let live = rpc_tx_to_live_tx(rpc_tx, &format!("0x{}", "11".repeat(32))).expect("map tx");
+
+        assert_eq!(live.hash, [0x11; 32]);
+        assert_eq!(live.sender, [0x22; 20]);
+        assert_eq!(live.to, Some([0x33; 20]));
+        assert_eq!(live.nonce, 42);
+        assert_eq!(live.tx_type, 2);
+        assert_eq!(live.input, vec![0xaa, 0xbb]);
+        assert_eq!(live.value_wei, Some(1_000_000_000_000_000_000));
+        assert_eq!(live.gas_limit, Some(21_000));
+        assert_eq!(live.chain_id, Some(1));
+        assert_eq!(live.gas_price_wei, Some(1_000_000_000));
+        assert_eq!(live.max_fee_per_gas_wei, Some(20_000_000_000));
+        assert_eq!(live.max_priority_fee_per_gas_wei, Some(2_000_000_000));
+        assert_eq!(live.max_fee_per_blob_gas_wei, Some(3));
+    }
 }

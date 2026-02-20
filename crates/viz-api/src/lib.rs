@@ -6,17 +6,20 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, NoopClickHouseSink,
-    StorageWriteHandle, StorageWriteOp, StorageWriterConfig, TxFeaturesRecord, spawn_single_writer,
+    StorageWriterConfig, spawn_single_writer,
 };
 use tower_http::cors::{Any, CorsLayer};
+
+#[cfg(test)]
+use event_log::{EventEnvelope, EventPayload, TxDecoded};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +60,17 @@ pub struct TransactionSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionDetail {
+    pub hash: String,
+    pub peer: String,
+    pub first_seen_unix_ms: i64,
+    pub seen_count: u32,
+    pub sender: Option<String>,
+    pub nonce: Option<u64>,
+    pub raw_tx_len: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
 }
@@ -74,6 +88,7 @@ pub trait VizDataProvider: Send + Sync {
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
     fn feature_summary(&self) -> Vec<FeatureSummary>;
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
+    fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
 }
 
 #[derive(Clone)]
@@ -162,6 +177,43 @@ impl VizDataProvider for InMemoryVizProvider {
             })
             .unwrap_or_default()
     }
+
+    fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
+        self.storage
+            .read()
+            .ok()
+            .map(|storage| {
+                let mut full_by_hash = std::collections::HashMap::new();
+                for row in storage.tx_full() {
+                    full_by_hash.insert(row.hash, row);
+                }
+
+                let mut emitted = std::collections::HashSet::new();
+                let mut out = Vec::new();
+
+                for seen in storage.tx_seen().iter().rev() {
+                    if !emitted.insert(seen.hash) {
+                        continue;
+                    }
+                    let full = full_by_hash.get(&seen.hash).copied();
+                    out.push(TransactionDetail {
+                        hash: format_bytes(&seen.hash),
+                        peer: seen.peer.clone(),
+                        first_seen_unix_ms: seen.first_seen_unix_ms,
+                        seen_count: seen.seen_count,
+                        sender: full.map(|row| format_bytes(&row.sender)),
+                        nonce: full.map(|row| row.nonce),
+                        raw_tx_len: full.map(|row| row.raw_tx.len()),
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+
+                out
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -176,6 +228,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/propagation", get(propagation))
         .route("/features", get(features))
         .route("/transactions", get(transactions))
+        .route("/transactions/all", get(transactions_all))
         .route("/stream", get(stream))
         .layer(cors)
         .with_state(state)
@@ -192,19 +245,7 @@ pub fn default_state() -> AppState {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
-    let live_rpc_config = LiveRpcConfig::from_env();
-    if live_rpc_config.is_none() {
-        if let Ok(mut store) = storage.write() {
-            store.append_event(seed_decoded_event(1, 1, 1));
-            store.append_event(seed_decoded_event(2, 2, 2));
-            store.upsert_tx_features(TxFeaturesRecord {
-                hash: hash_from_seq(1),
-                protocol: "uniswap-v2".to_owned(),
-                category: "swap".to_owned(),
-                mev_score: 80,
-            });
-        }
-    }
+    let live_rpc_config = LiveRpcConfig::default();
 
     let propagation = vec![
         PropagationEdge {
@@ -220,11 +261,7 @@ pub fn default_state() -> AppState {
             p99_delay_ms: 36,
         },
     ];
-    if let Some(config) = live_rpc_config {
-        start_live_rpc_feed(storage.clone(), writer.clone(), config);
-    } else {
-        start_demo_event_feed(storage.clone(), writer.clone());
-    }
+    start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
 
     AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
@@ -232,6 +269,7 @@ pub fn default_state() -> AppState {
     }
 }
 
+#[cfg(test)]
 fn seed_decoded_event(seq_id: u64, hash_seed: u64, nonce: u64) -> EventEnvelope {
     EventEnvelope {
         seq_id,
@@ -247,81 +285,14 @@ fn seed_decoded_event(seq_id: u64, hash_seed: u64, nonce: u64) -> EventEnvelope 
     }
 }
 
-fn start_demo_event_feed(storage: Arc<RwLock<InMemoryStorage>>, writer: StorageWriteHandle) {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle,
-        Err(_) => return,
-    };
-
-    let start_seq = storage
-        .read()
-        .ok()
-        .and_then(|store| store.latest_seq_id())
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(1);
-
-    handle.spawn(async move {
-        let mut ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            Duration::from_secs(1),
-        );
-        let mut seq_id = start_seq;
-        let mut nonce = start_seq;
-
-        loop {
-            ticker.tick().await;
-            let hash = hash_from_seq(seq_id);
-            let protocol = if seq_id % 2 == 0 {
-                "uniswap-v2"
-            } else {
-                "curve"
-            };
-            let category = if seq_id % 3 == 0 { "arb" } else { "swap" };
-            let score = 50 + ((seq_id % 45) as u16);
-
-            let event = EventEnvelope {
-                seq_id,
-                ingest_ts_unix_ms: current_unix_ms(),
-                ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
-                source_id: common::SourceId::new("demo-live"),
-                payload: EventPayload::TxDecoded(TxDecoded {
-                    hash,
-                    tx_type: 2,
-                    sender: [9; 20],
-                    nonce,
-                }),
-            };
-            if writer
-                .enqueue(StorageWriteOp::AppendEvent(event))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            if writer
-                .enqueue(StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
-                    hash,
-                    protocol: protocol.to_owned(),
-                    category: category.to_owned(),
-                    mev_score: score,
-                }))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            seq_id = seq_id.saturating_add(1);
-            nonce = nonce.saturating_add(1);
-        }
-    });
-}
+#[cfg(test)]
 fn hash_from_seq(seq: u64) -> [u8; 32] {
     let mut hash = [0_u8; 32];
     hash[..8].copy_from_slice(&seq.to_be_bytes());
     hash
 }
 
+#[cfg(test)]
 fn current_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -380,6 +351,14 @@ async fn transactions(
 ) -> Json<Vec<TransactionSummary>> {
     let limit = query.limit.unwrap_or(25).clamp(1, 200);
     Json(state.provider.recent_transactions(limit))
+}
+
+async fn transactions_all(
+    State(state): State<AppState>,
+    Query(query): Query<TransactionsQuery>,
+) -> Json<Vec<TransactionDetail>> {
+    let limit = query.limit.unwrap_or(1_000).clamp(1, 5_000);
+    Json(state.provider.transaction_details(limit))
 }
 
 async fn stream(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -483,6 +462,30 @@ mod tests {
             ];
             values.into_iter().take(limit).collect()
         }
+
+        fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
+            let values = vec![
+                TransactionDetail {
+                    hash: "0x01".to_owned(),
+                    peer: "rpc-ws".to_owned(),
+                    first_seen_unix_ms: 1_700_000_000_000,
+                    seen_count: 1,
+                    sender: Some("0xaa".to_owned()),
+                    nonce: Some(7),
+                    raw_tx_len: Some(120),
+                },
+                TransactionDetail {
+                    hash: "0x02".to_owned(),
+                    peer: "rpc-ws".to_owned(),
+                    first_seen_unix_ms: 1_700_000_000_100,
+                    seen_count: 1,
+                    sender: None,
+                    nonce: None,
+                    raw_tx_len: None,
+                },
+            ];
+            values.into_iter().take(limit).collect()
+        }
     }
 
     fn test_state(limit: usize) -> AppState {
@@ -535,20 +538,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_state_replay_points_grow_over_time() {
-        if std::env::var("VIZ_API_ETH_WS_URL").is_ok() {
-            return;
-        }
+    async fn default_state_initializes_live_rpc_without_env() {
         let state = default_state();
-        let before = state.provider.replay_points().len();
-
-        tokio::time::sleep(std::time::Duration::from_millis(1_250)).await;
-
-        let after = state.provider.replay_points().len();
-        assert!(
-            after > before,
-            "expected replay points to grow, before={before}, after={after}"
-        );
+        let _ = state.provider.replay_points();
+        assert_eq!(state.downsample_limit, 1_000);
     }
 
     #[tokio::test]
@@ -596,6 +589,28 @@ mod tests {
         let payload: Vec<TransactionSummary> = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0].hash, "0x01");
+    }
+
+    #[tokio::test]
+    async fn transactions_all_route_returns_detail_rows() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transactions/all?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Vec<TransactionDetail> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0].hash, "0x01");
+        assert_eq!(payload[1].hash, "0x02");
     }
 
     #[test]
