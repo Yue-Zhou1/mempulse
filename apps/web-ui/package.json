@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "python3 -m http.server 5173",
+    "dev": "python3 -m http.server 5174",
     "test": "node --test src/api-base.test.mjs"
   }
 }
