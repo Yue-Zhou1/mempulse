@@ -57,6 +57,8 @@ pub struct TxFeaturesRecord {
     pub protocol: String,
     pub category: String,
     pub mev_score: u16,
+    pub urgency_score: u16,
+    pub method_selector: Option<[u8; 4]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -572,6 +574,8 @@ mod tests {
             protocol: "uniswap-v2".to_owned(),
             category: "swap".to_owned(),
             mev_score: 80,
+            urgency_score: 40,
+            method_selector: Some([0x38, 0xed, 0x17, 0x39]),
         });
         store.upsert_tx_lifecycle(TxLifecycleRecord {
             hash: hash(1),
@@ -771,6 +775,8 @@ mod tests {
                 protocol: "uniswap-v2".to_owned(),
                 category: "swap".to_owned(),
                 mev_score: 80,
+                urgency_score: 40,
+                method_selector: Some([0x38, 0xed, 0x17, 0x39]),
             });
             store.upsert_tx_lifecycle(TxLifecycleRecord {
                 hash,

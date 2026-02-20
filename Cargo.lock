@@ -236,7 +236,6 @@ name = "feature-engine"
 version = "0.1.0"
 dependencies = [
  "common",
- "serde",
 ]
 
 [[package]]
@@ -1524,6 +1523,7 @@ dependencies = [
  "axum",
  "common",
  "event-log",
+ "feature-engine",
  "futures",
  "hashbrown",
  "replay",

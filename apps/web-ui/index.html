@@ -77,6 +77,119 @@
         margin-bottom: 4px;
         font-family: "IBM Plex Mono", "Consolas", monospace;
       }
+      #txPanel {
+        position: fixed;
+        left: 16px;
+        right: 16px;
+        bottom: 16px;
+        max-height: min(42vh, 420px);
+        background: rgba(2, 6, 23, 0.8);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 12px;
+        padding: 12px 14px;
+        backdrop-filter: blur(5px);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #txPanelTitle {
+        font-size: 13px;
+        color: #bfdbfe;
+      }
+      #txDetailWrap {
+        overflow: auto;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 8px;
+      }
+      #txTable {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 11px;
+      }
+      #txTable th,
+      #txTable td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        white-space: nowrap;
+      }
+      #txTable th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: rgba(2, 6, 23, 0.95);
+        color: #bfdbfe;
+      }
+      #txTable tbody tr:hover {
+        background: rgba(59, 130, 246, 0.08);
+      }
+      .mono {
+        font-family: "IBM Plex Mono", "Consolas", monospace;
+      }
+      #featurePanel {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        width: min(600px, calc(100vw - 32px));
+        max-height: min(42vh, 420px);
+        background: rgba(2, 6, 23, 0.8);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        border-radius: 12px;
+        padding: 12px 14px;
+        backdrop-filter: blur(5px);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #featurePanelTitle {
+        font-size: 13px;
+        color: #bfdbfe;
+      }
+      #featureDetailWrap {
+        overflow: auto;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 8px;
+      }
+      #featureTable {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 11px;
+      }
+      #featureTable th,
+      #featureTable td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        white-space: nowrap;
+      }
+      #featureTable th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: rgba(2, 6, 23, 0.95);
+        color: #bfdbfe;
+      }
+      #featureTable tbody tr:hover {
+        background: rgba(14, 165, 233, 0.08);
+      }
+      @media (max-width: 900px) {
+        #featurePanel {
+          position: fixed;
+          top: auto;
+          right: 16px;
+          left: 16px;
+          bottom: min(52vh, 460px);
+          width: auto;
+          max-height: 34vh;
+        }
+        #txPanel {
+          max-height: 50vh;
+        }
+        #txTable,
+        #featureTable {
+          font-size: 10px;
+        }
+      }
     </style>
   </head>
   <body>
@@ -93,6 +206,43 @@
       <ul id="featureList"></ul>
       <div id="txTitle">Recent transactions</div>
       <ul id="txList"></ul>
+    </div>
+    <div id="featurePanel">
+      <div id="featurePanelTitle">Feature engine outputs (<span id="featureTotalCount">0</span>)</div>
+      <div id="featureDetailWrap">
+        <table id="featureTable">
+          <thead>
+            <tr>
+              <th>Hash</th>
+              <th>Protocol</th>
+              <th>Category</th>
+              <th>MEV</th>
+              <th>Urgency</th>
+              <th>Selector</th>
+            </tr>
+          </thead>
+          <tbody id="featureTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="txPanel">
+      <div id="txPanelTitle">Observed mempool transactions (<span id="txTotalCount">0</span>)</div>
+      <div id="txDetailWrap">
+        <table id="txTable">
+          <thead>
+            <tr>
+              <th>Hash</th>
+              <th>Peer</th>
+              <th>First seen</th>
+              <th>Seen count</th>
+              <th>Sender</th>
+              <th>Nonce</th>
+              <th>Raw bytes</th>
+            </tr>
+          </thead>
+          <tbody id="txTableBody"></tbody>
+        </table>
+      </div>
     </div>
     <script type="module" src="./src/index.js"></script>
   </body>

@@ -50,6 +50,16 @@ pub struct FeatureSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FeatureDetail {
+    pub hash: String,
+    pub protocol: String,
+    pub category: String,
+    pub mev_score: u16,
+    pub urgency_score: u16,
+    pub method_selector: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionSummary {
     pub hash: String,
     pub sender: String,
@@ -87,6 +97,7 @@ pub trait VizDataProvider: Send + Sync {
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
     fn feature_summary(&self) -> Vec<FeatureSummary>;
+    fn feature_details(&self, limit: usize) -> Vec<FeatureDetail>;
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
 }
@@ -153,6 +164,36 @@ impl VizDataProvider for InMemoryVizProvider {
                         count: 1,
                     })
                     .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn feature_details(&self, limit: usize) -> Vec<FeatureDetail> {
+        self.storage
+            .read()
+            .ok()
+            .map(|storage| {
+                let mut emitted = std::collections::HashSet::new();
+                let mut out = Vec::new();
+
+                for feature in storage.tx_features().iter().rev() {
+                    if !emitted.insert(feature.hash) {
+                        continue;
+                    }
+                    out.push(FeatureDetail {
+                        hash: format_bytes(&feature.hash),
+                        protocol: feature.protocol.clone(),
+                        category: feature.category.clone(),
+                        mev_score: feature.mev_score,
+                        urgency_score: feature.urgency_score,
+                        method_selector: format_method_selector(feature.method_selector),
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+
+                out
             })
             .unwrap_or_default()
     }
@@ -227,6 +268,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/replay", get(replay))
         .route("/propagation", get(propagation))
         .route("/features", get(features))
+        .route("/features/recent", get(features_recent))
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/stream", get(stream))
@@ -308,6 +350,15 @@ fn format_bytes(bytes: &[u8]) -> String {
     out
 }
 
+fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
+    method_selector.map(|selector| {
+        format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            selector[0], selector[1], selector[2], selector[3]
+        )
+    })
+}
+
 pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
     if values.len() <= max_points || max_points == 0 {
         return values.to_vec();
@@ -338,6 +389,14 @@ async fn propagation(State(state): State<AppState>) -> Json<Vec<PropagationEdge>
 async fn features(State(state): State<AppState>) -> Json<Vec<FeatureSummary>> {
     let values = state.provider.feature_summary();
     Json(downsample(&values, state.downsample_limit))
+}
+
+async fn features_recent(
+    State(state): State<AppState>,
+    Query(query): Query<TransactionsQuery>,
+) -> Json<Vec<FeatureDetail>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 5_000);
+    Json(state.provider.feature_details(limit))
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -439,6 +498,28 @@ mod tests {
                 category: "swap".to_owned(),
                 count: 1,
             }]
+        }
+
+        fn feature_details(&self, limit: usize) -> Vec<FeatureDetail> {
+            let values = vec![
+                FeatureDetail {
+                    hash: "0x01".to_owned(),
+                    protocol: "uniswap-v2".to_owned(),
+                    category: "swap".to_owned(),
+                    mev_score: 72,
+                    urgency_score: 18,
+                    method_selector: Some("0x38ed1739".to_owned()),
+                },
+                FeatureDetail {
+                    hash: "0x02".to_owned(),
+                    protocol: "erc20".to_owned(),
+                    category: "transfer".to_owned(),
+                    mev_score: 18,
+                    urgency_score: 7,
+                    method_selector: Some("0xa9059cbb".to_owned()),
+                },
+            ];
+            values.into_iter().take(limit).collect()
         }
 
         fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary> {
@@ -611,6 +692,28 @@ mod tests {
         assert_eq!(payload.len(), 2);
         assert_eq!(payload[0].hash, "0x01");
         assert_eq!(payload[1].hash, "0x02");
+    }
+
+    #[tokio::test]
+    async fn features_recent_route_returns_rows() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/features/recent?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Vec<FeatureDetail> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0].protocol, "uniswap-v2");
+        assert_eq!(payload[0].mev_score, 72);
     }
 
     #[test]

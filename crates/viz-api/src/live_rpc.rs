@@ -2,6 +2,7 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use feature_engine::{FeatureAnalysis, FeatureInput, analyze_transaction};
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
 use serde::Deserialize;
@@ -243,6 +244,10 @@ async fn process_pending_hash(
         }
     };
 
+    let feature_analysis = fetched_tx
+        .as_ref()
+        .map(|tx| analyze_transaction(feature_input(tx)));
+
     if let Some(tx) = fetched_tx.as_ref() {
         let to = format_optional_fixed_hex(tx.to.as_ref().map(|value| value.as_slice()));
         let chain_id = format_optional_u64(tx.chain_id);
@@ -253,6 +258,8 @@ async fn process_pending_hash(
         let max_priority_fee_per_gas_wei =
             format_optional_u128(tx.max_priority_fee_per_gas_wei);
         let max_fee_per_blob_gas_wei = format_optional_u128(tx.max_fee_per_blob_gas_wei);
+        let analysis = feature_analysis.unwrap_or(default_feature_analysis());
+        let method_selector = format_method_selector_hex(analysis.method_selector);
         tracing::info!(
             hash = hash_hex,
             sender = %format_fixed_hex(&tx.sender),
@@ -266,6 +273,11 @@ async fn process_pending_hash(
             max_fee_per_gas_wei = %max_fee_per_gas_wei,
             max_priority_fee_per_gas_wei = %max_priority_fee_per_gas_wei,
             max_fee_per_blob_gas_wei = %max_fee_per_blob_gas_wei,
+            protocol = analysis.protocol,
+            category = analysis.category,
+            mev_score = analysis.mev_score,
+            urgency_score = analysis.urgency_score,
+            method_selector = %method_selector,
             input_bytes = tx.input.len(),
             "mempool transaction"
         );
@@ -312,6 +324,7 @@ async fn process_pending_hash(
     .await?;
 
     if let Some(tx) = fetched_tx {
+        let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         append_event(
             writer,
             next_seq_id,
@@ -336,9 +349,11 @@ async fn process_pending_hash(
         writer
             .enqueue(StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
                 hash: tx.hash,
-                protocol: "unknown".to_owned(),
-                category: "pending".to_owned(),
-                mev_score: 0,
+                protocol: analysis.protocol.to_owned(),
+                category: analysis.category.to_owned(),
+                mev_score: analysis.mev_score,
+                urgency_score: analysis.urgency_score,
+                method_selector: analysis.method_selector,
             }))
             .await?;
     }
@@ -429,6 +444,33 @@ struct LiveTx {
     max_priority_fee_per_gas_wei: Option<u128>,
     max_fee_per_blob_gas_wei: Option<u128>,
     input: Vec<u8>,
+}
+
+#[inline]
+fn feature_input(tx: &LiveTx) -> FeatureInput<'_> {
+    FeatureInput {
+        to: tx.to.as_ref(),
+        calldata: &tx.input,
+        tx_type: tx.tx_type,
+        chain_id: tx.chain_id,
+        gas_limit: tx.gas_limit,
+        value_wei: tx.value_wei,
+        gas_price_wei: tx.gas_price_wei,
+        max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+        max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+    }
+}
+
+#[inline]
+fn default_feature_analysis() -> FeatureAnalysis {
+    FeatureAnalysis {
+        protocol: "unknown",
+        category: "pending",
+        mev_score: 0,
+        urgency_score: 0,
+        method_selector: None,
+    }
 }
 
 async fn fetch_transaction_by_hash(
@@ -598,6 +640,16 @@ fn format_optional_u128(value: Option<u128>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_owned())
+}
+
+fn format_method_selector_hex(selector: Option<[u8; 4]>) -> String {
+    match selector {
+        Some(selector) => format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            selector[0], selector[1], selector[2], selector[3]
+        ),
+        None => "null".to_owned(),
+    }
 }
 
 fn current_seq_hi(storage: &Arc<RwLock<InMemoryStorage>>) -> u64 {

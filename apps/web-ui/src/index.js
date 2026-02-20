@@ -34,7 +34,11 @@ const mount = document.getElementById('scene');
 const timelineInput = document.getElementById('timeline');
 const replayMeta = document.getElementById('replayMeta');
 const featureList = document.getElementById('featureList');
+const featureTableBody = document.getElementById('featureTableBody');
+const featureTotalCount = document.getElementById('featureTotalCount');
 const txList = document.getElementById('txList');
+const txTableBody = document.getElementById('txTableBody');
+const txTotalCount = document.getElementById('txTotalCount');
 const apiStatus = document.getElementById('apiStatus');
 
 const scene = new THREE.Scene();
@@ -176,6 +180,86 @@ function renderTransactions(transactions) {
   });
 }
 
+function formatTime(unixMs) {
+  if (!Number.isFinite(unixMs)) return '-';
+  return new Date(unixMs).toLocaleTimeString();
+}
+
+function renderTransactionDetails(rows) {
+  txTableBody.innerHTML = '';
+  txTotalCount.textContent = String(rows.length);
+
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 7;
+    td.textContent = 'No observed mempool transactions from upstream yet.';
+    tr.appendChild(td);
+    txTableBody.appendChild(tr);
+    return;
+  }
+
+  rows.forEach((row) => {
+    const tr = document.createElement('tr');
+    const values = [
+      shortenHex(row.hash, 14, 10),
+      row.peer ?? '-',
+      formatTime(row.first_seen_unix_ms),
+      String(row.seen_count ?? 0),
+      row.sender ? shortenHex(row.sender, 12, 8) : '-',
+      row.nonce ?? '-',
+      row.raw_tx_len ?? '-',
+    ];
+
+    values.forEach((value, idx) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      if (idx === 0 || idx === 4) {
+        td.className = 'mono';
+      }
+      tr.appendChild(td);
+    });
+    txTableBody.appendChild(tr);
+  });
+}
+
+function renderFeatureDetails(rows) {
+  featureTableBody.innerHTML = '';
+  featureTotalCount.textContent = String(rows.length);
+
+  if (!rows.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.textContent = 'No feature-engine rows yet.';
+    tr.appendChild(td);
+    featureTableBody.appendChild(tr);
+    return;
+  }
+
+  rows.forEach((row) => {
+    const tr = document.createElement('tr');
+    const values = [
+      shortenHex(row.hash, 14, 10),
+      row.protocol ?? '-',
+      row.category ?? '-',
+      row.mev_score ?? '-',
+      row.urgency_score ?? '-',
+      row.method_selector ?? '-',
+    ];
+
+    values.forEach((value, idx) => {
+      const td = document.createElement('td');
+      td.textContent = String(value);
+      if (idx === 0 || idx === 5) {
+        td.className = 'mono';
+      }
+      tr.appendChild(td);
+    });
+    featureTableBody.appendChild(tr);
+  });
+}
+
 async function fetchJson(path) {
   const response = await fetch(`${apiBase}${path}`);
   if (!response.ok) {
@@ -187,11 +271,13 @@ async function fetchJson(path) {
 async function loadData() {
   apiStatus.textContent = `Loading from ${apiBase} ...`;
   try {
-    const [txRows, replayRows, propagationRows, featureRows] = await Promise.all([
+    const [txRows, txDetailRows, replayRows, propagationRows, featureRows, featureDetailRows] = await Promise.all([
       fetchJson('/transactions?limit=20'),
+      fetchJson('/transactions/all?limit=5000'),
       fetchJson('/replay'),
       fetchJson('/propagation'),
       fetchJson('/features'),
+      fetchJson('/features/recent?limit=500'),
     ]);
 
     const previousIndex = Number(timelineInput.value || 0);
@@ -209,9 +295,11 @@ async function loadData() {
     buildGraph(propagationEdges);
     applyReplayFrame(nextIndex);
     renderFeatures(featureRows);
+    renderFeatureDetails(featureDetailRows);
     renderTransactions(txRows);
+    renderTransactionDetails(txDetailRows);
     const lastUpdated = new Date().toLocaleTimeString();
-    apiStatus.textContent = `Connected. replay=${replayFrames.length} propagation=${propagationEdges.length} tx=${txRows.length} updated=${lastUpdated}`;
+    apiStatus.textContent = `Connected. replay=${replayFrames.length} propagation=${propagationEdges.length} feat_recent=${featureDetailRows.length} tx_recent=${txRows.length} tx_all=${txDetailRows.length} updated=${lastUpdated}`;
   } catch (error) {
     apiStatus.textContent = `API unavailable: ${error.message}`;
   }

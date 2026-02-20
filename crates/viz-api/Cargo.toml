@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 common = { path = "../common" }
 event-log = { path = "../event-log" }
+feature-engine = { path = "../feature-engine" }
 futures = { workspace = true }
 hashbrown = { workspace = true }
 replay = { path = "../replay" }
