@@ -1,6 +1,6 @@
 # web-ui
 
-Custom frontend for mempool replay and propagation visualization.
+Magic UI-style 2D frontend for mempool replay and transaction analysis.
 
 ## Run locally
 
@@ -10,9 +10,10 @@ Start API:
 cargo run -p viz-api --bin viz-api
 ```
 
-In a second terminal, start web UI static server:
+In a second terminal, install dependencies and start the web UI:
 
 ```bash
+npm install
 npm run dev
 ```
 
@@ -31,12 +32,11 @@ The page calls:
 
 and renders:
 
-- 3D propagation graph (nodes + latency-colored edges)
+- a SaaS-style 2D split layout (sidebar + list + detail pane)
+- animated metric cards and counters (Magic UI-inspired components)
 - replay timeline slider bound to pending-count frames
-- protocol/category summary list
-- feature-engine detail table (`hash`, `protocol`, `category`, `mev_score`, `urgency_score`, `method_selector`)
-- latest mempool transaction list (hash/sender/nonce/type)
-- observed mempool transactions table (`hash`, `peer`, `first_seen`, `seen_count`, `sender`, `nonce`, `raw_tx_len`)
+- searchable transaction list with protocol/category tags
+- detail pane for transaction metadata + feature-engine analysis
 
 ## Windows + WSL note
 

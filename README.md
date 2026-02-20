@@ -11,7 +11,7 @@ This repository is a Rust workspace for the mempool/MEV system.
 - `crates/storage` storage adapters and persistence services
 - `crates/viz-api` API for observability/replay visualization clients
 - `crates/replay` deterministic replay and lifecycle/reorg-aware state
-- `apps/web-ui` custom frontend skeleton (Three.js-ready)
+- `apps/web-ui` Magic UI-style 2D frontend for replay/analysis
 
 ## Operational Metrics Model
 
