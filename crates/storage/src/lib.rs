@@ -1,3 +1,6 @@
+mod backfill;
+mod clickhouse_schema;
+
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -11,6 +14,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+
+pub use backfill::{BackfillConfig, BackfillSummary, BackfillWriter};
+pub use clickhouse_schema::{ClickHouseSchemaConfig, clickhouse_event_table_ddl, clickhouse_schema_ddl};
 
 pub type FastMap<K, V> = HashMap<K, V, RandomState>;
 pub type FastSet<T> = HashSet<T, RandomState>;
