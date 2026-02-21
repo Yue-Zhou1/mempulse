@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ! -f "docs/plans/v2_scope_kpi.md" ]]; then
+  echo "[verify] missing required file: docs/plans/v2_scope_kpi.md"
+  exit 1
+fi
+
 echo "[verify] running workspace tests"
 cargo test --workspace
 

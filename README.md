@@ -45,6 +45,17 @@ This command runs:
 - `cargo build -p replay --bin replay-cli`
 - `cargo build -p viz-api --bin viz-api`
 
+## V2 Implementation Docs
+
+The interview-focused V2 plan and KPI contract are documented at:
+
+- `docs/plans/2026-02-21-mev-infra-v2-implementation.md`
+- `docs/plans/v2_scope_kpi.md`
+
+The legacy implementation plan now lives at:
+
+- `docs/mempool_mev_implementation.md`
+
 ## Real Mempool Mode
 
 `viz-api` can ingest real pending transactions from an Ethereum RPC provider.

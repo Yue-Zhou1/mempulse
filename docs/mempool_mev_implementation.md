@@ -1,5 +1,9 @@
 # Implementation Plan - Rust High-Frequency Mempool & MEV Infrastructure
 
+> Status: Legacy baseline plan. Active implementation roadmap is:
+> - `docs/plans/2026-02-21-mev-infra-v2-implementation.md`
+> - `docs/plans/v2_scope_kpi.md`
+
 ## 1. Objective
 
 Design and implement a high-throughput, low-latency Rust system for ingesting, decoding, and analyzing Ethereum transaction supply-chain data (mempool / propagation / ordering signals) to support MEV research and block-building infrastructure.
