@@ -7,10 +7,11 @@ use viz_api::{build_router, default_state};
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(env::var("RUST_LOG").ok().as_deref());
+    let ingest_mode = resolve_ingest_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
     let app = build_router(default_state());
     let bind_addr = resolve_bind_addr(env::var("VIZ_API_BIND").ok().as_deref());
     let listener = TcpListener::bind(&bind_addr).await?;
-    tracing::info!(bind_addr = %bind_addr, "viz-api listening");
+    tracing::info!(bind_addr = %bind_addr, ingest_mode = %ingest_mode, "viz-api listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -48,6 +49,14 @@ fn resolve_log_filter(env_override: Option<&str>) -> String {
     }
 }
 
+fn resolve_ingest_mode(env_override: Option<&str>) -> String {
+    match env_override.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(mode) if mode == "p2p" => "p2p".to_owned(),
+        Some(mode) if mode == "hybrid" => "hybrid".to_owned(),
+        _ => "rpc".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -78,5 +87,17 @@ mod tests {
     fn resolve_log_filter_appends_viz_api_info_when_missing() {
         let filter = super::resolve_log_filter(Some("warn"));
         assert_eq!(filter, "warn,viz_api=info");
+    }
+
+    #[test]
+    fn resolve_ingest_mode_defaults_to_rpc() {
+        let mode = super::resolve_ingest_mode(None);
+        assert_eq!(mode, "rpc");
+    }
+
+    #[test]
+    fn resolve_ingest_mode_accepts_valid_values() {
+        assert_eq!(super::resolve_ingest_mode(Some("p2p")), "p2p");
+        assert_eq!(super::resolve_ingest_mode(Some("hybrid")), "hybrid");
     }
 }

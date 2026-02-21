@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::{Arc, RwLock};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, NoopClickHouseSink,
@@ -91,6 +92,31 @@ pub struct StreamHello {
     pub message: String,
     pub replay_points: usize,
     pub propagation_edges: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestSourceMode {
+    Rpc,
+    P2p,
+    Hybrid,
+}
+
+impl IngestSourceMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            IngestSourceMode::Rpc => "rpc",
+            IngestSourceMode::P2p => "p2p",
+            IngestSourceMode::Hybrid => "hybrid",
+        }
+    }
+}
+
+fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
+    match env_override.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(mode) if mode == "p2p" => IngestSourceMode::P2p,
+        Some(mode) if mode == "hybrid" => IngestSourceMode::Hybrid,
+        _ => IngestSourceMode::Rpc,
+    }
 }
 
 pub trait VizDataProvider: Send + Sync {
@@ -307,6 +333,8 @@ pub fn default_state() -> AppState {
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
     let live_rpc_config = LiveRpcConfig::default();
+    let ingest_mode =
+        resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
     let propagation = vec![
         PropagationEdge {
@@ -322,7 +350,25 @@ pub fn default_state() -> AppState {
             p99_delay_ms: 36,
         },
     ];
-    start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
+    match ingest_mode {
+        IngestSourceMode::Rpc => {
+            tracing::info!(ingest_mode = ingest_mode.as_str(), "starting rpc ingest mode");
+            start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
+        }
+        IngestSourceMode::P2p => {
+            tracing::info!(
+                ingest_mode = ingest_mode.as_str(),
+                "starting p2p ingest mode (external devp2p runtime expected)"
+            );
+        }
+        IngestSourceMode::Hybrid => {
+            tracing::info!(
+                ingest_mode = ingest_mode.as_str(),
+                "starting hybrid ingest mode (rpc live feed + p2p runtime)"
+            );
+            start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
+        }
+    }
 
     AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
@@ -683,6 +729,24 @@ mod tests {
         let state = default_state();
         let _ = state.provider.replay_points();
         assert_eq!(state.downsample_limit, 1_000);
+    }
+
+    #[test]
+    fn resolve_ingest_source_mode_defaults_to_rpc() {
+        assert_eq!(resolve_ingest_source_mode(None), IngestSourceMode::Rpc);
+        assert_eq!(
+            resolve_ingest_source_mode(Some("unexpected")),
+            IngestSourceMode::Rpc
+        );
+    }
+
+    #[test]
+    fn resolve_ingest_source_mode_accepts_p2p_and_hybrid() {
+        assert_eq!(resolve_ingest_source_mode(Some("p2p")), IngestSourceMode::P2p);
+        assert_eq!(
+            resolve_ingest_source_mode(Some("hybrid")),
+            IngestSourceMode::Hybrid
+        );
     }
 
     #[tokio::test]
