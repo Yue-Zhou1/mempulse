@@ -1,4 +1,5 @@
-use common::Address;
+use common::{Address, TxHash};
+use event_log::TxDecoded;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureInput<'a> {
@@ -21,6 +22,16 @@ pub struct FeatureAnalysis {
     pub mev_score: u16,
     pub urgency_score: u16,
     pub method_selector: Option<[u8; 4]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeaturedTransaction {
+    pub hash: TxHash,
+    pub analysis: FeatureAnalysis,
+    pub tx_type: u8,
+    pub to: Option<Address>,
+    pub gas_limit: Option<u64>,
+    pub calldata_len: usize,
 }
 
 const WEI_PER_GWEI: u128 = 1_000_000_000;
@@ -72,6 +83,30 @@ pub fn analyze_transaction(input: FeatureInput<'_>) -> FeatureAnalysis {
         mev_score,
         urgency_score,
         method_selector,
+    }
+}
+
+pub fn analyze_decoded_transaction(tx: &TxDecoded, calldata: &[u8]) -> FeaturedTransaction {
+    let analysis = analyze_transaction(FeatureInput {
+        to: tx.to.as_ref(),
+        calldata,
+        tx_type: tx.tx_type,
+        chain_id: tx.chain_id,
+        gas_limit: tx.gas_limit,
+        value_wei: tx.value_wei,
+        gas_price_wei: tx.gas_price_wei,
+        max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+        max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+    });
+
+    FeaturedTransaction {
+        hash: tx.hash,
+        analysis,
+        tx_type: tx.tx_type,
+        to: tx.to,
+        gas_limit: tx.gas_limit,
+        calldata_len: calldata.len(),
     }
 }
 
