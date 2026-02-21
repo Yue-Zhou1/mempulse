@@ -39,14 +39,9 @@ pub trait IngestClock {
     fn now_mono_ns(&mut self) -> u64;
 }
 
+#[derive(Default)]
 pub struct SystemClock {
     monotonic_ns: u64,
-}
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self { monotonic_ns: 0 }
-    }
 }
 
 impl IngestClock for SystemClock {
