@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use mempool_state::{MempoolState, StateTransition, TxLifecycleStatus};
+pub use sim_engine::{
+    ChainContext as SimulationChainContext, SimulationBatchResult, TxSimulationResult,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayMode {
@@ -147,6 +150,24 @@ pub fn lifecycle_parity(
             (checkpoint.seq_id, actual == checkpoint.pending_hashes)
         })
         .collect()
+}
+
+pub fn simulate_deterministic_window(
+    events: &[EventEnvelope],
+    chain_context: &SimulationChainContext,
+) -> anyhow::Result<SimulationBatchResult> {
+    let mut sorted = events.to_vec();
+    sort_deterministic(&mut sorted);
+
+    let decoded_txs = sorted
+        .into_iter()
+        .filter_map(|event| match event.payload {
+            EventPayload::TxDecoded(decoded) => Some(decoded),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    sim_engine::simulate_deterministic(chain_context, &decoded_txs)
 }
 
 pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLifecycleStatus> {
