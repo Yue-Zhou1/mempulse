@@ -7,6 +7,7 @@ edition = "2024"
 ahash = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+builder = { path = "../builder" }
 common = { path = "../common" }
 event-log = { path = "../event-log" }
 feature-engine = { path = "../feature-engine" }

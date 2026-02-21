@@ -677,6 +677,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "builder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3441,6 +3454,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "axum",
+ "builder",
  "common",
  "event-log",
  "feature-engine",

@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use builder::RelayDryRunStatus;
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
     pub downsample_limit: usize,
+    pub relay_dry_run_status: Arc<RwLock<RelayDryRunStatus>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -347,6 +349,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
+        .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/stream", get(stream))
         .layer(cors)
         .with_state(state)
@@ -404,6 +407,7 @@ pub fn default_state() -> AppState {
     AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
         downsample_limit: 1_000,
+        relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
     }
 }
 
@@ -558,6 +562,15 @@ async fn transaction_by_hash(
         .transaction_detail_by_hash(&hash)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn relay_dry_run_status(State(state): State<AppState>) -> Json<RelayDryRunStatus> {
+    let status = state
+        .relay_dry_run_status
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    Json(status)
 }
 
 async fn stream(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -739,6 +752,7 @@ mod tests {
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         }
     }
 
@@ -936,6 +950,27 @@ mod tests {
         assert_eq!(payload.len(), 2);
         assert_eq!(payload[0].protocol, "uniswap-v2");
         assert_eq!(payload[0].mev_score, 72);
+    }
+
+    #[tokio::test]
+    async fn relay_dry_run_status_route_returns_default_state() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/relay/dry-run/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: RelayDryRunStatus = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.total_submissions, 0);
+        assert!(payload.latest.is_none());
     }
 
     #[test]

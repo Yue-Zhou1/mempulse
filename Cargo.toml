@@ -9,6 +9,7 @@ members = [
   "crates/replay",
   "crates/sim-engine",
   "crates/searcher",
+  "crates/builder",
 ]
 resolver = "2"
 
