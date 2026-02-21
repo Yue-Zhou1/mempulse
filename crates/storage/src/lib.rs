@@ -46,8 +46,18 @@ pub struct TxSeenRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxFullRecord {
     pub hash: TxHash,
+    pub tx_type: u8,
     pub sender: Address,
     pub nonce: u64,
+    pub to: Option<Address>,
+    pub chain_id: Option<u64>,
+    pub value_wei: Option<u128>,
+    pub gas_limit: Option<u64>,
+    pub gas_price_wei: Option<u128>,
+    pub max_fee_per_gas_wei: Option<u128>,
+    pub max_priority_fee_per_gas_wei: Option<u128>,
+    pub max_fee_per_blob_gas_wei: Option<u128>,
+    pub calldata_len: Option<u32>,
     pub raw_tx: Vec<u8>,
 }
 
@@ -548,6 +558,15 @@ mod tests {
                 tx_type: 2,
                 sender: [9; 20],
                 nonce: seq,
+                chain_id: Some(1),
+                to: None,
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: None,
             }),
         }
     }
@@ -565,8 +584,18 @@ mod tests {
         });
         store.upsert_tx_full(TxFullRecord {
             hash: hash(1),
+            tx_type: 2,
             sender: [9; 20],
             nonce: 1,
+            to: None,
+            chain_id: Some(1),
+            value_wei: None,
+            gas_limit: None,
+            gas_price_wei: None,
+            max_fee_per_gas_wei: None,
+            max_priority_fee_per_gas_wei: None,
+            max_fee_per_blob_gas_wei: None,
+            calldata_len: Some(3),
             raw_tx: vec![1, 2, 3],
         });
         store.upsert_tx_features(TxFeaturesRecord {
@@ -766,8 +795,18 @@ mod tests {
             });
             store.upsert_tx_full(TxFullRecord {
                 hash,
+                tx_type: 2,
                 sender: [9; 20],
                 nonce: idx as u64,
+                to: None,
+                chain_id: Some(1),
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(1),
                 raw_tx: vec![idx],
             });
             store.upsert_tx_features(TxFeaturesRecord {

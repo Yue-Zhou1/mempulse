@@ -76,6 +76,24 @@ pub struct TxDecoded {
     pub tx_type: u8,
     pub sender: Address,
     pub nonce: u64,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+    #[serde(default)]
+    pub to: Option<Address>,
+    #[serde(default)]
+    pub value_wei: Option<u128>,
+    #[serde(default)]
+    pub gas_limit: Option<u64>,
+    #[serde(default)]
+    pub gas_price_wei: Option<u128>,
+    #[serde(default)]
+    pub max_fee_per_gas_wei: Option<u128>,
+    #[serde(default)]
+    pub max_priority_fee_per_gas_wei: Option<u128>,
+    #[serde(default)]
+    pub max_fee_per_blob_gas_wei: Option<u128>,
+    #[serde(default)]
+    pub calldata_len: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

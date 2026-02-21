@@ -193,6 +193,15 @@ mod tests {
                 tx_type: 2,
                 sender: address(sender_v),
                 nonce,
+                chain_id: Some(1),
+                to: None,
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: None,
             }),
         )
     }

@@ -335,14 +335,33 @@ async fn process_pending_hash(
                 tx_type: tx.tx_type,
                 sender: tx.sender,
                 nonce: tx.nonce,
+                chain_id: tx.chain_id,
+                to: tx.to,
+                value_wei: tx.value_wei,
+                gas_limit: tx.gas_limit,
+                gas_price_wei: tx.gas_price_wei,
+                max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+                max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+                calldata_len: Some(tx.input.len() as u32),
             }),
         )
         .await?;
         writer
             .enqueue(StorageWriteOp::UpsertTxFull(TxFullRecord {
                 hash: tx.hash,
+                tx_type: tx.tx_type,
                 sender: tx.sender,
                 nonce: tx.nonce,
+                to: tx.to,
+                chain_id: tx.chain_id,
+                value_wei: tx.value_wei,
+                gas_limit: tx.gas_limit,
+                gas_price_wei: tx.gas_price_wei,
+                max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+                max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+                max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+                calldata_len: Some(tx.input.len() as u32),
                 raw_tx: tx.input,
             }))
             .await?;

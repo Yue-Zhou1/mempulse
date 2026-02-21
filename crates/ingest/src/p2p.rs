@@ -185,6 +185,15 @@ impl P2pIngestService {
                     tx_type: tx.tx_type,
                     sender: tx.sender,
                     nonce: tx.nonce,
+                    chain_id: None,
+                    to: None,
+                    value_wei: None,
+                    gas_limit: None,
+                    gas_price_wei: None,
+                    max_fee_per_gas_wei: None,
+                    max_priority_fee_per_gas_wei: None,
+                    max_fee_per_blob_gas_wei: None,
+                    calldata_len: None,
                 }),
             ));
         }
