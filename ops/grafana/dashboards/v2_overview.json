@@ -1,0 +1,80 @@
+{
+  "title": "MEV V2 Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingest Lag (ms)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "ingest_lag_ms",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "title": "Queue Saturation (%)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(queue_depth_current / queue_depth_capacity) * 100",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      }
+    },
+    {
+      "id": 3,
+      "title": "Decode Failure Rate (%)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(tx_decode_fail_total / tx_decode_total) * 100",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "id": 4,
+      "title": "Coverage Ratio",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "tx_per_sec_current / tx_per_sec_baseline",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      }
+    }
+  ]
+}

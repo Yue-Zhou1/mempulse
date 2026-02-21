@@ -1,0 +1,38 @@
+groups:
+  - name: mev_v2_alerts
+    rules:
+      - alert: MempoolQueueSaturation
+        expr: (queue_depth_current / queue_depth_capacity) > 0.9
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Mempool ingest queue is saturated
+          description: queue depth exceeded 90% of configured capacity for at least 1 minute.
+
+      - alert: MempoolIngestLagHigh
+        expr: ingest_lag_ms > 500
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Ingest lag above SLO
+          description: ingest lag is above 500ms for 2 minutes.
+
+      - alert: DecodeFailureRateHigh
+        expr: tx_decode_fail_total / tx_decode_total > 0.01
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Decode failure ratio elevated
+          description: decode failure ratio exceeded 1% for at least 2 minutes.
+
+      - alert: CoverageCollapse
+        expr: tx_per_sec_current / tx_per_sec_baseline < 0.6
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Mempool coverage collapsed
+          description: current ingest throughput dropped below 60% of baseline for 2 minutes.

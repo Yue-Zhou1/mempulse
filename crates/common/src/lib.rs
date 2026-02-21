@@ -29,6 +29,7 @@ pub struct AlertThresholdConfig {
     pub coverage_drop_percent: u8,
     pub storage_write_latency_ms: u32,
     pub clock_skew_ms: u32,
+    pub queue_saturation_percent: u8,
 }
 
 impl Default for AlertThresholdConfig {
@@ -40,6 +41,7 @@ impl Default for AlertThresholdConfig {
             coverage_drop_percent: 40,
             storage_write_latency_ms: 250,
             clock_skew_ms: 150,
+            queue_saturation_percent: 90,
         }
     }
 }
@@ -54,6 +56,8 @@ pub struct MetricSnapshot {
     pub tx_per_sec_baseline: u64,
     pub storage_write_latency_ms: u32,
     pub clock_skew_ms: u32,
+    pub queue_depth_current: u64,
+    pub queue_depth_capacity: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -64,6 +68,7 @@ pub struct AlertDecisions {
     pub coverage_collapse: bool,
     pub storage_latency: bool,
     pub clock_skew: bool,
+    pub queue_saturation: bool,
 }
 
 pub fn evaluate_alerts(
@@ -82,6 +87,11 @@ pub fn evaluate_alerts(
         let ratio = snapshot.tx_per_sec_current as f64 / snapshot.tx_per_sec_baseline as f64;
         ((1.0 - ratio.clamp(0.0, 1.0)) * 100.0).round() as u8
     };
+    let queue_saturation_percent = if snapshot.queue_depth_capacity == 0 {
+        0
+    } else {
+        ((snapshot.queue_depth_current.saturating_mul(100)) / snapshot.queue_depth_capacity) as u8
+    };
 
     AlertDecisions {
         peer_churn: snapshot.peer_disconnects_total >= thresholds.peer_churn_spike as u64,
@@ -90,6 +100,7 @@ pub fn evaluate_alerts(
         coverage_collapse: coverage_drop_percent >= thresholds.coverage_drop_percent,
         storage_latency: snapshot.storage_write_latency_ms >= thresholds.storage_write_latency_ms,
         clock_skew: snapshot.clock_skew_ms >= thresholds.clock_skew_ms,
+        queue_saturation: queue_saturation_percent >= thresholds.queue_saturation_percent,
     }
 }
 
@@ -115,6 +126,8 @@ mod tests {
             tx_per_sec_baseline: 1_000,
             storage_write_latency_ms: 300,
             clock_skew_ms: 200,
+            queue_depth_current: 9_500,
+            queue_depth_capacity: 10_000,
         };
 
         let decisions = evaluate_alerts(&snapshot, &thresholds);
@@ -124,5 +137,29 @@ mod tests {
         assert!(decisions.coverage_collapse);
         assert!(decisions.storage_latency);
         assert!(decisions.clock_skew);
+        assert!(decisions.queue_saturation);
+    }
+
+    #[test]
+    fn evaluate_alerts_flags_queue_saturation_when_near_capacity() {
+        let thresholds = AlertThresholdConfig::default();
+        let snapshot = MetricSnapshot {
+            peer_disconnects_total: 0,
+            ingest_lag_ms: 0,
+            tx_decode_fail_total: 0,
+            tx_decode_total: 1_000,
+            tx_per_sec_current: 1_000,
+            tx_per_sec_baseline: 1_000,
+            storage_write_latency_ms: 50,
+            clock_skew_ms: 10,
+            queue_depth_current: 4_999,
+            queue_depth_capacity: 5_000,
+        };
+
+        let decisions = evaluate_alerts(&snapshot, &thresholds);
+        assert!(decisions.queue_saturation);
+        assert!(!decisions.ingest_lag);
+        assert!(!decisions.decode_failure);
+        assert!(!decisions.coverage_collapse);
     }
 }

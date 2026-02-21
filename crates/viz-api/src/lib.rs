@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use builder::RelayDryRunStatus;
+use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,7 @@ pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
     pub downsample_limit: usize,
     pub relay_dry_run_status: Arc<RwLock<RelayDryRunStatus>>,
+    pub alert_thresholds: AlertThresholdConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,6 +141,7 @@ pub trait VizDataProvider: Send + Sync {
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
+    fn metric_snapshot(&self) -> MetricSnapshot;
 }
 
 #[derive(Clone)]
@@ -332,6 +335,29 @@ impl VizDataProvider for InMemoryVizProvider {
             })
         })
     }
+
+    fn metric_snapshot(&self) -> MetricSnapshot {
+        let (tx_seen_len, tx_full_len) = self
+            .storage
+            .read()
+            .ok()
+            .map(|storage| (storage.tx_seen().len() as u64, storage.tx_full().len() as u64))
+            .unwrap_or((0, 0));
+        let queue_depth_capacity = 10_000_u64;
+
+        MetricSnapshot {
+            peer_disconnects_total: 0,
+            ingest_lag_ms: 0,
+            tx_decode_fail_total: tx_seen_len.saturating_sub(tx_full_len),
+            tx_decode_total: tx_seen_len.max(1),
+            tx_per_sec_current: tx_seen_len,
+            tx_per_sec_baseline: tx_seen_len.max(1),
+            storage_write_latency_ms: 0,
+            clock_skew_ms: 0,
+            queue_depth_current: tx_seen_len.min(queue_depth_capacity),
+            queue_depth_capacity,
+        }
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -344,6 +370,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/replay", get(replay))
         .route("/propagation", get(propagation))
+        .route("/metrics/snapshot", get(metrics_snapshot))
+        .route("/alerts/evaluate", get(alerts_evaluate))
         .route("/features", get(features))
         .route("/features/recent", get(features_recent))
         .route("/transactions", get(transactions))
@@ -408,6 +436,7 @@ pub fn default_state() -> AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
         downsample_limit: 1_000,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+        alert_thresholds: AlertThresholdConfig::default(),
     }
 }
 
@@ -507,6 +536,15 @@ async fn health() -> (StatusCode, Json<HealthResponse>) {
             status: "ok".to_owned(),
         }),
     )
+}
+
+async fn metrics_snapshot(State(state): State<AppState>) -> Json<MetricSnapshot> {
+    Json(state.provider.metric_snapshot())
+}
+
+async fn alerts_evaluate(State(state): State<AppState>) -> Json<AlertDecisions> {
+    let snapshot = state.provider.metric_snapshot();
+    Json(evaluate_alerts(&snapshot, &state.alert_thresholds))
 }
 
 async fn replay(State(state): State<AppState>) -> Json<Vec<ReplayPoint>> {
@@ -746,6 +784,21 @@ mod tests {
                 .into_iter()
                 .find(|row| row.hash == hash)
         }
+
+        fn metric_snapshot(&self) -> MetricSnapshot {
+            MetricSnapshot {
+                peer_disconnects_total: 0,
+                ingest_lag_ms: 700,
+                tx_decode_fail_total: 25,
+                tx_decode_total: 1_000,
+                tx_per_sec_current: 450,
+                tx_per_sec_baseline: 1_000,
+                storage_write_latency_ms: 200,
+                clock_skew_ms: 50,
+                queue_depth_current: 9_600,
+                queue_depth_capacity: 10_000,
+            }
+        }
     }
 
     fn test_state(limit: usize) -> AppState {
@@ -753,6 +806,7 @@ mod tests {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
         }
     }
 
@@ -847,6 +901,50 @@ mod tests {
 
         let methods = response.headers().get(ACCESS_CONTROL_ALLOW_METHODS);
         assert!(methods.is_some(), "missing access-control-allow-methods");
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_route_returns_provider_snapshot() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: MetricSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.ingest_lag_ms, 700);
+        assert_eq!(payload.queue_depth_current, 9_600);
+    }
+
+    #[tokio::test]
+    async fn alerts_evaluate_route_returns_decisions() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/alerts/evaluate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AlertDecisions = serde_json::from_slice(&body).unwrap();
+        assert!(payload.ingest_lag);
+        assert!(payload.decode_failure);
+        assert!(payload.coverage_collapse);
+        assert!(payload.queue_saturation);
     }
 
     #[tokio::test]
