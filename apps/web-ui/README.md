@@ -38,6 +38,20 @@ and renders:
 - searchable transaction list with protocol/category tags
 - detail pane for transaction metadata + feature-engine analysis
 
+## One-Command Demo
+
+From repository root:
+
+```bash
+bash scripts/demo_v2.sh --run
+```
+
+Verify endpoint readiness/output contract:
+
+```bash
+bash scripts/demo_v2.sh --verify
+```
+
 ## Windows + WSL note
 
 When the UI is opened from Windows browser and API runs in WSL, pass API base explicitly:

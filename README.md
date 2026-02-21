@@ -92,3 +92,22 @@ Artifacts are written to:
 - `target/perf/runtime_allocator_matrix.tsv`
 - `target/perf/pipeline_latency_snapshot.log`
 - `docs/perf/v2_baseline.md`
+
+## V2 Demo Workflow
+
+Verification:
+
+```bash
+bash scripts/demo_v2.sh --verify
+```
+
+Run API + UI together:
+
+```bash
+bash scripts/demo_v2.sh --run
+```
+
+Reference docs:
+
+- `docs/demo/interview_demo.md`
+- `docs/demo/sample_output.md`
