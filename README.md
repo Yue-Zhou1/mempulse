@@ -11,6 +11,7 @@ This repository is a Rust workspace for the mempool/MEV system.
 - `crates/storage` storage adapters and persistence services
 - `crates/viz-api` API for observability/replay visualization clients
 - `crates/replay` deterministic replay and lifecycle/reorg-aware state
+- `crates/bench` latency benchmark harness and profiling helpers
 - `apps/web-ui` Magic UI-style 2D frontend for replay/analysis
 
 ## Operational Metrics Model
@@ -51,6 +52,7 @@ The interview-focused V2 plan and KPI contract are documented at:
 
 - `docs/plans/2026-02-21-mev-infra-v2-implementation.md`
 - `docs/plans/v2_scope_kpi.md`
+- `docs/perf/v2_baseline.md`
 
 The legacy implementation plan now lives at:
 
@@ -75,3 +77,18 @@ cargo run -p viz-api --bin viz-api
 ```
 
 Without these variables, `viz-api` falls back to synthetic demo events.
+
+## Performance Budget Check
+
+Run the pipeline latency budget check and generate baseline artifacts:
+
+```bash
+bash scripts/profile_pipeline.sh --check-budget
+```
+
+Artifacts are written to:
+
+- `target/perf/pipeline_latency_summary.json`
+- `target/perf/runtime_allocator_matrix.tsv`
+- `target/perf/pipeline_latency_snapshot.log`
+- `docs/perf/v2_baseline.md`

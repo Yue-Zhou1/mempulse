@@ -10,6 +10,7 @@ members = [
   "crates/sim-engine",
   "crates/searcher",
   "crates/builder",
+  "crates/bench",
 ]
 resolver = "2"
 
