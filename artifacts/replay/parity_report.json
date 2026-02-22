@@ -1,0 +1,12 @@
+{
+  "generated_unix_ms": 1771764489825,
+  "dataset_name": "synthetic-mixed-lifecycle-v1",
+  "total_events": 1911,
+  "total_checkpoints": 1911,
+  "passed_checkpoints": 1911,
+  "failed_checkpoints": 0,
+  "parity_percent": 100.0,
+  "slo_target_percent": 99.99,
+  "slo_pass": true,
+  "failed_seq_ids": []
+}

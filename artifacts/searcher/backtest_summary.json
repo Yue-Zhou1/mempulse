@@ -1,0 +1,103 @@
+{
+  "generated_unix_ms": 1771764489927,
+  "dataset_name": "synthetic-mainnet-like-mix-v1",
+  "config": {
+    "min_score": 8000,
+    "max_candidates": 64
+  },
+  "dataset_size": 12,
+  "predicted_positive": 5,
+  "ground_truth_positive": 6,
+  "confusion": {
+    "tp": 5,
+    "fp": 0,
+    "fn_": 1,
+    "tn": 6
+  },
+  "precision": 1.0,
+  "recall": 0.8333333333333334,
+  "f1": 0.9090909090909091,
+  "pnl_proxy_bps": 460,
+  "top_candidates": [
+    {
+      "rank": 1,
+      "tx_hash": "0x1212121212121212121212121212121212121212121212121212121212121212",
+      "strategy": "SandwichCandidate",
+      "score": 11228,
+      "protocol": "1inch",
+      "category": "swap"
+    },
+    {
+      "rank": 2,
+      "tx_hash": "0x1010101010101010101010101010101010101010101010101010101010101010",
+      "strategy": "SandwichCandidate",
+      "score": 11093,
+      "protocol": "uniswap-v2",
+      "category": "swap"
+    },
+    {
+      "rank": 3,
+      "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "strategy": "SandwichCandidate",
+      "score": 11038,
+      "protocol": "uniswap-v3",
+      "category": "swap"
+    },
+    {
+      "rank": 4,
+      "tx_hash": "0x1414141414141414141414141414141414141414141414141414141414141414",
+      "strategy": "SandwichCandidate",
+      "score": 10863,
+      "protocol": "uniswap-v3",
+      "category": "swap"
+    },
+    {
+      "rank": 5,
+      "tx_hash": "0x1313131313131313131313131313131313131313131313131313131313131313",
+      "strategy": "SandwichCandidate",
+      "score": 10818,
+      "protocol": "uniswap-v2",
+      "category": "swap"
+    },
+    {
+      "rank": 6,
+      "tx_hash": "0x1212121212121212121212121212121212121212121212121212121212121212",
+      "strategy": "BackrunCandidate",
+      "score": 9278,
+      "protocol": "1inch",
+      "category": "swap"
+    },
+    {
+      "rank": 7,
+      "tx_hash": "0x1010101010101010101010101010101010101010101010101010101010101010",
+      "strategy": "BackrunCandidate",
+      "score": 9168,
+      "protocol": "uniswap-v2",
+      "category": "swap"
+    },
+    {
+      "rank": 8,
+      "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "strategy": "BackrunCandidate",
+      "score": 9118,
+      "protocol": "uniswap-v3",
+      "category": "swap"
+    },
+    {
+      "rank": 9,
+      "tx_hash": "0x1414141414141414141414141414141414141414141414141414141414141414",
+      "strategy": "BackrunCandidate",
+      "score": 8968,
+      "protocol": "uniswap-v3",
+      "category": "swap"
+    },
+    {
+      "rank": 10,
+      "tx_hash": "0x1313131313131313131313131313131313131313131313131313131313131313",
+      "strategy": "BackrunCandidate",
+      "score": 8928,
+      "protocol": "uniswap-v2",
+      "category": "swap"
+    }
+  ]
+}

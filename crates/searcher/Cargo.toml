@@ -8,3 +8,4 @@ common = { path = "../common" }
 event-log = { path = "../event-log" }
 feature-engine = { path = "../feature-engine" }
 serde = { workspace = true }
+serde_json = { workspace = true }

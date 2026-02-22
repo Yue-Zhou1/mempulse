@@ -2,7 +2,7 @@
 
 ## Objective
 
-Define measurable, interview-grade acceptance targets for the V2 mempool/MEV infrastructure effort.
+Define measurable, demo-grade acceptance targets for the V2 mempool/MEV infrastructure effort.
 
 ## Scope
 
@@ -44,7 +44,7 @@ Define measurable, interview-grade acceptance targets for the V2 mempool/MEV inf
 3. M3: canonical schema expansion and deterministic simulation.
 4. M4: opportunity engine and relay dry-run path.
 5. M5: performance hardening, observability, storage backfill.
-6. M6: interview demo package and final verification.
+6. M6: demo demo package and final verification.
 
 ## Exit Criteria
 

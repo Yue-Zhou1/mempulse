@@ -2880,6 +2880,7 @@ dependencies = [
  "event-log",
  "feature-engine",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

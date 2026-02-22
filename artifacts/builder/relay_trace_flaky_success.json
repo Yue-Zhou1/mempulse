@@ -1,0 +1,25 @@
+{
+  "relay_url": "http://127.0.0.1:33795/relay/v1/builder/blocks",
+  "accepted": true,
+  "final_state": "accepted",
+  "attempts": [
+    {
+      "attempt": 1,
+      "endpoint": "http://127.0.0.1:33795/relay/v1/builder/blocks",
+      "http_status": 503,
+      "error": null,
+      "latency_ms": 1,
+      "backoff_ms": 10
+    },
+    {
+      "attempt": 2,
+      "endpoint": "http://127.0.0.1:33795/relay/v1/builder/blocks",
+      "http_status": 200,
+      "error": null,
+      "latency_ms": 0,
+      "backoff_ms": 0
+    }
+  ],
+  "started_unix_ms": 1771764490064,
+  "finished_unix_ms": 1771764490077
+}

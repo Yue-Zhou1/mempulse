@@ -1,0 +1,33 @@
+{
+  "relay_url": "http://127.0.0.1:9/relay/v1/builder/blocks",
+  "accepted": false,
+  "final_state": "exhausted",
+  "attempts": [
+    {
+      "attempt": 1,
+      "endpoint": "http://127.0.0.1:9/relay/v1/builder/blocks",
+      "http_status": null,
+      "error": "error sending request for url (http://127.0.0.1:9/relay/v1/builder/blocks)",
+      "latency_ms": 0,
+      "backoff_ms": 10
+    },
+    {
+      "attempt": 2,
+      "endpoint": "http://127.0.0.1:9/relay/v1/builder/blocks",
+      "http_status": null,
+      "error": "error sending request for url (http://127.0.0.1:9/relay/v1/builder/blocks)",
+      "latency_ms": 0,
+      "backoff_ms": 20
+    },
+    {
+      "attempt": 3,
+      "endpoint": "http://127.0.0.1:9/relay/v1/builder/blocks",
+      "http_status": null,
+      "error": "error sending request for url (http://127.0.0.1:9/relay/v1/builder/blocks)",
+      "latency_ms": 0,
+      "backoff_ms": 0
+    }
+  ],
+  "started_unix_ms": 1771764490077,
+  "finished_unix_ms": 1771764490112
+}

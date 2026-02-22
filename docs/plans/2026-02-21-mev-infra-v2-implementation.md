@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Upgrade the current prototype into an interview-grade, end-to-end Ethereum mempool + MEV research and block-building pipeline aligned with Sigma Prime role expectations.
+**Goal:** Upgrade the current prototype into an demo-grade, end-to-end Ethereum mempool + MEV research and block-building pipeline aligned with Sigma Prime role expectations.
 
 **Architecture:** Keep the current event-driven Rust pipeline as the backbone, then add a production p2p ingest lane, deterministic execution/simulation, opportunity engine, PBS relay integration, and performance/ops hardening. Preserve replay determinism and make every major claim measurable via benchmark and SLO artifacts.
 
@@ -19,7 +19,7 @@
 | Transaction supply chain understanding | Partial | Real devp2p ingest, propagation/coverage analysis, private flow stubs |
 | Production systems rigor | Partial | SLO dashboards, alerts, chaos tests, runbooks, reproducible demo pack |
 
-## Acceptance Targets (Interview Readiness)
+## Acceptance Targets (Demo Readiness)
 
 1. Process and feature live mainnet mempool feed continuously for 60+ minutes without OOM or queue collapse.
 2. Show measurable ingest latency and coverage delta between RPC and devp2p modes.
@@ -327,11 +327,11 @@ git commit -m "feat: add clickhouse schema and idempotent backfill pipeline"
 
 ---
 
-### Task 10: End-to-End Interview Demo Scenario and Reproducibility
+### Task 10: End-to-End Demo Demo Scenario and Reproducibility
 
 **Files:**
 - Create: `scripts/demo_v2.sh`
-- Create: `docs/demo/interview_demo.md`
+- Create: `docs/demo/v2_demo.md`
 - Create: `docs/demo/sample_output.md`
 - Modify: `apps/web-ui/README.md`
 - Modify: `README.md`
@@ -358,8 +358,8 @@ git commit -m "feat: add clickhouse schema and idempotent backfill pipeline"
 
 **Step 5: Commit**
 ```bash
-git add scripts/demo_v2.sh docs/demo/interview_demo.md docs/demo/sample_output.md apps/web-ui/README.md README.md
-git commit -m "docs: add reproducible v2 interview demo workflow"
+git add scripts/demo_v2.sh docs/demo/v2_demo.md docs/demo/sample_output.md apps/web-ui/README.md README.md
+git commit -m "docs: add reproducible v2 demo demo workflow"
 ```
 
 ---
@@ -382,7 +382,7 @@ Expected:
 - Latency budget check passes.
 - Demo verification passes with deterministic output.
 
-## Interview Artifact Checklist
+## Demo Artifact Checklist
 
 1. Architecture diagram with ingest/searcher/builder boundaries.
 2. Performance report with before/after optimization deltas.
@@ -403,7 +403,7 @@ Expected:
 - Mitigation: budgeted profiling gate in CI.
 
 4. **Scope creep into full builder product**
-- Mitigation: keep relay path dry-run and interview-focused.
+- Mitigation: keep relay path dry-run and demo-focused.
 
 ## Suggested Timeline (6 Weeks)
 
@@ -412,5 +412,4 @@ Expected:
 3. Week 3: Task 5 (searcher core)
 4. Week 4: Task 6 (relay dry-run) + Task 7 (performance)
 5. Week 5: Tasks 8-9 (ops + storage/backfill)
-6. Week 6: Task 10 + final verification + interview artifact polish
-
+6. Week 6: Task 10 + final verification + demo artifact polish

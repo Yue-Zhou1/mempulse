@@ -48,7 +48,7 @@ This command runs:
 
 ## V2 Implementation Docs
 
-The interview-focused V2 plan and KPI contract are documented at:
+The demo-focused V2 plan and KPI contract are documented at:
 
 - `docs/plans/2026-02-21-mev-infra-v2-implementation.md`
 - `docs/plans/v2_scope_kpi.md`
@@ -109,5 +109,5 @@ bash scripts/demo_v2.sh --run
 
 Reference docs:
 
-- `docs/demo/interview_demo.md`
+- `docs/demo/v2_demo.md`
 - `docs/demo/sample_output.md`

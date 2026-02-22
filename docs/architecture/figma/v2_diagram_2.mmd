@@ -1,0 +1,24 @@
+sequenceDiagram
+    participant Src as RPC/devp2p Source
+    participant Ingest as ingest
+    participant Log as event-log
+    participant Store as storage
+    participant Feat as feature-engine
+    participant Search as searcher
+    participant Sim as sim-engine
+    participant Build as builder
+    participant API as viz-api
+    participant UI as web-ui
+
+    Src->>Ingest: pending tx hash / tx payload
+    Ingest->>Log: TxSeen
+    Ingest->>Log: TxFetched
+    Ingest->>Log: TxDecoded (enriched fields)
+    Log->>Store: append canonical events
+    Log->>Feat: decoded tx features
+    Feat->>Search: scored candidates
+    Search->>Sim: simulate top candidates
+    Sim->>Build: evaluated bundle/block payload
+    Build-->>Log: dry-run relay result events
+    Store->>API: replay + tx/feature/metrics reads
+    API->>UI: JSON endpoints for timeline/list/detail

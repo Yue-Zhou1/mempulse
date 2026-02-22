@@ -1,0 +1,21 @@
+{
+  "generated_unix_ms": 1771764490112,
+  "scenarios": [
+    {
+      "name": "flaky_success",
+      "accepted": true,
+      "final_state": "accepted",
+      "attempt_count": 2,
+      "had_http_5xx": true,
+      "had_transport_error": false
+    },
+    {
+      "name": "exhausted_failure",
+      "accepted": false,
+      "final_state": "exhausted",
+      "attempt_count": 3,
+      "had_http_5xx": false,
+      "had_transport_error": true
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-# V2 Interview Demo Workflow
+# V2 Demo Demo Workflow
 
 ## One-Command Verify
 
@@ -34,10 +34,24 @@ Open:
 
 - `http://127.0.0.1:5174/?apiBase=http://127.0.0.1:3100`
 
-## Interview Narrative
+## Demo Narrative
 
 1. Show ingest/replay API health and replay output shape.
 2. Show feature/searcher outputs in the UI transaction list and details.
 3. Show alert and metrics endpoints (`/metrics/snapshot`, `/alerts/evaluate`).
 4. Show relay dry-run status endpoint (`/relay/dry-run/status`).
 5. Reference `docs/perf/v2_baseline.md` for measured latency budget evidence.
+
+## Demo Artifact Pack (Remaining Gap Closers)
+
+Generate all three report artifacts:
+
+```bash
+bash scripts/generate_artifacts.sh
+```
+
+Then present:
+
+1. Deterministic replay parity report: `docs/reports/deterministic_replay_parity_report.md`
+2. MEV backtest summary: `docs/reports/mev_opportunity_backtest_summary.md`
+3. Relay dry-run trace package: `docs/reports/relay_dry_run_trace_package.md`
