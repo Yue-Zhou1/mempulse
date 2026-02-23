@@ -8,6 +8,11 @@ function normalizeApiBase(value) {
     return null;
   }
 
+  if (trimmed.startsWith('/')) {
+    const normalized = trimmed.replace(/\/+$/, '');
+    return normalized || '/';
+  }
+
   try {
     return new URL(trimmed).origin;
   } catch {
