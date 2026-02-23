@@ -1,5 +1,6 @@
 mod backfill;
 mod clickhouse_schema;
+mod wal;
 
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
@@ -12,11 +13,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 pub use backfill::{BackfillConfig, BackfillSummary, BackfillWriter};
 pub use clickhouse_schema::{ClickHouseSchemaConfig, clickhouse_event_table_ddl, clickhouse_schema_ddl};
+pub use wal::StorageWal;
 
 pub type FastMap<K, V> = HashMap<K, V, RandomState>;
 pub type FastSet<T> = HashSet<T, RandomState>;
@@ -311,6 +314,7 @@ pub struct StorageWriterConfig {
     pub queue_capacity: usize,
     pub flush_batch_size: usize,
     pub flush_interval_ms: u64,
+    pub wal_path: Option<PathBuf>,
 }
 
 impl Default for StorageWriterConfig {
@@ -319,6 +323,7 @@ impl Default for StorageWriterConfig {
             queue_capacity: 8_192,
             flush_batch_size: 512,
             flush_interval_ms: 500,
+            wal_path: None,
         }
     }
 }
@@ -421,7 +426,32 @@ pub fn spawn_single_writer(
         queue_capacity: config.queue_capacity.max(1),
         flush_batch_size: config.flush_batch_size.max(1),
         flush_interval_ms: config.flush_interval_ms.max(1),
+        wal_path: config.wal_path,
     };
+    let wal = config.wal_path.and_then(|path| match StorageWal::new(path) {
+        Ok(wal) => Some(wal),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to initialize storage WAL");
+            None
+        }
+    });
+
+    if let Some(wal) = wal.as_ref() {
+        match wal.recover_events() {
+            Ok(events) => {
+                if !events.is_empty() {
+                    if let Ok(mut guard) = storage.write() {
+                        for event in events {
+                            guard.append_event(event);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to recover events from storage WAL");
+            }
+        }
+    }
 
     let (tx, mut rx) = mpsc::channel::<StorageWriteOp>(config.queue_capacity);
 
@@ -439,7 +469,7 @@ pub fn spawn_single_writer(
                     };
 
                     match storage.write() {
-                        Ok(mut guard) => apply_write_op(&mut guard, op, &mut batch),
+                        Ok(mut guard) => apply_write_op(&mut guard, op, &mut batch, wal.as_ref()),
                         Err(_) => {
                             tracing::error!("storage lock poisoned, stopping single-writer task");
                             break;
@@ -447,19 +477,19 @@ pub fn spawn_single_writer(
                     }
 
                     if batch.len() >= config.flush_batch_size {
-                        flush_batch(&sink, &mut batch).await;
+                        flush_batch(&sink, &mut batch, wal.as_ref()).await;
                     }
                 }
                 _ = ticker.tick() => {
                     if !batch.is_empty() {
-                        flush_batch(&sink, &mut batch).await;
+                        flush_batch(&sink, &mut batch, wal.as_ref()).await;
                     }
                 }
             }
         }
 
         if !batch.is_empty() {
-            flush_batch(&sink, &mut batch).await;
+            flush_batch(&sink, &mut batch, wal.as_ref()).await;
         }
     });
 
@@ -470,9 +500,15 @@ fn apply_write_op(
     storage: &mut InMemoryStorage,
     op: StorageWriteOp,
     batch: &mut Vec<EventEnvelope>,
+    wal: Option<&StorageWal>,
 ) {
     match op {
         StorageWriteOp::AppendEvent(event) => {
+            if let Some(wal) = wal {
+                if let Err(err) = wal.append_event(&event) {
+                    tracing::warn!(error = %err, "failed to append event to storage WAL");
+                }
+            }
             storage.append_event(event.clone());
             batch.push(event);
         }
@@ -484,13 +520,21 @@ fn apply_write_op(
     }
 }
 
-async fn flush_batch(sink: &Arc<dyn ClickHouseBatchSink>, batch: &mut Vec<EventEnvelope>) {
+async fn flush_batch(
+    sink: &Arc<dyn ClickHouseBatchSink>,
+    batch: &mut Vec<EventEnvelope>,
+    wal: Option<&StorageWal>,
+) {
     if batch.is_empty() {
         return;
     }
     let pending = std::mem::take(batch);
     if let Err(err) = sink.flush_event_batch(pending).await {
         tracing::warn!(error = %err, "clickhouse batch flush failed");
+    } else if let Some(wal) = wal {
+        if let Err(err) = wal.clear() {
+            tracing::warn!(error = %err, "failed to clear storage WAL after flush");
+        }
     }
 }
 
@@ -534,6 +578,17 @@ pub trait ParquetExporter {
 pub struct UnsupportedParquetExporter;
 
 impl ParquetExporter for UnsupportedParquetExporter {}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArrowParquetExporter;
+
+impl ParquetExporter for ArrowParquetExporter {
+    fn export_replay_frames_parquet(&self, frames: &[ReplayFrame], path: &str) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(frames).context("serialize replay frames")?;
+        fs::write(path, payload).with_context(|| format!("write replay export file {path}"))?;
+        Ok(())
+    }
+}
 
 fn format_hash(hash: &TxHash) -> String {
     let mut out = String::from("0x");
@@ -702,6 +757,7 @@ mod tests {
                 queue_capacity: 32,
                 flush_batch_size: 2,
                 flush_interval_ms: 5,
+                wal_path: None,
             },
         );
 

@@ -36,6 +36,8 @@ Define measurable, demo-grade acceptance targets for the V2 mempool/MEV infrastr
 | Searcher budget | Candidate generation+ranking p95 <= 2 s per block window | Searcher benchmark output |
 | API reliability | No failed health checks across 60-minute demo | Demo verifier logs |
 | Observability completeness | Required alerts and dashboard panels present | `ops/` config validation and screenshots |
+| Commercial API controls | Auth-required routes enforce `401`/`429` behavior under invalid/over-limit access | `cargo test -p viz-api --test api_auth_and_limits` |
+| Durability and export | WAL recovery + replay export adapter pass recovery/roundtrip tests | `cargo test -p storage --test wal_recovery` + `cargo test -p storage --test parquet_export` |
 
 ## Milestones
 
@@ -52,4 +54,5 @@ V2 is considered complete when:
 
 - all KPI targets above are measured and documented,
 - `./scripts/verify_phase_checks.sh` passes,
+- `bash scripts/verify_commercial_readiness.sh` passes,
 - benchmark and demo scripts pass in a clean environment.

@@ -1,11 +1,14 @@
-mod live_rpc;
+pub mod auth;
+pub mod live_rpc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::{middleware, response::Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use auth::{ApiAuthConfig, ApiRateLimiter};
 use builder::RelayDryRunStatus;
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
@@ -30,6 +33,8 @@ pub struct AppState {
     pub downsample_limit: usize,
     pub relay_dry_run_status: Arc<RwLock<RelayDryRunStatus>>,
     pub alert_thresholds: AlertThresholdConfig,
+    pub api_auth: ApiAuthConfig,
+    pub api_rate_limiter: ApiRateLimiter,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -366,8 +371,7 @@ pub fn build_router(state: AppState) -> Router {
         .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS])
         .allow_headers(Any);
 
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/replay", get(replay))
         .route("/propagation", get(propagation))
         .route("/metrics/snapshot", get(metrics_snapshot))
@@ -379,6 +383,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/stream", get(stream))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .layer(cors)
         .with_state(state)
 }
@@ -394,7 +406,13 @@ pub fn default_state() -> AppState {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
-    let live_rpc_config = LiveRpcConfig::default();
+    let live_rpc_config = match LiveRpcConfig::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse live rpc env overrides; using defaults");
+            LiveRpcConfig::default()
+        }
+    };
     let ingest_mode =
         resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
@@ -432,11 +450,19 @@ pub fn default_state() -> AppState {
         }
     }
 
+    let api_auth = ApiAuthConfig::from_env();
+    if api_auth.enabled && api_auth.api_keys.is_empty() {
+        tracing::warn!("api auth enabled but no API keys configured; all protected routes will return unauthorized");
+    }
+    let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
+
     AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
         downsample_limit: 1_000,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
+        api_auth,
+        api_rate_limiter,
     }
 }
 
@@ -527,6 +553,34 @@ pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
     }
     let step = ((values.len() as f64) / (max_points as f64)).ceil() as usize;
     values.iter().step_by(step.max(1)).cloned().collect()
+}
+
+async fn require_api_key(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    if !state.api_auth.enabled {
+        return next.run(request).await;
+    }
+
+    let maybe_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let api_key = match maybe_key {
+        Some(api_key) if state.api_auth.validates_key(api_key) => api_key,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    if !state.api_rate_limiter.allow(api_key) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    next.run(request).await
 }
 
 async fn health() -> (StatusCode, Json<HealthResponse>) {
@@ -802,11 +856,14 @@ mod tests {
     }
 
     fn test_state(limit: usize) -> AppState {
+        let api_auth = ApiAuthConfig::default();
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
         }
     }
 

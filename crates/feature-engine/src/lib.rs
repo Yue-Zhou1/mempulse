@@ -1,5 +1,8 @@
+pub mod registry;
+
 use common::{Address, TxHash};
 use event_log::TxDecoded;
+use registry::ProtocolRegistry;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureInput<'a> {
@@ -35,23 +38,6 @@ pub struct FeaturedTransaction {
 }
 
 const WEI_PER_GWEI: u128 = 1_000_000_000;
-const UNISWAP_V2_ROUTER02: Address = [
-    0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac, 0xb4,
-    0xc6, 0x59, 0xf2, 0x48, 0x8d,
-];
-const UNISWAP_V3_ROUTER02: Address = [
-    0x68, 0xb3, 0x46, 0x58, 0x33, 0xfb, 0x72, 0xa7, 0x0e, 0xcd, 0xf4, 0x85, 0xe0, 0xe4, 0xc7,
-    0xbd, 0x86, 0x65, 0xfc, 0x45,
-];
-const UNISWAP_UNIVERSAL_ROUTER: Address = [
-    0xef, 0x1c, 0x6e, 0x67, 0x70, 0x3c, 0x7b, 0xd7, 0x10, 0x7e, 0xed, 0x83, 0x03, 0xfb, 0xe6,
-    0xec, 0x25, 0x54, 0xbf, 0x6b,
-];
-const ONE_INCH_ROUTER_V5: Address = [
-    0x11, 0x11, 0x11, 0x12, 0x54, 0xee, 0xb2, 0x54, 0x77, 0xb6, 0x8f, 0xb8, 0x5e, 0xd9, 0x29,
-    0xf7, 0x3a, 0x96, 0x05, 0x82,
-];
-
 pub fn analyze_transaction(input: FeatureInput<'_>) -> FeatureAnalysis {
     let method_selector = selector(input.calldata);
     let protocol = classify_protocol(input.to, method_selector);
@@ -120,27 +106,7 @@ fn selector(calldata: &[u8]) -> Option<[u8; 4]> {
 
 #[inline]
 fn classify_protocol(to: Option<&Address>, method_selector: Option<[u8; 4]>) -> &'static str {
-    if let Some(address) = to {
-        if address == &UNISWAP_V2_ROUTER02 {
-            return "uniswap-v2";
-        }
-        if address == &UNISWAP_V3_ROUTER02 {
-            return "uniswap-v3";
-        }
-        if address == &UNISWAP_UNIVERSAL_ROUTER {
-            return "uniswap-universal";
-        }
-        if address == &ONE_INCH_ROUTER_V5 {
-            return "1inch";
-        }
-    }
-
-    match method_selector {
-        Some([0xa9, 0x05, 0x9c, 0xbb]) => "erc20",
-        Some([0x23, 0xb8, 0x72, 0xdd]) => "erc20",
-        Some([0x09, 0x5e, 0xa7, 0xb3]) => "erc20",
-        _ => "unknown",
-    }
+    ProtocolRegistry::default_mainnet().classify(to.copied(), method_selector)
 }
 
 #[inline]

@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
 
 mod strategies;
+mod scoring;
 
 use common::TxHash;
 use event_log::TxDecoded;
 use feature_engine::analyze_decoded_transaction;
 use serde::{Deserialize, Serialize};
+use scoring::ScoreBreakdown;
 use strategies::default_strategies;
 
 pub use strategies::StrategyKind;
+pub use scoring::ScoreBreakdown as OpportunityScoreBreakdown;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearcherInputTx {
@@ -38,6 +41,8 @@ pub struct OpportunityCandidate {
     pub score: u32,
     pub protocol: String,
     pub category: String,
+    pub breakdown: ScoreBreakdown,
+    pub reasons: Vec<String>,
 }
 
 pub fn rank_opportunities(batch: &[SearcherInputTx], config: SearcherConfig) -> Vec<OpportunityCandidate> {

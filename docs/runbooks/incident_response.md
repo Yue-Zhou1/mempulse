@@ -20,6 +20,7 @@ This runbook covers ingest/decoding/coverage incidents surfaced by the V2 alert 
 3. Capture current deploy + runtime state:
    - git SHA
    - `VIZ_API_INGEST_MODE`
+   - `VIZ_API_AUTH_ENABLED` + key rotation status
    - upstream RPC/WS endpoint status
 
 ## Playbooks
@@ -50,6 +51,12 @@ This runbook covers ingest/decoding/coverage incidents surfaced by the V2 alert 
 1. Compare current tx/sec against baseline and upstream mempool view.
 2. Check for RPC provider degradation or regional network partition.
 3. Switch to fallback endpoint and track ratio recovery over 2 blocks.
+
+### API Auth / Quota Errors
+
+1. Verify caller key is present in `VIZ_API_API_KEYS`.
+2. Check rate-limit budget (`VIZ_API_RATE_LIMIT_PER_MINUTE`) against observed request volume.
+3. Confirm failures are `401` (auth) vs `429` (quota) and communicate mitigation.
 
 ## Exit Criteria
 

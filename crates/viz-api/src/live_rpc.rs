@@ -23,6 +23,10 @@ const PRIMARY_PUBLIC_WS_URL: &str = "wss://eth.drpc.org";
 const PRIMARY_PUBLIC_HTTP_URL: &str = "https://eth.drpc.org";
 const FALLBACK_PUBLIC_WS_URL: &str = "wss://ethereum-rpc.publicnode.com";
 const FALLBACK_PUBLIC_HTTP_URL: &str = "https://ethereum-rpc.publicnode.com";
+const ENV_ETH_WS_URL: &str = "VIZ_API_ETH_WS_URL";
+const ENV_ETH_HTTP_URL: &str = "VIZ_API_ETH_HTTP_URL";
+const ENV_SOURCE_ID: &str = "VIZ_API_SOURCE_ID";
+const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
 
 #[derive(Clone, Debug)]
 struct RpcEndpoint {
@@ -53,6 +57,72 @@ impl Default for LiveRpcConfig {
             source_id: SourceId::new("rpc-live"),
             max_seen_hashes: 10_000,
         }
+    }
+}
+
+impl LiveRpcConfig {
+    pub fn from_env() -> Result<Self> {
+        let ws_override = std::env::var(ENV_ETH_WS_URL)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let http_override = std::env::var(ENV_ETH_HTTP_URL)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let source_id = std::env::var(ENV_SOURCE_ID)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "rpc-live".to_owned());
+        let max_seen_hashes = std::env::var(ENV_MAX_SEEN_HASHES)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|err| anyhow!("invalid {ENV_MAX_SEEN_HASHES}: {err}"))?
+            .unwrap_or(10_000)
+            .max(1);
+
+        let mut config = Self::default();
+        if let Some(ws_url) = ws_override {
+            let ws_url_static: &'static str = Box::leak(ws_url.into_boxed_str());
+            let http_url_static: &'static str = Box::leak(
+                http_override
+                    .unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned())
+                    .into_boxed_str(),
+            );
+            config.endpoints = vec![RpcEndpoint {
+                ws_url: ws_url_static,
+                http_url: http_url_static,
+            }];
+        } else if let Some(http_url) = http_override {
+            let http_url_static: &'static str = Box::leak(http_url.into_boxed_str());
+            if let Some(primary) = config.endpoints.first_mut() {
+                primary.http_url = http_url_static;
+            }
+        }
+
+        config.source_id = SourceId::new(source_id);
+        config.max_seen_hashes = max_seen_hashes;
+        Ok(config)
+    }
+
+    pub fn primary_ws_url(&self) -> Option<&str> {
+        self.endpoints.first().map(|endpoint| endpoint.ws_url)
+    }
+
+    pub fn primary_http_url(&self) -> Option<&str> {
+        self.endpoints.first().map(|endpoint| endpoint.http_url)
+    }
+
+    pub fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub fn max_seen_hashes(&self) -> usize {
+        self.max_seen_hashes
     }
 }
 

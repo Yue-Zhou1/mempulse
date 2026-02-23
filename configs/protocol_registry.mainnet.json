@@ -1,0 +1,33 @@
+{
+  "protocols": [
+    {
+      "name": "uniswap-v2",
+      "addresses": [
+        "0x7a250d5630b4cf539739df2c5dacb4c659f2488d"
+      ]
+    },
+    {
+      "name": "uniswap-v3",
+      "addresses": [
+        "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+      ]
+    },
+    {
+      "name": "uniswap-universal",
+      "addresses": [
+        "0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b"
+      ]
+    },
+    {
+      "name": "1inch",
+      "addresses": [
+        "0x1111111254eeb25477b68fb85ed929f73a960582"
+      ]
+    }
+  ],
+  "selector_protocols": [
+    { "selector": "0xa9059cbb", "protocol": "erc20" },
+    { "selector": "0x23b872dd", "protocol": "erc20" },
+    { "selector": "0x095ea7b3", "protocol": "erc20" }
+  ]
+}

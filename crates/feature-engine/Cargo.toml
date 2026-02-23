@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 event-log = { path = "../event-log" }
+serde = { workspace = true }
+serde_json = { workspace = true }

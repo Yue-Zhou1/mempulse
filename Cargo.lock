@@ -1209,6 +1209,8 @@ version = "0.1.0"
 dependencies = [
  "common",
  "event-log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

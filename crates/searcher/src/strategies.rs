@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::OpportunityCandidate;
+use crate::{OpportunityCandidate, scoring::ScoreBreakdown};
 use feature_engine::FeaturedTransaction;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
@@ -33,11 +33,24 @@ impl Strategy for SandwichCandidateStrategy {
             return None;
         }
 
-        let score = analysis.mev_score as u32 * 120
-            + analysis.urgency_score as u32 * 25
-            + structural_bonus(featured)
-            + 500;
-        Some(candidate(StrategyKind::SandwichCandidate, featured, score))
+        let breakdown = ScoreBreakdown {
+            mev_component: analysis.mev_score as u32 * 120,
+            urgency_component: analysis.urgency_score as u32 * 25,
+            structural_component: structural_bonus(featured),
+            strategy_bonus: 500,
+        };
+        let reasons = vec![
+            format!("mev_score={}*120", analysis.mev_score),
+            format!("urgency_score={}*25", analysis.urgency_score),
+            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            "strategy bonus=500".to_owned(),
+        ];
+        Some(candidate(
+            StrategyKind::SandwichCandidate,
+            featured,
+            breakdown,
+            reasons,
+        ))
     }
 }
 
@@ -48,11 +61,24 @@ impl Strategy for BackrunCandidateStrategy {
             return None;
         }
 
-        let score = analysis.mev_score as u32 * 100
-            + analysis.urgency_score as u32 * 20
-            + structural_bonus(featured)
-            + 300;
-        Some(candidate(StrategyKind::BackrunCandidate, featured, score))
+        let breakdown = ScoreBreakdown {
+            mev_component: analysis.mev_score as u32 * 100,
+            urgency_component: analysis.urgency_score as u32 * 20,
+            structural_component: structural_bonus(featured),
+            strategy_bonus: 300,
+        };
+        let reasons = vec![
+            format!("mev_score={}*100", analysis.mev_score),
+            format!("urgency_score={}*20", analysis.urgency_score),
+            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            "strategy bonus=300".to_owned(),
+        ];
+        Some(candidate(
+            StrategyKind::BackrunCandidate,
+            featured,
+            breakdown,
+            reasons,
+        ))
     }
 }
 
@@ -63,9 +89,24 @@ impl Strategy for ArbCandidateStrategy {
             return None;
         }
 
-        let score =
-            analysis.mev_score as u32 * 90 + analysis.urgency_score as u32 * 15 + structural_bonus(featured) + 200;
-        Some(candidate(StrategyKind::ArbCandidate, featured, score))
+        let breakdown = ScoreBreakdown {
+            mev_component: analysis.mev_score as u32 * 90,
+            urgency_component: analysis.urgency_score as u32 * 15,
+            structural_component: structural_bonus(featured),
+            strategy_bonus: 200,
+        };
+        let reasons = vec![
+            format!("mev_score={}*90", analysis.mev_score),
+            format!("urgency_score={}*15", analysis.urgency_score),
+            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            "strategy bonus=200".to_owned(),
+        ];
+        Some(candidate(
+            StrategyKind::ArbCandidate,
+            featured,
+            breakdown,
+            reasons,
+        ))
     }
 }
 
@@ -86,13 +127,16 @@ fn structural_bonus(featured: &FeaturedTransaction) -> u32 {
 fn candidate(
     strategy: StrategyKind,
     featured: &FeaturedTransaction,
-    score: u32,
+    breakdown: ScoreBreakdown,
+    reasons: Vec<String>,
 ) -> OpportunityCandidate {
     OpportunityCandidate {
         tx_hash: featured.hash,
         strategy,
-        score,
+        score: breakdown.total(),
         protocol: featured.analysis.protocol.to_owned(),
         category: featured.analysis.category.to_owned(),
+        breakdown,
+        reasons,
     }
 }

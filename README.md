@@ -64,9 +64,10 @@ The legacy implementation plan now lives at:
 
 Set environment variables before starting `viz-api`:
 
-- `VIZ_API_ETH_WS_URL` (required): WebSocket endpoint for `eth_subscribe newPendingTransactions`
-- `VIZ_API_ETH_HTTP_URL` (recommended): HTTP endpoint for `eth_getTransactionByHash`
+- `VIZ_API_ETH_WS_URL` (optional override): WebSocket endpoint for `eth_subscribe newPendingTransactions`
+- `VIZ_API_ETH_HTTP_URL` (optional override): HTTP endpoint for `eth_getTransactionByHash`
 - `VIZ_API_SOURCE_ID` (optional): source label (default: `rpc-live`)
+- `VIZ_API_MAX_SEEN_HASHES` (optional): dedup cache size for live feed (default: `10000`)
 
 Example:
 
@@ -76,7 +77,7 @@ export VIZ_API_ETH_HTTP_URL="https://YOUR_PROVIDER_HTTP_URL"
 cargo run -p viz-api --bin viz-api
 ```
 
-Without these variables, `viz-api` falls back to synthetic demo events.
+Without these overrides, `viz-api` uses built-in public RPC endpoints for live mode.
 
 ## Performance Budget Check
 

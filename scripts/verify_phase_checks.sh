@@ -13,4 +13,11 @@ echo "[verify] building replay and viz binaries"
 cargo build -p replay --bin replay-cli
 cargo build -p viz-api --bin viz-api
 
+if [[ "${VERIFY_COMMERCIAL_READINESS:-1}" == "1" ]]; then
+  echo "[verify] running commercial readiness gate"
+  bash scripts/verify_commercial_readiness.sh
+else
+  echo "[verify] skipping commercial readiness gate (VERIFY_COMMERCIAL_READINESS=${VERIFY_COMMERCIAL_READINESS:-0})"
+fi
+
 echo "[verify] phase acceptance checks: PASS"

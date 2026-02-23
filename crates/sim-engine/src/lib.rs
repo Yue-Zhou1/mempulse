@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod state_provider;
+
 use anyhow::Result;
 use common::{Address, TxHash};
 use event_log::TxDecoded;
@@ -11,6 +13,8 @@ use revm::{Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext, contex
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+pub use state_provider::{AccountSeed, NoopStateProvider, StateProvider};
 
 const MAX_SYNTHETIC_CALLDATA_BYTES: u32 = 8_192;
 const SEEDED_BALANCE_WEI: u128 = 1_000_000_000_000_000_000_000_000_000_000;
@@ -41,12 +45,41 @@ pub struct SimulationBatchResult {
     pub final_state_diff_hash: TxHash,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimulationTxInput {
+    pub decoded: TxDecoded,
+    #[serde(default)]
+    pub calldata: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SimulationMode<'a> {
+    SyntheticDeterministic,
+    RpcBacked(&'a dyn StateProvider),
+}
+
 pub fn simulate_deterministic(
     chain_context: &ChainContext,
     txs: &[TxDecoded],
 ) -> Result<SimulationBatchResult> {
+    let inputs = txs
+        .iter()
+        .cloned()
+        .map(|decoded| SimulationTxInput {
+            decoded,
+            calldata: None,
+        })
+        .collect::<Vec<_>>();
+    simulate_with_mode(chain_context, &inputs, SimulationMode::SyntheticDeterministic)
+}
+
+pub fn simulate_with_mode(
+    chain_context: &ChainContext,
+    txs: &[SimulationTxInput],
+    mode: SimulationMode<'_>,
+) -> Result<SimulationBatchResult> {
     let mut db = InMemoryDB::default();
-    seed_sender_accounts(&mut db, txs);
+    seed_sender_accounts(&mut db, txs, mode)?;
 
     let base_fee_u64 = chain_context.base_fee_wei.min(u64::MAX as u128) as u64;
     let mut evm = Context::mainnet()
@@ -73,20 +106,20 @@ pub fn simulate_deterministic(
 
     let mut tx_results = Vec::with_capacity(txs.len());
     for tx in txs {
-        let tx_env = tx_env_from_decoded(chain_context, tx);
+        let tx_env = tx_env_from_input(chain_context, tx);
         let result_and_state = evm.transact(tx_env)?;
         let gas_used = result_and_state.result.gas_used();
         let success = result_and_state.result.is_success();
         let state_diff_hash = hash_state_diff(&result_and_state.state);
 
-        aggregate.update(tx.hash);
+        aggregate.update(tx.decoded.hash);
         aggregate.update(gas_used.to_le_bytes());
         aggregate.update([u8::from(success)]);
         aggregate.update(state_diff_hash);
 
         evm.db().commit(result_and_state.state);
         tx_results.push(TxSimulationResult {
-            hash: tx.hash,
+            hash: tx.decoded.hash,
             success,
             gas_used,
             state_diff_hash,
@@ -100,22 +133,36 @@ pub fn simulate_deterministic(
     })
 }
 
-fn seed_sender_accounts(db: &mut InMemoryDB, txs: &[TxDecoded]) {
+fn seed_sender_accounts(
+    db: &mut InMemoryDB,
+    txs: &[SimulationTxInput],
+    mode: SimulationMode<'_>,
+) -> Result<()> {
     let mut sender_start_nonce = BTreeMap::<Address, u64>::new();
     for tx in txs {
         sender_start_nonce
-            .entry(tx.sender)
-            .and_modify(|nonce| *nonce = (*nonce).min(tx.nonce))
-            .or_insert(tx.nonce);
+            .entry(tx.decoded.sender)
+            .and_modify(|nonce| *nonce = (*nonce).min(tx.decoded.nonce))
+            .or_insert(tx.decoded.nonce);
     }
 
     for (sender, nonce) in sender_start_nonce {
-        let info = AccountInfo::from_balance(U256::from(SEEDED_BALANCE_WEI)).with_nonce(nonce);
+        let seeded = match mode {
+            SimulationMode::SyntheticDeterministic => None,
+            SimulationMode::RpcBacked(provider) => provider.account_seed(sender)?,
+        };
+        let balance = seeded
+            .map(|account| account.balance_wei)
+            .unwrap_or(SEEDED_BALANCE_WEI);
+        let account_nonce = seeded.map(|account| account.nonce).unwrap_or(nonce);
+        let info = AccountInfo::from_balance(U256::from(balance)).with_nonce(account_nonce);
         db.insert_account_info(to_revm_address(sender), info);
     }
+    Ok(())
 }
 
-fn tx_env_from_decoded(chain_context: &ChainContext, tx: &TxDecoded) -> TxEnv {
+fn tx_env_from_input(chain_context: &ChainContext, input: &SimulationTxInput) -> TxEnv {
+    let tx = &input.decoded;
     let gas_limit = tx.gas_limit.unwrap_or(210_000).max(21_000);
     let mut gas_price = tx
         .gas_price_wei
@@ -133,7 +180,14 @@ fn tx_env_from_decoded(chain_context: &ChainContext, tx: &TxDecoded) -> TxEnv {
         .calldata_len
         .unwrap_or(0)
         .min(MAX_SYNTHETIC_CALLDATA_BYTES);
-    let data = Bytes::from(vec![0u8; calldata_len as usize]);
+    let data = input
+        .calldata
+        .as_ref()
+        .map(|bytes| {
+            let bounded_len = bytes.len().min(MAX_SYNTHETIC_CALLDATA_BYTES as usize);
+            Bytes::from(bytes[..bounded_len].to_vec())
+        })
+        .unwrap_or_else(|| Bytes::from(vec![0u8; calldata_len as usize]));
 
     TxEnv {
         tx_type: tx.tx_type,
