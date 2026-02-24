@@ -131,6 +131,7 @@ fn default_feature_engine_version() -> String {
 pub trait EventStore {
     fn append_event(&mut self, event: EventEnvelope);
     fn list_events(&self) -> Vec<EventEnvelope>;
+    fn scan_events(&self, from_seq_id: u64, limit: usize) -> Vec<EventEnvelope>;
     fn latest_seq_id(&self) -> Option<u64>;
 }
 
@@ -328,6 +329,61 @@ impl EventStore for InMemoryStorage {
             });
         }
 
+        let lifecycle_update = match &event.payload {
+            EventPayload::TxDecoded(decoded) => Some(TxLifecycleRecord {
+                hash: decoded.hash,
+                status: "pending".to_owned(),
+                reason: None,
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxDropped(dropped) => Some(TxLifecycleRecord {
+                hash: dropped.hash,
+                status: "dropped".to_owned(),
+                reason: Some(dropped.reason.clone()),
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxConfirmedProvisional(confirmed) => Some(TxLifecycleRecord {
+                hash: confirmed.hash,
+                status: "confirmed_provisional".to_owned(),
+                reason: Some(format!(
+                    "block={}:{}",
+                    confirmed.block_number,
+                    format_hash(&confirmed.block_hash)
+                )),
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxConfirmedFinal(confirmed) => Some(TxLifecycleRecord {
+                hash: confirmed.hash,
+                status: "confirmed_final".to_owned(),
+                reason: Some(format!(
+                    "block={}:{}",
+                    confirmed.block_number,
+                    format_hash(&confirmed.block_hash)
+                )),
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxReplaced(replaced) => Some(TxLifecycleRecord {
+                hash: replaced.hash,
+                status: "replaced".to_owned(),
+                reason: Some(format_hash(&replaced.replaced_by)),
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxReorged(reorged) => Some(TxLifecycleRecord {
+                hash: reorged.hash,
+                status: "pending".to_owned(),
+                reason: Some("reorg_reopened".to_owned()),
+                updated_unix_ms: event.ingest_ts_unix_ms,
+            }),
+            EventPayload::TxSeen(_)
+            | EventPayload::TxFetched(_)
+            | EventPayload::OppDetected(_)
+            | EventPayload::SimCompleted(_)
+            | EventPayload::BundleSubmitted(_) => None,
+        };
+        if let Some(record) = lifecycle_update {
+            self.upsert_tx_lifecycle(record);
+        }
+
         self.events.push_back(event);
         while self.events.len() > self.config.event_capacity {
             let _ = self.events.pop_front();
@@ -340,6 +396,15 @@ impl EventStore for InMemoryStorage {
         let mut out = self.events.iter().cloned().collect::<Vec<_>>();
         sort_deterministic(&mut out);
         out
+    }
+
+    fn scan_events(&self, from_seq_id: u64, limit: usize) -> Vec<EventEnvelope> {
+        let limit = limit.max(1);
+        self.list_events()
+            .into_iter()
+            .filter(|event| event.seq_id > from_seq_id)
+            .take(limit)
+            .collect()
     }
 
     fn latest_seq_id(&self) -> Option<u64> {
@@ -666,7 +731,7 @@ fn format_hash(hash: &TxHash) -> String {
 mod tests {
     use super::*;
     use common::SourceId;
-    use event_log::{EventPayload, TxDecoded, TxSeen};
+    use event_log::{EventPayload, TxConfirmed, TxDecoded, TxReorged, TxSeen};
 
     fn hash(v: u8) -> TxHash {
         [v; 32]
@@ -985,6 +1050,21 @@ mod tests {
     }
 
     #[test]
+    fn scan_events_returns_sorted_window_after_seq() {
+        let mut store = InMemoryStorage::default();
+        store.append_event(seen_event(5, "peer-b", 5));
+        store.append_event(seen_event(3, "peer-a", 3));
+        store.append_event(seen_event(4, "peer-c", 4));
+
+        let scan = store.scan_events(3, 2);
+        let seqs = scan
+            .into_iter()
+            .map(|event| event.seq_id)
+            .collect::<Vec<_>>();
+        assert_eq!(seqs, vec![4, 5]);
+    }
+
+    #[test]
     fn recent_transactions_are_sorted_by_seen_time_desc_then_hash() {
         let mut store = InMemoryStorage::with_config(StorageConfig {
             event_capacity: 100,
@@ -1139,5 +1219,65 @@ mod tests {
 
         assert_eq!(store.write_latency_ns.len(), 4);
         assert!(store.avg_write_latency_ns().is_some());
+    }
+
+    #[test]
+    fn append_event_derives_lifecycle_rows_including_reorg_reopen() {
+        let mut store = InMemoryStorage::default();
+        let tx_hash = hash(42);
+
+        store.append_event(EventEnvelope {
+            seq_id: 1,
+            ingest_ts_unix_ms: 1_700_000_000_001,
+            ingest_ts_mono_ns: 1,
+            source_id: SourceId::new("test"),
+            payload: EventPayload::TxDecoded(TxDecoded {
+                hash: tx_hash,
+                tx_type: 2,
+                sender: [9; 20],
+                nonce: 1,
+                chain_id: Some(1),
+                to: None,
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: None,
+            }),
+        });
+        store.append_event(EventEnvelope {
+            seq_id: 2,
+            ingest_ts_unix_ms: 1_700_000_000_002,
+            ingest_ts_mono_ns: 2,
+            source_id: SourceId::new("test"),
+            payload: EventPayload::TxConfirmedProvisional(TxConfirmed {
+                hash: tx_hash,
+                block_number: 1_234_567,
+                block_hash: [7; 32],
+            }),
+        });
+        store.append_event(EventEnvelope {
+            seq_id: 3,
+            ingest_ts_unix_ms: 1_700_000_000_003,
+            ingest_ts_mono_ns: 3,
+            source_id: SourceId::new("test"),
+            payload: EventPayload::TxReorged(TxReorged {
+                hash: tx_hash,
+                old_block_hash: [7; 32],
+                new_block_hash: [8; 32],
+            }),
+        });
+
+        let lifecycle = store
+            .tx_lifecycle()
+            .iter()
+            .rev()
+            .find(|row| row.hash == tx_hash);
+        let lifecycle = lifecycle.expect("lifecycle row");
+        assert_eq!(lifecycle.status, "pending");
+        assert_eq!(lifecycle.reason.as_deref(), Some("reorg_reopened"));
+        assert_eq!(lifecycle.updated_unix_ms, 1_700_000_000_003);
     }
 }

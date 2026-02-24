@@ -15,6 +15,7 @@ This runbook covers ingest/decoding/coverage incidents surfaced by the V2 alert 
 
 1. Confirm active alerts in Prometheus and Grafana (`ops/grafana/dashboards/v2_overview.json`).
 2. Query API snapshots:
+   - `GET /metrics` (Prometheus exposition)
    - `GET /metrics/snapshot`
    - `GET /alerts/evaluate`
 3. Capture current deploy + runtime state:

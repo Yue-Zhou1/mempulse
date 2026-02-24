@@ -57,6 +57,17 @@ impl StorageWal {
         Ok(events)
     }
 
+    pub fn scan(&self, from_seq_id: u64, limit: usize) -> Result<Vec<EventEnvelope>> {
+        let limit = limit.max(1);
+        let mut events = self.recover_events()?;
+        events.sort_by_key(|event| event.seq_id);
+        Ok(events
+            .into_iter()
+            .filter(|event| event.seq_id > from_seq_id)
+            .take(limit)
+            .collect())
+    }
+
     pub fn clear(&self) -> Result<()> {
         fs::write(&self.path, b"")
             .with_context(|| format!("clear WAL file {}", self.path.display()))?;

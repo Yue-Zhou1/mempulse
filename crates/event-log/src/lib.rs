@@ -63,6 +63,9 @@ pub enum EventPayload {
     TxSeen(TxSeen),
     TxFetched(TxFetched),
     TxDecoded(TxDecoded),
+    OppDetected(OppDetected),
+    SimCompleted(SimCompleted),
+    BundleSubmitted(BundleSubmitted),
     TxReplaced(TxReplaced),
     TxDropped(TxDropped),
     TxConfirmedProvisional(TxConfirmed),
@@ -76,6 +79,9 @@ impl EventPayload {
             EventPayload::TxSeen(e) => e.hash,
             EventPayload::TxFetched(e) => e.hash,
             EventPayload::TxDecoded(e) => e.hash,
+            EventPayload::OppDetected(e) => e.hash,
+            EventPayload::SimCompleted(e) => e.hash,
+            EventPayload::BundleSubmitted(e) => e.hash,
             EventPayload::TxReplaced(e) => e.hash,
             EventPayload::TxDropped(e) => e.hash,
             EventPayload::TxConfirmedProvisional(e) => e.hash,
@@ -123,6 +129,42 @@ pub struct TxDecoded {
     pub max_fee_per_blob_gas_wei: Option<u128>,
     #[serde(default)]
     pub calldata_len: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OppDetected {
+    pub hash: TxHash,
+    pub strategy: String,
+    pub score: u32,
+    pub protocol: String,
+    pub category: String,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimCompleted {
+    pub hash: TxHash,
+    pub sim_id: String,
+    pub status: String,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleSubmitted {
+    pub hash: TxHash,
+    pub bundle_id: String,
+    pub sim_id: String,
+    pub relay: String,
+    pub accepted: bool,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -229,6 +271,33 @@ mod tests {
         let decoded: EventEnvelope = from_str(&encoded).expect("deserialize event");
 
         assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn opp_detected_payload_round_trip_json_with_versions() {
+        let event = EventEnvelope {
+            seq_id: 77,
+            ingest_ts_unix_ms: 1_700_000_223_456,
+            ingest_ts_mono_ns: 7_777_777,
+            source_id: SourceId::new("searcher"),
+            payload: EventPayload::OppDetected(OppDetected {
+                hash: hash(9),
+                strategy: "SandwichCandidate".to_owned(),
+                score: 12_345,
+                protocol: "uniswap-v2".to_owned(),
+                category: "swap".to_owned(),
+                feature_engine_version: "feature-engine.v1".to_owned(),
+                scorer_version: "scorer.v1".to_owned(),
+                strategy_version: "strategy.sandwich.v1".to_owned(),
+                reasons: vec!["mev_score=90*120".to_owned()],
+            }),
+        };
+
+        let encoded = to_string(&event).expect("serialize event");
+        let decoded: EventEnvelope = from_str(&encoded).expect("deserialize event");
+
+        assert_eq!(event, decoded);
+        assert_eq!(decoded.payload.primary_hash(), hash(9));
     }
 
     #[test]

@@ -7,7 +7,7 @@ rule_files:
 
 scrape_configs:
   - job_name: viz-api
-    metrics_path: /metrics/snapshot
+    metrics_path: /metrics
     static_configs:
       - targets:
           - localhost:3000

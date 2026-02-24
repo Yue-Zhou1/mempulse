@@ -1,7 +1,7 @@
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
-use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use event_log::{EventEnvelope, EventPayload, OppDetected, TxDecoded, TxFetched, TxSeen};
 use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
 };
@@ -453,6 +453,24 @@ async fn process_pending_hash(
             }))
             .await?;
         for opportunity in build_opportunity_records(&decoded, &raw_tx, now_unix_ms) {
+            append_event(
+                writer,
+                next_seq_id,
+                source_id,
+                now_unix_ms,
+                EventPayload::OppDetected(OppDetected {
+                    hash: opportunity.tx_hash,
+                    strategy: opportunity.strategy.clone(),
+                    score: opportunity.score,
+                    protocol: opportunity.protocol.clone(),
+                    category: opportunity.category.clone(),
+                    feature_engine_version: opportunity.feature_engine_version.clone(),
+                    scorer_version: opportunity.scorer_version.clone(),
+                    strategy_version: opportunity.strategy_version.clone(),
+                    reasons: opportunity.reasons.clone(),
+                }),
+            )
+            .await?;
             writer
                 .enqueue(StorageWriteOp::UpsertOpportunity(opportunity))
                 .await?;
@@ -889,7 +907,11 @@ mod tests {
         let records = build_opportunity_records(&decoded, &calldata, detected_unix_ms);
 
         assert!(!records.is_empty());
-        assert!(records.windows(2).all(|pair| pair[0].score >= pair[1].score));
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0].score >= pair[1].score)
+        );
         assert!(
             records
                 .iter()

@@ -1,7 +1,7 @@
 use ahash::RandomState;
 use anyhow::Result;
 use common::{SourceId, TxHash};
-use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxFetched, TxSeen};
 use hashbrown::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,12 +12,14 @@ type FastSet<T> = HashSet<T, RandomState>;
 #[derive(Clone, Debug)]
 pub struct RpcIngestConfig {
     pub max_seen_hashes: usize,
+    pub pending_batch_capacity: usize,
 }
 
 impl Default for RpcIngestConfig {
     fn default() -> Self {
         Self {
             max_seen_hashes: 250_000,
+            pending_batch_capacity: 4_096,
         }
     }
 }
@@ -90,6 +92,7 @@ where
             source_id,
             config: RpcIngestConfig {
                 max_seen_hashes: config.max_seen_hashes.max(1),
+                pending_batch_capacity: config.pending_batch_capacity.max(1),
             },
             seen_hashes: FastSet::default(),
             seen_order: VecDeque::new(),
@@ -100,9 +103,32 @@ where
     pub fn process_pending_batch(&mut self) -> Result<Vec<EventEnvelope>> {
         let mut events = Vec::new();
         let hashes = self.provider.pending_hashes()?;
+        let depth_current = hashes.len();
 
-        for hash in hashes {
+        for (idx, hash) in hashes.into_iter().enumerate() {
+            if idx >= self.config.pending_batch_capacity {
+                events.push(self.new_event(EventPayload::TxDropped(TxDropped {
+                    hash,
+                    reason: self.drop_reason(
+                        "QueueFull",
+                        "rpc.pending_batch",
+                        depth_current,
+                        self.config.pending_batch_capacity,
+                    ),
+                })));
+                continue;
+            }
+
             if !self.remember_hash(hash) {
+                events.push(self.new_event(EventPayload::TxDropped(TxDropped {
+                    hash,
+                    reason: self.drop_reason(
+                        "Duplicate",
+                        "rpc.pending_batch",
+                        depth_current,
+                        self.config.pending_batch_capacity,
+                    ),
+                })));
                 continue;
             }
 
@@ -140,6 +166,19 @@ where
         }
 
         Ok(events)
+    }
+
+    fn drop_reason(
+        &self,
+        reason: &str,
+        queue_name: &str,
+        depth_current: usize,
+        depth_peak: usize,
+    ) -> String {
+        format!(
+            "{reason};lane=rpc;source={};queue={queue_name};depth_current={depth_current};depth_peak={depth_peak}",
+            self.source_id.0
+        )
     }
 
     fn remember_hash(&mut self, hash: TxHash) -> bool {
@@ -240,8 +279,8 @@ mod tests {
 
         let events = service.process_pending_batch().expect("process batch");
 
-        // 2 unique hashes * (seen + fetched + decoded) events
-        assert_eq!(events.len(), 6);
+        // 2 unique hashes * (seen + fetched + decoded) events + 1 duplicate drop event
+        assert_eq!(events.len(), 7);
         assert!(events.windows(2).all(|w| w[0].seq_id < w[1].seq_id));
 
         let seen_hashes: Vec<TxHash> = events
@@ -253,6 +292,15 @@ mod tests {
             .collect();
 
         assert_eq!(seen_hashes, vec![hash(1), hash(2)]);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.payload,
+                EventPayload::TxDropped(ref dropped)
+                    if dropped.hash == hash(1)
+                        && dropped.reason.contains("Duplicate")
+                        && dropped.reason.contains("queue=rpc.pending_batch")
+            )
+        }));
     }
 
     #[test]
@@ -268,7 +316,7 @@ mod tests {
         let second_batch = service.process_pending_batch().expect("batch two");
 
         assert_eq!(first_batch.len(), 3);
-        assert_eq!(second_batch.len(), 3);
+        assert_eq!(second_batch.len(), 4);
 
         let second_seen: Vec<TxHash> = second_batch
             .iter()
@@ -279,6 +327,15 @@ mod tests {
             .collect();
 
         assert_eq!(second_seen, vec![hash(8)]);
+        assert!(second_batch.iter().any(|event| {
+            matches!(
+                event.payload,
+                EventPayload::TxDropped(ref dropped)
+                    if dropped.hash == hash(7)
+                        && dropped.reason.contains("Duplicate")
+                        && dropped.reason.contains("queue=rpc.pending_batch")
+            )
+        }));
     }
 
     #[test]
@@ -292,7 +349,10 @@ mod tests {
             provider,
             SourceId::new("rpc-mainnet"),
             clock,
-            RpcIngestConfig { max_seen_hashes: 2 },
+            RpcIngestConfig {
+                max_seen_hashes: 2,
+                pending_batch_capacity: 16,
+            },
         );
 
         service.process_pending_batch().expect("batch one");
@@ -308,5 +368,37 @@ mod tests {
             })
             .collect();
         assert_eq!(seen_hashes, vec![hash(1)]);
+    }
+
+    #[test]
+    fn emits_queue_full_drop_when_pending_batch_exceeds_capacity() {
+        let provider = InMemoryPendingTxProvider::new(
+            vec![vec![hash(1), hash(2), hash(3)]],
+            vec![tx(1, 2), tx(2, 2), tx(3, 2)],
+        );
+        let clock = StepClock::default();
+        let mut service = RpcIngestService::with_config(
+            provider,
+            SourceId::new("rpc-mainnet"),
+            clock,
+            RpcIngestConfig {
+                max_seen_hashes: 16,
+                pending_batch_capacity: 2,
+            },
+        );
+
+        let events = service.process_pending_batch().expect("batch");
+        let dropped = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::TxDropped(dropped) => Some(dropped),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].hash, hash(3));
+        assert!(dropped[0].reason.contains("QueueFull"));
+        assert!(dropped[0].reason.contains("queue=rpc.pending_batch"));
     }
 }

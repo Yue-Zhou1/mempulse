@@ -68,6 +68,21 @@ pub struct MempoolState {
 }
 
 impl MempoolState {
+    pub fn from_pending_hashes(pending_hashes: &[TxHash]) -> Self {
+        let mut state = Self::default();
+        for hash in pending_hashes {
+            state.txs.insert(
+                *hash,
+                TxEntry {
+                    sender: None,
+                    nonce: None,
+                    status: TxLifecycleStatus::Pending,
+                },
+            );
+        }
+        state
+    }
+
     pub fn apply_event(&mut self, event: &EventEnvelope) -> Vec<StateTransition> {
         match &event.payload {
             EventPayload::TxDecoded(decoded) => self.apply_decoded(decoded),
@@ -122,7 +137,11 @@ impl MempoolState {
                     new_hash: replaced.replaced_by,
                 }]
             }
-            EventPayload::TxSeen(_) | EventPayload::TxFetched(_) => Vec::new(),
+            EventPayload::TxSeen(_)
+            | EventPayload::TxFetched(_)
+            | EventPayload::OppDetected(_)
+            | EventPayload::SimCompleted(_)
+            | EventPayload::BundleSubmitted(_) => Vec::new(),
         }
     }
 

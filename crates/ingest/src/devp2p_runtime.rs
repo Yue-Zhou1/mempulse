@@ -5,6 +5,29 @@ use crate::{
     GetPooledTransactionsRequest, P2pIngestConfig, P2pIngestService, P2pMetrics, P2pTxPayload,
 };
 
+#[allow(async_fn_in_trait)]
+pub trait P2pRuntime {
+    async fn ingest_announcements(
+        &mut self,
+        peer_id: PeerId,
+        hashes: Vec<TxHash>,
+        now_unix_ms: i64,
+        now_mono_ns: u64,
+    ) -> Vec<EventEnvelope>;
+
+    async fn ingest_pooled_transactions(
+        &mut self,
+        peer_id: PeerId,
+        txs: Vec<P2pTxPayload>,
+        now_unix_ms: i64,
+        now_mono_ns: u64,
+    ) -> Vec<EventEnvelope>;
+
+    fn dequeue_get_pooled_transactions(&mut self) -> Option<GetPooledTransactionsRequest>;
+
+    fn metrics(&self) -> &P2pMetrics;
+}
+
 #[derive(Clone, Debug)]
 pub struct Devp2pRuntime {
     service: P2pIngestService,
@@ -44,6 +67,38 @@ impl Devp2pRuntime {
     }
 
     pub fn metrics(&self) -> &P2pMetrics {
+        self.service.metrics()
+    }
+}
+
+impl P2pRuntime for Devp2pRuntime {
+    async fn ingest_announcements(
+        &mut self,
+        peer_id: PeerId,
+        hashes: Vec<TxHash>,
+        now_unix_ms: i64,
+        now_mono_ns: u64,
+    ) -> Vec<EventEnvelope> {
+        self.service
+            .handle_new_pooled_transaction_hashes(peer_id, hashes, now_unix_ms, now_mono_ns)
+    }
+
+    async fn ingest_pooled_transactions(
+        &mut self,
+        peer_id: PeerId,
+        txs: Vec<P2pTxPayload>,
+        now_unix_ms: i64,
+        now_mono_ns: u64,
+    ) -> Vec<EventEnvelope> {
+        self.service
+            .handle_pooled_transactions(peer_id, txs, now_unix_ms, now_mono_ns)
+    }
+
+    fn dequeue_get_pooled_transactions(&mut self) -> Option<GetPooledTransactionsRequest> {
+        self.service.dequeue_get_pooled_transactions()
+    }
+
+    fn metrics(&self) -> &P2pMetrics {
         self.service.metrics()
     }
 }

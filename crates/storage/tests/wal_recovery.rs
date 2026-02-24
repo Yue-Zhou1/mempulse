@@ -72,3 +72,21 @@ async fn writer_recovers_unflushed_events_from_wal_on_restart() {
 
     let _ = std::fs::remove_file(wal_path);
 }
+
+#[test]
+fn wal_scan_returns_events_after_seq_with_limit() {
+    let wal_path = temp_wal_path("scan");
+    let wal = StorageWal::new(&wal_path).expect("create wal");
+    wal.append_event(&decoded_event(1, 1))
+        .expect("append event 1 to wal");
+    wal.append_event(&decoded_event(2, 2))
+        .expect("append event 2 to wal");
+    wal.append_event(&decoded_event(3, 3))
+        .expect("append event 3 to wal");
+
+    let scanned = wal.scan(1, 1).expect("scan wal");
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].seq_id, 2);
+
+    let _ = std::fs::remove_file(wal_path);
+}

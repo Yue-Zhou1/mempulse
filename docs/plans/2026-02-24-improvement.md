@@ -368,10 +368,10 @@ Alerts:
 
 ### Phase 0: Determinism Scaffolding (must do first)
 
-- [ ]  Global Sequencer (`global_seq + WAL append + broadcast`)
-- [ ]  Sort all visible collection outputs
+- [x]  Global Sequencer (`global_seq + WAL append + broadcast`)
+- [x]  Sort all visible collection outputs
 - [ ]  Write rule versions into events
-- [ ]  Determinism replay test (checkpoint parity)
+- [x]  Determinism replay test (checkpoint parity)
 
 **Acceptance**
 
@@ -381,10 +381,10 @@ Alerts:
 
 ### Phase 1: Ingest Engineering + WAL/CH
 
-- [ ]  devp2p runtime trait abstraction/integration (or integrate with reth-network)
-- [ ]  All queues bounded + drop events
+- [x]  devp2p runtime trait abstraction/integration (or integrate with reth-network)
+- [x]  All queues bounded + drop events
 - [ ]  WAL segments + scan API
-- [ ]  ClickHouse sink batch writes (acceleration only)
+- [x]  ClickHouse sink batch writes (acceleration only)
 
 **Acceptance**
 
@@ -394,9 +394,9 @@ Alerts:
 
 ### Phase 2: Replay/Feature/Sim/Relay Enhancements
 
-- [ ]  checkpoint/snapshot
-- [ ]  Reorg invalidation/reopen event closed loop
-- [ ]  Ranking componentization + stable sorting
+- [x]  checkpoint/snapshot
+- [x]  Reorg invalidation/reopen event closed loop
+- [x]  Ranking componentization + stable sorting
 - [ ]  Sim trace capture + improved failure categorization
 - [ ]  Relay health + circuit breaker/downweighting
 
@@ -408,9 +408,9 @@ Alerts:
 
 ### Phase 3: Delivery (API/UI/Alerts)
 
-- [ ]  Full API (`events/replay/tx/opp/sim/bundle`)
+- [x]  Full API (`events/replay/tx/opp/sim/bundle`)
 - [ ]  Three-screen UI
-- [ ]  Prometheus metrics + alert rules
+- [x]  Prometheus metrics + alert rules
 
 **Acceptance**
 

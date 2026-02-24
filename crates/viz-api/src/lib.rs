@@ -5,15 +5,19 @@ use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use axum::{middleware, response::Response};
-use builder::RelayDryRunStatus;
+use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
-use replay::{ReplayMode, replay_frames};
+use replay::{
+    ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
+    replay_from_checkpoint,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::{Arc, RwLock};
@@ -24,7 +28,9 @@ use storage::{
 use tower_http::cors::{Any, CorsLayer};
 
 #[cfg(test)]
-use event_log::{TxDecoded, TxFetched, TxSeen};
+use builder::RelayAttemptTrace;
+#[cfg(test)]
+use event_log::{TxConfirmed, TxDecoded, TxFetched, TxReorged, TxSeen};
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +80,7 @@ pub struct FeatureDetail {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OpportunityDetail {
     pub tx_hash: String,
+    pub status: String,
     pub strategy: String,
     pub score: u32,
     pub protocol: String,
@@ -114,6 +121,14 @@ pub struct TransactionDetail {
     pub max_fee_per_blob_gas_wei: Option<u128>,
     pub calldata_len: Option<u32>,
     pub raw_tx_len: Option<usize>,
+    pub lifecycle_status: Option<String>,
+    pub lifecycle_reason: Option<String>,
+    pub lifecycle_updated_unix_ms: Option<i64>,
+    pub protocol: Option<String>,
+    pub category: Option<String>,
+    pub mev_score: Option<u16>,
+    pub urgency_score: Option<u16>,
+    pub feature_engine_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -127,6 +142,50 @@ pub struct StreamHello {
     pub message: String,
     pub replay_points: usize,
     pub propagation_edges: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplayRangeDiffSummary {
+    pub from_pending_count: usize,
+    pub to_pending_count: usize,
+    pub added_pending_count: usize,
+    pub removed_pending_count: usize,
+    pub added_pending: Vec<String>,
+    pub removed_pending: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplayRangeResponse {
+    pub from_seq_id: u64,
+    pub to_seq_id: u64,
+    pub from_checkpoint_hash: String,
+    pub to_checkpoint_hash: String,
+    pub summary: ReplayRangeDiffSummary,
+    pub frames: Vec<ReplayPoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BundleDetail {
+    pub id: String,
+    pub relay_url: String,
+    pub accepted: bool,
+    pub final_state: String,
+    pub attempt_count: usize,
+    pub started_unix_ms: i64,
+    pub finished_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimDetail {
+    pub id: String,
+    pub bundle_id: String,
+    pub status: String,
+    pub relay_url: String,
+    pub attempt_count: usize,
+    pub accepted: bool,
+    pub fail_category: Option<String>,
+    pub started_unix_ms: i64,
+    pub finished_unix_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +214,8 @@ fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
 }
 
 pub trait VizDataProvider: Send + Sync {
-    fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize) -> Vec<EventEnvelope>;
+    fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
+    -> Vec<EventEnvelope>;
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
     fn feature_summary(&self) -> Vec<FeatureSummary>;
@@ -189,15 +249,19 @@ impl InMemoryVizProvider {
 }
 
 impl VizDataProvider for InMemoryVizProvider {
-    fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize) -> Vec<EventEnvelope> {
+    fn events(
+        &self,
+        after_seq_id: u64,
+        event_types: &[String],
+        limit: usize,
+    ) -> Vec<EventEnvelope> {
         self.storage
             .read()
             .ok()
             .map(|storage| {
                 storage
-                    .list_events()
+                    .scan_events(after_seq_id, limit.saturating_mul(2).max(limit))
                     .into_iter()
-                    .filter(|event| event.seq_id > after_seq_id)
                     .filter(|event| {
                         event_types.is_empty()
                             || event_types.iter().any(|kind| {
@@ -233,7 +297,15 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn propagation_edges(&self) -> Vec<PropagationEdge> {
-        (*self.propagation).clone()
+        let mut edges = (*self.propagation).clone();
+        edges.sort_unstable_by(|left, right| {
+            left.source
+                .cmp(&right.source)
+                .then_with(|| left.destination.cmp(&right.destination))
+                .then_with(|| left.p50_delay_ms.cmp(&right.p50_delay_ms))
+                .then_with(|| left.p99_delay_ms.cmp(&right.p99_delay_ms))
+        });
+        edges
     }
 
     fn feature_summary(&self) -> Vec<FeatureSummary> {
@@ -241,15 +313,29 @@ impl VizDataProvider for InMemoryVizProvider {
             .read()
             .ok()
             .map(|storage| {
-                storage
-                    .tx_features()
-                    .iter()
-                    .map(|feature| FeatureSummary {
-                        protocol: feature.protocol.clone(),
-                        category: feature.category.clone(),
-                        count: 1,
+                let mut counts = std::collections::BTreeMap::<(String, String), u64>::new();
+                for feature in storage.tx_features() {
+                    *counts
+                        .entry((feature.protocol.clone(), feature.category.clone()))
+                        .or_insert(0) += 1;
+                }
+
+                let mut out = counts
+                    .into_iter()
+                    .map(|((protocol, category), count)| FeatureSummary {
+                        protocol,
+                        category,
+                        count,
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                out.sort_unstable_by(|left, right| {
+                    right
+                        .count
+                        .cmp(&left.count)
+                        .then_with(|| left.protocol.cmp(&right.protocol))
+                        .then_with(|| left.category.cmp(&right.category))
+                });
+                out
             })
             .unwrap_or_default()
     }
@@ -297,6 +383,7 @@ impl VizDataProvider for InMemoryVizProvider {
                     .take(limit)
                     .map(|row| OpportunityDetail {
                         tx_hash: format_bytes(&row.tx_hash),
+                        status: "detected".to_owned(),
                         strategy: row.strategy,
                         score: row.score,
                         protocol: row.protocol,
@@ -342,6 +429,14 @@ impl VizDataProvider for InMemoryVizProvider {
                 for row in storage.tx_full() {
                     full_by_hash.insert(row.hash, row);
                 }
+                let mut feature_by_hash = std::collections::HashMap::new();
+                for row in storage.tx_features() {
+                    feature_by_hash.insert(row.hash, row);
+                }
+                let mut lifecycle_by_hash = std::collections::HashMap::new();
+                for row in storage.tx_lifecycle() {
+                    lifecycle_by_hash.insert(row.hash, row);
+                }
 
                 let mut emitted = std::collections::HashSet::new();
                 let mut out = Vec::new();
@@ -351,6 +446,8 @@ impl VizDataProvider for InMemoryVizProvider {
                         continue;
                     }
                     let full = full_by_hash.get(&seen.hash).copied();
+                    let feature = feature_by_hash.get(&seen.hash).copied();
+                    let lifecycle = lifecycle_by_hash.get(&seen.hash).copied();
                     out.push(TransactionDetail {
                         hash: format_bytes(&seen.hash),
                         peer: seen.peer.clone(),
@@ -370,6 +467,15 @@ impl VizDataProvider for InMemoryVizProvider {
                         max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
                         calldata_len: full.and_then(|row| row.calldata_len),
                         raw_tx_len: full.map(|row| row.raw_tx.len()),
+                        lifecycle_status: lifecycle.map(|row| row.status.clone()),
+                        lifecycle_reason: lifecycle.and_then(|row| row.reason.clone()),
+                        lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
+                        protocol: feature.map(|row| row.protocol.clone()),
+                        category: feature.map(|row| row.category.clone()),
+                        mev_score: feature.map(|row| row.mev_score),
+                        urgency_score: feature.map(|row| row.urgency_score),
+                        feature_engine_version: feature
+                            .map(|row| row.feature_engine_version.clone()),
                     });
                     if out.len() >= limit {
                         break;
@@ -390,6 +496,29 @@ impl VizDataProvider for InMemoryVizProvider {
                 .rev()
                 .find(|seen| seen.hash == hash)?;
             let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+            let feature = storage
+                .tx_features()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
+            let lifecycle = storage
+                .tx_lifecycle()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
+            let fallback_lifecycle = lifecycle
+                .is_none()
+                .then(|| current_lifecycle(&storage.list_events(), hash));
+            let (lifecycle_status, lifecycle_reason) = lifecycle
+                .map(|row| (Some(row.status.clone()), row.reason.clone()))
+                .unwrap_or_else(|| {
+                    fallback_lifecycle
+                        .flatten()
+                        .as_ref()
+                        .map(map_lifecycle_status)
+                        .map(|(status, reason)| (Some(status), reason))
+                        .unwrap_or((None, None))
+                });
             Some(TransactionDetail {
                 hash: format_bytes(&seen.hash),
                 peer: seen.peer.clone(),
@@ -408,6 +537,14 @@ impl VizDataProvider for InMemoryVizProvider {
                 max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
                 calldata_len: full.and_then(|row| row.calldata_len),
                 raw_tx_len: full.map(|row| row.raw_tx.len()),
+                lifecycle_status,
+                lifecycle_reason,
+                lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
+                protocol: feature.map(|row| row.protocol.clone()),
+                category: feature.map(|row| row.category.clone()),
+                mev_score: feature.map(|row| row.mev_score),
+                urgency_score: feature.map(|row| row.urgency_score),
+                feature_engine_version: feature.map(|row| row.feature_engine_version.clone()),
             })
         })
     }
@@ -455,7 +592,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/alerts/evaluate", get(alerts_evaluate))
         .route("/features", get(features))
         .route("/features/recent", get(features_recent))
+        .route("/opps", get(opportunities))
         .route("/opps/recent", get(opportunities_recent))
+        .route("/tx/{hash}", get(transaction_by_hash))
+        .route("/sim/{id}", get(sim_by_id))
+        .route("/bundle/{id}", get(bundle_by_id))
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
@@ -468,6 +609,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_prometheus))
         .merge(protected)
         .layer(cors)
         .with_state(state)
@@ -605,11 +747,36 @@ fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
     })
 }
 
+fn map_lifecycle_status(status: &TxLifecycleStatus) -> (String, Option<String>) {
+    match status {
+        TxLifecycleStatus::Pending => ("pending".to_owned(), None),
+        TxLifecycleStatus::Replaced { by } => ("replaced".to_owned(), Some(format_bytes(by))),
+        TxLifecycleStatus::Dropped { reason } => ("dropped".to_owned(), Some(reason.clone())),
+        TxLifecycleStatus::ConfirmedProvisional {
+            block_number,
+            block_hash,
+        } => (
+            "confirmed_provisional".to_owned(),
+            Some(format!("block={block_number}:{}", format_bytes(block_hash))),
+        ),
+        TxLifecycleStatus::ConfirmedFinal {
+            block_number,
+            block_hash,
+        } => (
+            "confirmed_final".to_owned(),
+            Some(format!("block={block_number}:{}", format_bytes(block_hash))),
+        ),
+    }
+}
+
 fn event_payload_type(payload: &EventPayload) -> &'static str {
     match payload {
         EventPayload::TxSeen(_) => "TxSeen",
         EventPayload::TxFetched(_) => "TxFetched",
         EventPayload::TxDecoded(_) => "TxDecoded",
+        EventPayload::OppDetected(_) => "OppDetected",
+        EventPayload::SimCompleted(_) => "SimCompleted",
+        EventPayload::BundleSubmitted(_) => "BundleSubmitted",
         EventPayload::TxReplaced(_) => "TxReplaced",
         EventPayload::TxDropped(_) => "TxDropped",
         EventPayload::TxConfirmedProvisional(_) => "TxConfirmedProvisional",
@@ -704,14 +871,90 @@ async fn metrics_snapshot(State(state): State<AppState>) -> Json<MetricSnapshot>
     Json(state.provider.metric_snapshot())
 }
 
+async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
+    let body = render_prometheus_metrics(&state);
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
 async fn alerts_evaluate(State(state): State<AppState>) -> Json<AlertDecisions> {
     let snapshot = state.provider.metric_snapshot();
     Json(evaluate_alerts(&snapshot, &state.alert_thresholds))
 }
 
-async fn replay(State(state): State<AppState>) -> Json<Vec<ReplayPoint>> {
-    let values = state.provider.replay_points();
-    Json(downsample(&values, state.downsample_limit))
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ReplayQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+    stride: Option<usize>,
+}
+
+async fn replay(
+    State(state): State<AppState>,
+    Query(query): Query<ReplayQuery>,
+) -> impl IntoResponse {
+    let (from_seq_id, to_seq_id) = match (query.from, query.to) {
+        (Some(from_seq_id), Some(to_seq_id)) => {
+            if from_seq_id <= to_seq_id {
+                (from_seq_id, to_seq_id)
+            } else {
+                (to_seq_id, from_seq_id)
+            }
+        }
+        (None, None) => {
+            let values = state.provider.replay_points();
+            return Json(downsample(&values, state.downsample_limit)).into_response();
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let events = collect_events_up_to_seq(state.provider.as_ref(), to_seq_id);
+    let summary = match replay_diff_summary(&events, from_seq_id, to_seq_id) {
+        Some(summary) => summary,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let checkpoint = match replay::lifecycle_snapshot(&events, from_seq_id) {
+        Some(checkpoint) => checkpoint,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let stride = query.stride.unwrap_or(1).clamp(1, 5_000);
+    let frames = replay_from_checkpoint(&events, &checkpoint, stride)
+        .into_iter()
+        .filter(|frame| frame.seq_hi <= to_seq_id)
+        .map(|frame| ReplayPoint {
+            seq_hi: frame.seq_hi,
+            timestamp_unix_ms: frame.timestamp_unix_ms,
+            pending_count: frame.pending.len() as u32,
+        })
+        .collect::<Vec<_>>();
+
+    let response = ReplayRangeResponse {
+        from_seq_id: summary.from_seq_id,
+        to_seq_id: summary.to_seq_id,
+        from_checkpoint_hash: format_bytes(&summary.from_checkpoint_hash),
+        to_checkpoint_hash: format_bytes(&summary.to_checkpoint_hash),
+        summary: ReplayRangeDiffSummary {
+            from_pending_count: summary.from_pending_count,
+            to_pending_count: summary.to_pending_count,
+            added_pending_count: summary.added_pending.len(),
+            removed_pending_count: summary.removed_pending.len(),
+            added_pending: summary
+                .added_pending
+                .iter()
+                .map(|hash| format_bytes(hash))
+                .collect(),
+            removed_pending: summary
+                .removed_pending
+                .iter()
+                .map(|hash| format_bytes(hash))
+                .collect(),
+        },
+        frames,
+    };
+    Json(response).into_response()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -721,7 +964,10 @@ struct EventsQuery {
     limit: Option<usize>,
 }
 
-async fn events(State(state): State<AppState>, Query(query): Query<EventsQuery>) -> Json<Vec<EventEnvelope>> {
+async fn events(
+    State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
+) -> Json<Vec<EventEnvelope>> {
     let after_seq_id = query.after.unwrap_or(0);
     let limit = query.limit.unwrap_or(1_000).clamp(1, 5_000);
     let event_types = parse_event_type_filters(query.types.as_deref());
@@ -750,6 +996,7 @@ async fn features_recent(
 struct TransactionsQuery {
     limit: Option<usize>,
     min_score: Option<u32>,
+    status: Option<String>,
 }
 
 async fn transactions(
@@ -764,9 +1011,33 @@ async fn opportunities_recent(
     State(state): State<AppState>,
     Query(query): Query<TransactionsQuery>,
 ) -> Json<Vec<OpportunityDetail>> {
+    Json(filtered_opportunities(&state, &query))
+}
+
+async fn opportunities(
+    State(state): State<AppState>,
+    Query(query): Query<TransactionsQuery>,
+) -> Json<Vec<OpportunityDetail>> {
+    Json(filtered_opportunities(&state, &query))
+}
+
+fn filtered_opportunities(state: &AppState, query: &TransactionsQuery) -> Vec<OpportunityDetail> {
     let limit = query.limit.unwrap_or(100).clamp(1, 5_000);
     let min_score = query.min_score.unwrap_or(0);
-    Json(state.provider.opportunities(limit, min_score))
+    let values = state.provider.opportunities(limit, min_score);
+    let status_filter = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match status_filter {
+        Some(status) => values
+            .into_iter()
+            .filter(|row| row.status.eq_ignore_ascii_case(status))
+            .collect(),
+        None => values,
+    }
 }
 
 async fn transactions_all(
@@ -795,6 +1066,211 @@ async fn relay_dry_run_status(State(state): State<AppState>) -> Json<RelayDryRun
         .map(|guard| guard.clone())
         .unwrap_or_default();
     Json(status)
+}
+
+async fn bundle_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<BundleDetail>, StatusCode> {
+    let relay = state
+        .relay_dry_run_status
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
+    let bundle_id = bundle_id_for_result(&latest);
+    if id != "latest" && id != bundle_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(BundleDetail {
+        id: bundle_id,
+        relay_url: latest.relay_url,
+        accepted: latest.accepted,
+        final_state: latest.final_state,
+        attempt_count: latest.attempts.len(),
+        started_unix_ms: latest.started_unix_ms,
+        finished_unix_ms: latest.finished_unix_ms,
+    }))
+}
+
+async fn sim_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SimDetail>, StatusCode> {
+    let relay = state
+        .relay_dry_run_status
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
+
+    let bundle_id = bundle_id_for_result(&latest);
+    let sim_id = sim_id_for_result(&latest);
+    if id != "latest" && id != sim_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(SimDetail {
+        id: sim_id,
+        bundle_id,
+        status: if latest.accepted {
+            "ok".to_owned()
+        } else {
+            "fail".to_owned()
+        },
+        relay_url: latest.relay_url,
+        attempt_count: latest.attempts.len(),
+        accepted: latest.accepted,
+        fail_category: if latest.accepted {
+            None
+        } else {
+            Some("relay_exhausted".to_owned())
+        },
+        started_unix_ms: latest.started_unix_ms,
+        finished_unix_ms: latest.finished_unix_ms,
+    }))
+}
+
+fn render_prometheus_metrics(state: &AppState) -> String {
+    let snapshot = state.provider.metric_snapshot();
+    let relay = state
+        .relay_dry_run_status
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let relay_success_rate = if relay.total_submissions == 0 {
+        0.0
+    } else {
+        relay.total_accepted as f64 / relay.total_submissions as f64
+    };
+
+    let mut out = String::new();
+    out.push_str("# TYPE mempulse_ingest_queue_depth gauge\n");
+    out.push_str(&format!(
+        "mempulse_ingest_queue_depth {}\n",
+        snapshot.queue_depth_current
+    ));
+    out.push_str("# TYPE mempulse_ingest_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "mempulse_ingest_queue_capacity {}\n",
+        snapshot.queue_depth_capacity
+    ));
+    out.push_str("# TYPE mempulse_ingest_decode_fail_total counter\n");
+    out.push_str(&format!(
+        "mempulse_ingest_decode_fail_total {}\n",
+        snapshot.tx_decode_fail_total
+    ));
+    out.push_str("# TYPE mempulse_ingest_decode_total counter\n");
+    out.push_str(&format!(
+        "mempulse_ingest_decode_total {}\n",
+        snapshot.tx_decode_total
+    ));
+    out.push_str("# TYPE mempulse_ingest_lag_ms gauge\n");
+    out.push_str(&format!(
+        "mempulse_ingest_lag_ms {}\n",
+        snapshot.ingest_lag_ms
+    ));
+    out.push_str("# TYPE mempulse_ingest_tx_per_sec_current gauge\n");
+    out.push_str(&format!(
+        "mempulse_ingest_tx_per_sec_current {}\n",
+        snapshot.tx_per_sec_current
+    ));
+    out.push_str("# TYPE mempulse_ingest_tx_per_sec_baseline gauge\n");
+    out.push_str(&format!(
+        "mempulse_ingest_tx_per_sec_baseline {}\n",
+        snapshot.tx_per_sec_baseline
+    ));
+    out.push_str("# TYPE mempulse_ingest_drops_total counter\n");
+    out.push_str(&format!(
+        "mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {}\n",
+        snapshot.tx_decode_fail_total
+    ));
+
+    // Stub values until replay runtime exports these counters directly.
+    out.push_str("# TYPE mempulse_replay_lag_events gauge\n");
+    out.push_str("mempulse_replay_lag_events 0\n");
+    out.push_str("# TYPE mempulse_replay_checkpoint_duration_ms gauge\n");
+    out.push_str("mempulse_replay_checkpoint_duration_ms 0\n");
+    out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
+    out.push_str("mempulse_replay_reorg_depth 0\n");
+
+    // Stub values until simulator exports categorized metrics directly.
+    out.push_str("# TYPE mempulse_sim_latency_ms gauge\n");
+    out.push_str("mempulse_sim_latency_ms 0\n");
+    out.push_str("# TYPE mempulse_sim_fail_total counter\n");
+    out.push_str("mempulse_sim_fail_total{category=\"unknown\"} 0\n");
+
+    out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
+    out.push_str(&format!(
+        "mempulse_relay_success_rate {:.6}\n",
+        relay_success_rate
+    ));
+    out.push_str("# TYPE mempulse_relay_bundle_included_total counter\n");
+    out.push_str(&format!(
+        "mempulse_relay_bundle_included_total {}\n",
+        relay.total_accepted
+    ));
+    out.push_str("# TYPE mempulse_relay_bundle_filtered_total counter\n");
+    out.push_str(&format!(
+        "mempulse_relay_bundle_filtered_total{{reason=\"dry_run_failed\"}} {}\n",
+        relay.total_failed
+    ));
+    out
+}
+
+fn collect_events_up_to_seq(provider: &dyn VizDataProvider, to_seq_id: u64) -> Vec<EventEnvelope> {
+    const PAGE_SIZE: usize = 2_000;
+    const MAX_SCAN_EVENTS: usize = 200_000;
+
+    let mut after_seq_id = 0_u64;
+    let mut out = Vec::new();
+    while out.len() < MAX_SCAN_EVENTS {
+        let page = provider.events(after_seq_id, &[], PAGE_SIZE);
+        if page.is_empty() {
+            break;
+        }
+
+        let mut progressed = false;
+        for event in page {
+            let seq_id = event.seq_id;
+            if event.seq_id <= after_seq_id {
+                continue;
+            }
+            progressed = true;
+            after_seq_id = seq_id;
+            if seq_id <= to_seq_id {
+                out.push(event);
+            }
+            if seq_id >= to_seq_id {
+                return out;
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+
+    out
+}
+
+fn bundle_id_for_result(result: &RelayDryRunResult) -> String {
+    format!(
+        "bundle-{}-{}-{}",
+        result.started_unix_ms,
+        result.finished_unix_ms,
+        result.attempts.len()
+    )
+}
+
+fn sim_id_for_result(result: &RelayDryRunResult) -> String {
+    format!(
+        "sim-{}-{}-{}",
+        result.started_unix_ms,
+        result.finished_unix_ms,
+        result.attempts.len()
+    )
 }
 
 async fn stream(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -991,6 +1467,7 @@ mod tests {
             let values = vec![
                 OpportunityDetail {
                     tx_hash: "0x11".to_owned(),
+                    status: "detected".to_owned(),
                     strategy: "SandwichCandidate".to_owned(),
                     score: 12_000,
                     protocol: "uniswap-v2".to_owned(),
@@ -1003,6 +1480,7 @@ mod tests {
                 },
                 OpportunityDetail {
                     tx_hash: "0x22".to_owned(),
+                    status: "detected".to_owned(),
                     strategy: "BackrunCandidate".to_owned(),
                     score: 9_500,
                     protocol: "uniswap-v3".to_owned(),
@@ -1041,6 +1519,14 @@ mod tests {
                     max_fee_per_blob_gas_wei: Some(3),
                     calldata_len: Some(120),
                     raw_tx_len: Some(120),
+                    lifecycle_status: Some("pending".to_owned()),
+                    lifecycle_reason: Some("reorg-reopened".to_owned()),
+                    lifecycle_updated_unix_ms: Some(1_700_000_000_111),
+                    protocol: Some("uniswap-v2".to_owned()),
+                    category: Some("swap".to_owned()),
+                    mev_score: Some(72),
+                    urgency_score: Some(18),
+                    feature_engine_version: Some("feature-engine.v1".to_owned()),
                 },
                 TransactionDetail {
                     hash: "0x02".to_owned(),
@@ -1060,6 +1546,14 @@ mod tests {
                     max_fee_per_blob_gas_wei: None,
                     calldata_len: None,
                     raw_tx_len: None,
+                    lifecycle_status: None,
+                    lifecycle_reason: None,
+                    lifecycle_updated_unix_ms: None,
+                    protocol: None,
+                    category: None,
+                    mev_score: None,
+                    urgency_score: None,
+                    feature_engine_version: None,
                 },
             ];
             values.into_iter().take(limit).collect()
@@ -1099,6 +1593,39 @@ mod tests {
         }
     }
 
+    fn test_state_with_relay(limit: usize, relay_status: RelayDryRunStatus) -> AppState {
+        let api_auth = ApiAuthConfig::default();
+        AppState {
+            provider: Arc::new(MockProvider),
+            downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(relay_status)),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+        }
+    }
+
+    fn seeded_relay_status() -> RelayDryRunStatus {
+        let result = RelayDryRunResult {
+            relay_url: "https://relay.example".to_owned(),
+            accepted: false,
+            final_state: "exhausted".to_owned(),
+            attempts: vec![RelayAttemptTrace {
+                attempt: 1,
+                endpoint: "https://relay.example".to_owned(),
+                http_status: Some(500),
+                error: Some("timeout".to_owned()),
+                latency_ms: 300,
+                backoff_ms: 50,
+            }],
+            started_unix_ms: 1_700_000_000_010,
+            finished_unix_ms: 1_700_000_000_020,
+        };
+        let mut status = RelayDryRunStatus::default();
+        status.record(result);
+        status
+    }
+
     #[tokio::test]
     async fn health_route_returns_ok() {
         let app = build_router(test_state(100));
@@ -1117,6 +1644,41 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let payload: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_returns_prometheus_text_series() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(content_type.starts_with("text/plain; version=0.0.4"));
+
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_ingest_queue_depth"));
+        assert!(payload.contains("mempulse_ingest_drops_total{reason=\"decode_fail\"}"));
+        assert!(payload.contains("mempulse_ingest_lag_ms"));
+        assert!(payload.contains("mempulse_ingest_decode_total"));
+        assert!(payload.contains("mempulse_ingest_tx_per_sec_current"));
+        assert!(payload.contains("mempulse_replay_lag_events"));
+        assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
+        assert!(payload.contains("mempulse_relay_success_rate"));
     }
 
     #[tokio::test]
@@ -1139,6 +1701,39 @@ mod tests {
         assert_eq!(payload.len(), 2);
         assert_eq!(payload[0].seq_hi, 1);
         assert_eq!(payload[1].seq_hi, 3);
+    }
+
+    #[tokio::test]
+    async fn replay_route_from_to_returns_checkpoint_hash_and_diff_summary() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/replay?from=1&to=3&stride=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["from_seq_id"], serde_json::json!(1));
+        assert_eq!(payload["to_seq_id"], serde_json::json!(3));
+        assert_eq!(
+            payload["summary"]["added_pending_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            payload["summary"]["removed_pending_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            payload["frames"].as_array().map(|values| values.len()),
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -1326,6 +1921,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tx_route_alias_returns_detail_row() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tx/0x01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: TransactionDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.hash, "0x01");
+    }
+
+    #[tokio::test]
     async fn transaction_by_hash_route_returns_404_for_unknown_hash() {
         let app = build_router(test_state(100));
 
@@ -1388,6 +2003,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opps_route_applies_status_filter() {
+        let app = build_router(test_state(100));
+
+        let detected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/opps?limit=10&status=detected")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detected.status(), StatusCode::OK);
+        let body = to_bytes(detected.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Vec<OpportunityDetail> = serde_json::from_slice(&body).unwrap();
+        assert!(!payload.is_empty());
+
+        let invalidated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/opps?limit=10&status=invalidated")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalidated.status(), StatusCode::OK);
+        let body = to_bytes(invalidated.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: Vec<OpportunityDetail> = serde_json::from_slice(&body).unwrap();
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
     async fn relay_dry_run_status_route_returns_default_state() {
         let app = build_router(test_state(100));
 
@@ -1408,6 +2059,52 @@ mod tests {
         assert!(payload.latest.is_none());
     }
 
+    #[tokio::test]
+    async fn bundle_route_returns_latest_bundle_detail() {
+        let app = build_router(test_state_with_relay(100, seeded_relay_status()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bundle/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: BundleDetail = serde_json::from_slice(&body).unwrap();
+        assert!(!payload.id.is_empty());
+        assert_eq!(payload.relay_url, "https://relay.example");
+        assert_eq!(payload.attempt_count, 1);
+        assert!(!payload.accepted);
+    }
+
+    #[tokio::test]
+    async fn sim_route_returns_latest_sim_detail() {
+        let app = build_router(test_state_with_relay(100, seeded_relay_status()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sim/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SimDetail = serde_json::from_slice(&body).unwrap();
+        assert!(!payload.id.is_empty());
+        assert_eq!(payload.relay_url, "https://relay.example");
+        assert_eq!(payload.status, "fail");
+        assert_eq!(payload.fail_category.as_deref(), Some("relay_exhausted"));
+    }
+
     #[test]
     fn in_memory_provider_recent_transactions_are_latest_first_and_deduped() {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
@@ -1425,6 +2122,92 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].nonce, 3);
         assert_eq!(recent[1].nonce, 2);
+    }
+
+    #[test]
+    fn in_memory_provider_feature_summary_is_aggregated_and_sorted() {
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        {
+            let mut guard = storage.write().expect("write lock");
+            for (seq, protocol, category) in [
+                (11_u64, "uniswap-v3", "swap"),
+                (22_u64, "aave-v3", "borrow"),
+                (33_u64, "aave-v3", "borrow"),
+                (44_u64, "uniswap-v3", "swap"),
+                (55_u64, "aave-v3", "borrow"),
+            ] {
+                guard.upsert_tx_features(storage::TxFeaturesRecord {
+                    hash: hash_from_seq(seq),
+                    protocol: protocol.to_owned(),
+                    category: category.to_owned(),
+                    mev_score: 50,
+                    urgency_score: 10,
+                    method_selector: None,
+                    feature_engine_version: "feature-engine.v1".to_owned(),
+                });
+            }
+        }
+
+        let provider = InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1);
+        let summary = provider.feature_summary();
+
+        assert_eq!(
+            summary,
+            vec![
+                FeatureSummary {
+                    protocol: "aave-v3".to_owned(),
+                    category: "borrow".to_owned(),
+                    count: 3,
+                },
+                FeatureSummary {
+                    protocol: "uniswap-v3".to_owned(),
+                    category: "swap".to_owned(),
+                    count: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn in_memory_provider_propagation_edges_are_sorted_deterministically() {
+        let provider = InMemoryVizProvider::new(
+            Arc::new(RwLock::new(InMemoryStorage::default())),
+            Arc::new(vec![
+                PropagationEdge {
+                    source: "peer-b".to_owned(),
+                    destination: "peer-c".to_owned(),
+                    p50_delay_ms: 10,
+                    p99_delay_ms: 20,
+                },
+                PropagationEdge {
+                    source: "peer-a".to_owned(),
+                    destination: "peer-z".to_owned(),
+                    p50_delay_ms: 5,
+                    p99_delay_ms: 15,
+                },
+                PropagationEdge {
+                    source: "peer-a".to_owned(),
+                    destination: "peer-b".to_owned(),
+                    p50_delay_ms: 2,
+                    p99_delay_ms: 9,
+                },
+            ]),
+            1,
+        );
+
+        let edges = provider.propagation_edges();
+        assert_eq!(edges.len(), 3);
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| (edge.source.as_str(), edge.destination.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("peer-a", "peer-b"),
+                ("peer-a", "peer-z"),
+                ("peer-b", "peer-c"),
+            ]
+        );
     }
 
     #[test]
@@ -1456,6 +2239,21 @@ mod tests {
                 calldata_len: Some(3),
                 raw_tx: vec![0xaa, 0xbb, 0xcc],
             });
+            guard.upsert_tx_features(storage::TxFeaturesRecord {
+                hash,
+                protocol: "uniswap-v2".to_owned(),
+                category: "swap".to_owned(),
+                mev_score: 77,
+                urgency_score: 18,
+                method_selector: Some([0x38, 0xed, 0x17, 0x39]),
+                feature_engine_version: "feature-engine.v1".to_owned(),
+            });
+            guard.upsert_tx_lifecycle(storage::TxLifecycleRecord {
+                hash,
+                status: "pending".to_owned(),
+                reason: Some("reorg-reopened".to_owned()),
+                updated_unix_ms: 1_700_000_000_123,
+            });
         }
 
         let provider = InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1);
@@ -1466,5 +2264,94 @@ mod tests {
         assert_eq!(detail.peer, "rpc-ws");
         assert_eq!(detail.nonce, Some(42));
         assert_eq!(detail.raw_tx_len, Some(3));
+        assert_eq!(detail.lifecycle_status.as_deref(), Some("pending"));
+        assert_eq!(detail.lifecycle_reason.as_deref(), Some("reorg-reopened"));
+        assert_eq!(detail.protocol.as_deref(), Some("uniswap-v2"));
+        assert_eq!(detail.category.as_deref(), Some("swap"));
+        assert_eq!(detail.mev_score, Some(77));
+        assert_eq!(detail.urgency_score, Some(18));
+    }
+
+    #[test]
+    fn in_memory_provider_transaction_detail_by_hash_falls_back_to_replay_lifecycle() {
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        let hash = hash_from_seq(77);
+        {
+            let mut guard = storage.write().expect("write lock");
+            guard.append_event(EventEnvelope {
+                seq_id: 1,
+                ingest_ts_unix_ms: 1_700_000_000_000,
+                ingest_ts_mono_ns: 1,
+                source_id: common::SourceId::new("seed"),
+                payload: EventPayload::TxDecoded(TxDecoded {
+                    hash,
+                    tx_type: 2,
+                    sender: [1_u8; 20],
+                    nonce: 1,
+                    chain_id: Some(1),
+                    to: None,
+                    value_wei: None,
+                    gas_limit: None,
+                    gas_price_wei: None,
+                    max_fee_per_gas_wei: None,
+                    max_priority_fee_per_gas_wei: None,
+                    max_fee_per_blob_gas_wei: None,
+                    calldata_len: None,
+                }),
+            });
+            guard.append_event(EventEnvelope {
+                seq_id: 2,
+                ingest_ts_unix_ms: 1_700_000_000_010,
+                ingest_ts_mono_ns: 2,
+                source_id: common::SourceId::new("seed"),
+                payload: EventPayload::TxConfirmedProvisional(TxConfirmed {
+                    hash,
+                    block_number: 1_234_567,
+                    block_hash: [7_u8; 32],
+                }),
+            });
+            guard.append_event(EventEnvelope {
+                seq_id: 3,
+                ingest_ts_unix_ms: 1_700_000_000_020,
+                ingest_ts_mono_ns: 3,
+                source_id: common::SourceId::new("seed"),
+                payload: EventPayload::TxReorged(TxReorged {
+                    hash,
+                    old_block_hash: [7_u8; 32],
+                    new_block_hash: [8_u8; 32],
+                }),
+            });
+
+            guard.upsert_tx_seen(storage::TxSeenRecord {
+                hash,
+                peer: "rpc-ws".to_owned(),
+                first_seen_unix_ms: 1_700_000_000_000,
+                first_seen_mono_ns: 1_700_000_000_000_000_000,
+                seen_count: 1,
+            });
+            guard.upsert_tx_full(storage::TxFullRecord {
+                hash,
+                tx_type: 2,
+                sender: [1_u8; 20],
+                nonce: 1,
+                to: None,
+                chain_id: Some(1),
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(0),
+                raw_tx: Vec::new(),
+            });
+        }
+
+        let provider = InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1);
+        let detail = provider
+            .transaction_detail_by_hash(&format_bytes(&hash))
+            .expect("detail row");
+
+        assert_eq!(detail.lifecycle_status.as_deref(), Some("pending"));
     }
 }

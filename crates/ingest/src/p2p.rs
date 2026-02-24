@@ -1,6 +1,6 @@
 use ahash::RandomState;
 use common::{PeerId, SourceId, TxHash};
-use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxFetched, TxSeen};
 use hashbrown::HashMap;
 use std::collections::VecDeque;
 
@@ -99,8 +99,21 @@ impl P2pIngestService {
 
         for hash in hashes {
             if let Some(first_seen) = self.first_seen.get(&hash) {
-                self.metrics.duplicates_dropped_total += 1;
                 let delay = now_unix_ms.saturating_sub(first_seen.unix_ms) as u32;
+                self.metrics.duplicates_dropped_total += 1;
+                events.push(self.new_event(
+                    now_unix_ms,
+                    now_mono_ns,
+                    EventPayload::TxDropped(TxDropped {
+                        hash,
+                        reason: self.drop_reason(
+                            "Duplicate",
+                            "p2p.fetch",
+                            &peer_id,
+                            self.fetch_queue.len(),
+                        ),
+                    }),
+                ));
                 self.propagation_delays_by_peer
                     .entry(peer_id.clone())
                     .or_default()
@@ -110,6 +123,20 @@ impl P2pIngestService {
 
             if self.fetch_queue.len() >= self.config.fetch_queue_capacity {
                 self.metrics.queue_dropped_total += 1;
+                self.metrics.queue_depth_current = self.fetch_queue.len();
+                events.push(self.new_event(
+                    now_unix_ms,
+                    now_mono_ns,
+                    EventPayload::TxDropped(TxDropped {
+                        hash,
+                        reason: self.drop_reason(
+                            "QueueFull",
+                            "p2p.fetch",
+                            &peer_id,
+                            self.fetch_queue.len(),
+                        ),
+                    }),
+                ));
                 continue;
             }
 
@@ -235,6 +262,19 @@ impl P2pIngestService {
         &self.metrics
     }
 
+    fn drop_reason(
+        &self,
+        reason: &str,
+        queue_name: &str,
+        peer_id: &PeerId,
+        depth_current: usize,
+    ) -> String {
+        format!(
+            "{reason};lane=p2p;source={};peer={peer_id};queue={queue_name};depth_current={depth_current};depth_peak={}",
+            self.source_id.0, self.metrics.queue_depth_peak
+        )
+    }
+
     fn new_event(
         &mut self,
         now_unix_ms: i64,
@@ -285,12 +325,46 @@ mod tests {
             1_700_000_000_011,
             20,
         );
-        assert!(second.is_empty());
+        assert_eq!(second.len(), 1);
+        assert!(matches!(second[0].payload, EventPayload::TxDropped(_)));
         assert_eq!(service.metrics().duplicates_dropped_total, 1);
 
         let stats = service.propagation_stats_by_peer();
         assert_eq!(stats.get("peer-b").unwrap().count, 1);
         assert_eq!(stats.get("peer-b").unwrap().avg_delay_ms, 11);
+    }
+
+    #[test]
+    fn duplicate_announcements_emit_dropped_event() {
+        let mut service = P2pIngestService::new(
+            P2pIngestConfig {
+                fetch_queue_capacity: 8,
+                max_seen_hashes: 128,
+            },
+            SourceId::new("p2p"),
+        );
+
+        let _ = service.handle_new_pooled_transaction_hashes(
+            "peer-a".to_owned(),
+            vec![hash(1)],
+            1_700_000_000_000,
+            10,
+        );
+        let duplicate = service.handle_new_pooled_transaction_hashes(
+            "peer-b".to_owned(),
+            vec![hash(1)],
+            1_700_000_000_011,
+            20,
+        );
+
+        assert_eq!(duplicate.len(), 1);
+        assert!(matches!(
+            duplicate[0].payload,
+            EventPayload::TxDropped(ref dropped)
+                if dropped.hash == hash(1)
+                    && dropped.reason.contains("Duplicate")
+                    && dropped.reason.contains("queue=p2p.fetch")
+        ));
     }
 
     #[test]
@@ -317,7 +391,14 @@ mod tests {
         );
 
         assert_eq!(first.len(), 1);
-        assert!(second.is_empty());
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            second[0].payload,
+            EventPayload::TxDropped(ref dropped)
+                if dropped.hash == hash(2)
+                    && dropped.reason.contains("QueueFull")
+                    && dropped.reason.contains("queue=p2p.fetch")
+        ));
         assert_eq!(service.metrics().queue_dropped_total, 1);
     }
 
@@ -361,7 +442,14 @@ mod tests {
             10,
         );
 
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 8);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, EventPayload::TxDropped(_)))
+                .count(),
+            5
+        );
         assert_eq!(service.metrics().queue_depth_peak, 3);
         assert_eq!(service.metrics().queue_depth_current, 3);
         assert_eq!(service.metrics().queue_dropped_total, 5);

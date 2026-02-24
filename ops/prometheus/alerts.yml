@@ -2,7 +2,7 @@ groups:
   - name: mev_v2_alerts
     rules:
       - alert: MempoolQueueSaturation
-        expr: (queue_depth_current / queue_depth_capacity) > 0.9
+        expr: (mempulse_ingest_queue_depth / mempulse_ingest_queue_capacity) > 0.9
         for: 1m
         labels:
           severity: critical
@@ -11,7 +11,7 @@ groups:
           description: queue depth exceeded 90% of configured capacity for at least 1 minute.
 
       - alert: MempoolIngestLagHigh
-        expr: ingest_lag_ms > 500
+        expr: mempulse_ingest_lag_ms > 500
         for: 2m
         labels:
           severity: warning
@@ -20,7 +20,7 @@ groups:
           description: ingest lag is above 500ms for 2 minutes.
 
       - alert: DecodeFailureRateHigh
-        expr: tx_decode_fail_total / tx_decode_total > 0.01
+        expr: mempulse_ingest_decode_fail_total / clamp_min(mempulse_ingest_decode_total, 1) > 0.01
         for: 2m
         labels:
           severity: warning
@@ -29,10 +29,46 @@ groups:
           description: decode failure ratio exceeded 1% for at least 2 minutes.
 
       - alert: CoverageCollapse
-        expr: tx_per_sec_current / tx_per_sec_baseline < 0.6
+        expr: mempulse_ingest_tx_per_sec_current / clamp_min(mempulse_ingest_tx_per_sec_baseline, 1) < 0.6
         for: 2m
         labels:
           severity: warning
         annotations:
           summary: Mempool coverage collapsed
           description: current ingest throughput dropped below 60% of baseline for 2 minutes.
+
+      - alert: ReplayLagGrowing
+        expr: mempulse_replay_lag_events > 1000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: Replay lag is growing
+          description: replay lag exceeded 1000 events for at least 3 minutes.
+
+      - alert: ReplayReorgDepthHigh
+        expr: mempulse_replay_reorg_depth > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Reorg depth is above normal
+          description: replay reorg depth exceeded 3.
+
+      - alert: SimFailureSpike
+        expr: increase(mempulse_sim_fail_total[5m]) > 20
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Simulation failures spiking
+          description: simulation failures increased by more than 20 in 5 minutes.
+
+      - alert: RelaySuccessRateLow
+        expr: (sum(mempulse_relay_bundle_included_total) + sum(mempulse_relay_bundle_filtered_total)) > 20 and mempulse_relay_success_rate < 0.5
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: Relay success rate is below threshold
+          description: relay success rate stayed below 50% after at least 20 bundle outcomes.
