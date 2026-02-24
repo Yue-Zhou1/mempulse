@@ -21,6 +21,35 @@ impl EventEnvelope {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalSequencer {
+    next_seq_id: u64,
+}
+
+impl Default for GlobalSequencer {
+    fn default() -> Self {
+        Self { next_seq_id: 1 }
+    }
+}
+
+impl GlobalSequencer {
+    pub fn from_latest_seq_id(latest_seq_id: Option<u64>) -> Self {
+        let next_seq_id = latest_seq_id.unwrap_or(0).saturating_add(1).max(1);
+        Self { next_seq_id }
+    }
+
+    pub fn next_seq_id(&mut self) -> u64 {
+        let seq_id = self.next_seq_id;
+        self.next_seq_id = self.next_seq_id.saturating_add(1);
+        seq_id
+    }
+
+    pub fn assign(&mut self, mut event: EventEnvelope) -> EventEnvelope {
+        event.seq_id = self.next_seq_id();
+        event
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct EventOrderKey {
     pub seq_id: u64,
@@ -200,5 +229,16 @@ mod tests {
         let decoded: EventEnvelope = from_str(&encoded).expect("deserialize event");
 
         assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn global_sequencer_assigns_monotonic_ids_and_can_resume() {
+        let mut fresh = GlobalSequencer::default();
+        assert_eq!(fresh.next_seq_id(), 1);
+        assert_eq!(fresh.next_seq_id(), 2);
+
+        let mut resumed = GlobalSequencer::from_latest_seq_id(Some(41));
+        assert_eq!(resumed.next_seq_id(), 42);
+        assert_eq!(resumed.next_seq_id(), 43);
     }
 }
