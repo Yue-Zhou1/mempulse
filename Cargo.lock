@@ -3641,6 +3641,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "replay",
  "reqwest",
+ "searcher",
  "serde",
  "serde_json",
  "storage",

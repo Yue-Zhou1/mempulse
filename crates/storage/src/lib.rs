@@ -6,7 +6,7 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::{Address, PeerId, TxHash};
-use event_log::{EventEnvelope, EventPayload};
+use event_log::{EventEnvelope, EventPayload, GlobalSequencer, sort_deterministic};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 pub use backfill::{BackfillConfig, BackfillSummary, BackfillWriter};
-pub use clickhouse_schema::{ClickHouseSchemaConfig, clickhouse_event_table_ddl, clickhouse_schema_ddl};
+pub use clickhouse_schema::{
+    ClickHouseSchemaConfig, clickhouse_event_table_ddl, clickhouse_schema_ddl,
+};
 pub use wal::StorageWal;
 
 pub type FastMap<K, V> = HashMap<K, V, RandomState>;
@@ -78,6 +80,22 @@ pub struct TxFeaturesRecord {
     pub mev_score: u16,
     pub urgency_score: u16,
     pub method_selector: Option<[u8; 4]>,
+    #[serde(default = "default_feature_engine_version")]
+    pub feature_engine_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpportunityRecord {
+    pub tx_hash: TxHash,
+    pub strategy: String,
+    pub score: u32,
+    pub protocol: String,
+    pub category: String,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
+    pub reasons: Vec<String>,
+    pub detected_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,6 +124,10 @@ pub struct RecentTransactionRecord {
     pub source_id: String,
 }
 
+fn default_feature_engine_version() -> String {
+    feature_engine::version().to_owned()
+}
+
 pub trait EventStore {
     fn append_event(&mut self, event: EventEnvelope);
     fn list_events(&self) -> Vec<EventEnvelope>;
@@ -119,6 +141,7 @@ pub struct InMemoryStorage {
     tx_seen: VecDeque<TxSeenRecord>,
     tx_full: VecDeque<TxFullRecord>,
     tx_features: VecDeque<TxFeaturesRecord>,
+    opportunities: VecDeque<OpportunityRecord>,
     tx_lifecycle: VecDeque<TxLifecycleRecord>,
     peer_stats: VecDeque<PeerStatsRecord>,
     write_latency_ns: VecDeque<u64>,
@@ -148,6 +171,7 @@ impl InMemoryStorage {
             tx_seen: VecDeque::new(),
             tx_full: VecDeque::new(),
             tx_features: VecDeque::new(),
+            opportunities: VecDeque::new(),
             tx_lifecycle: VecDeque::new(),
             peer_stats: VecDeque::new(),
             write_latency_ns: VecDeque::new(),
@@ -175,6 +199,12 @@ impl InMemoryStorage {
         self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
+    pub fn upsert_opportunity(&mut self, record: OpportunityRecord) {
+        let start = Instant::now();
+        push_bounded(&mut self.opportunities, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+    }
+
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
         push_bounded(&mut self.tx_lifecycle, record, self.config.table_capacity);
@@ -197,6 +227,17 @@ impl InMemoryStorage {
 
     pub fn tx_features(&self) -> &VecDeque<TxFeaturesRecord> {
         &self.tx_features
+    }
+
+    pub fn opportunities(&self) -> Vec<OpportunityRecord> {
+        let mut out = self.opportunities.iter().cloned().collect::<Vec<_>>();
+        out.sort_unstable_by(|a, b| {
+            b.detected_unix_ms
+                .cmp(&a.detected_unix_ms)
+                .then_with(|| a.tx_hash.cmp(&b.tx_hash))
+                .then_with(|| a.strategy.cmp(&b.strategy))
+        });
+        out
     }
 
     pub fn tx_lifecycle(&self) -> &VecDeque<TxLifecycleRecord> {
@@ -224,6 +265,11 @@ impl InMemoryStorage {
             }
         }
 
+        out.sort_unstable_by(|a, b| {
+            b.seen_unix_ms
+                .cmp(&a.seen_unix_ms)
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
         out
     }
 
@@ -291,7 +337,9 @@ impl EventStore for InMemoryStorage {
     }
 
     fn list_events(&self) -> Vec<EventEnvelope> {
-        self.events.iter().cloned().collect()
+        let mut out = self.events.iter().cloned().collect::<Vec<_>>();
+        sort_deterministic(&mut out);
+        out
     }
 
     fn latest_seq_id(&self) -> Option<u64> {
@@ -305,6 +353,7 @@ pub enum StorageWriteOp {
     UpsertTxSeen(TxSeenRecord),
     UpsertTxFull(TxFullRecord),
     UpsertTxFeatures(TxFeaturesRecord),
+    UpsertOpportunity(OpportunityRecord),
     UpsertTxLifecycle(TxLifecycleRecord),
     UpsertPeerStats(PeerStatsRecord),
 }
@@ -428,13 +477,15 @@ pub fn spawn_single_writer(
         flush_interval_ms: config.flush_interval_ms.max(1),
         wal_path: config.wal_path,
     };
-    let wal = config.wal_path.and_then(|path| match StorageWal::new(path) {
-        Ok(wal) => Some(wal),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to initialize storage WAL");
-            None
-        }
-    });
+    let wal = config
+        .wal_path
+        .and_then(|path| match StorageWal::new(path) {
+            Ok(wal) => Some(wal),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to initialize storage WAL");
+                None
+            }
+        });
 
     if let Some(wal) = wal.as_ref() {
         match wal.recover_events() {
@@ -453,6 +504,10 @@ pub fn spawn_single_writer(
         }
     }
 
+    let mut sequencer = GlobalSequencer::from_latest_seq_id(
+        storage.read().ok().and_then(|guard| guard.latest_seq_id()),
+    );
+
     let (tx, mut rx) = mpsc::channel::<StorageWriteOp>(config.queue_capacity);
 
     tokio::spawn(async move {
@@ -469,7 +524,13 @@ pub fn spawn_single_writer(
                     };
 
                     match storage.write() {
-                        Ok(mut guard) => apply_write_op(&mut guard, op, &mut batch, wal.as_ref()),
+                        Ok(mut guard) => apply_write_op(
+                            &mut guard,
+                            op,
+                            &mut batch,
+                            wal.as_ref(),
+                            &mut sequencer,
+                        ),
                         Err(_) => {
                             tracing::error!("storage lock poisoned, stopping single-writer task");
                             break;
@@ -501,9 +562,11 @@ fn apply_write_op(
     op: StorageWriteOp,
     batch: &mut Vec<EventEnvelope>,
     wal: Option<&StorageWal>,
+    sequencer: &mut GlobalSequencer,
 ) {
     match op {
         StorageWriteOp::AppendEvent(event) => {
+            let event = sequencer.assign(event);
             if let Some(wal) = wal {
                 if let Err(err) = wal.append_event(&event) {
                     tracing::warn!(error = %err, "failed to append event to storage WAL");
@@ -515,6 +578,7 @@ fn apply_write_op(
         StorageWriteOp::UpsertTxSeen(record) => storage.upsert_tx_seen(record),
         StorageWriteOp::UpsertTxFull(record) => storage.upsert_tx_full(record),
         StorageWriteOp::UpsertTxFeatures(record) => storage.upsert_tx_features(record),
+        StorageWriteOp::UpsertOpportunity(record) => storage.upsert_opportunity(record),
         StorageWriteOp::UpsertTxLifecycle(record) => storage.upsert_tx_lifecycle(record),
         StorageWriteOp::UpsertPeerStats(record) => storage.upsert_peer_stats(record),
     }
@@ -632,6 +696,60 @@ mod tests {
         }
     }
 
+    fn seen_event(seq: u64, source: &str, hash_seed: u8) -> EventEnvelope {
+        EventEnvelope {
+            seq_id: seq,
+            ingest_ts_unix_ms: 1_700_000_000_000 + seq as i64,
+            ingest_ts_mono_ns: seq * 10,
+            source_id: SourceId::new(source),
+            payload: EventPayload::TxSeen(TxSeen {
+                hash: hash(hash_seed),
+                peer_id: format!("peer-{hash_seed}"),
+                seen_at_unix_ms: 1_700_000_000_000 + seq as i64,
+                seen_at_mono_ns: seq * 10,
+            }),
+        }
+    }
+
+    fn decoded_event_with_ts(seq: u64, ts_unix_ms: i64, hash_seed: u8) -> EventEnvelope {
+        EventEnvelope {
+            seq_id: seq,
+            ingest_ts_unix_ms: ts_unix_ms,
+            ingest_ts_mono_ns: seq * 10,
+            source_id: SourceId::new("test"),
+            payload: EventPayload::TxDecoded(TxDecoded {
+                hash: hash(hash_seed),
+                tx_type: 2,
+                sender: [9; 20],
+                nonce: seq,
+                chain_id: Some(1),
+                to: None,
+                value_wei: None,
+                gas_limit: None,
+                gas_price_wei: None,
+                max_fee_per_gas_wei: None,
+                max_priority_fee_per_gas_wei: None,
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: None,
+            }),
+        }
+    }
+
+    fn opportunity_record(seq: u8) -> OpportunityRecord {
+        OpportunityRecord {
+            tx_hash: hash(seq),
+            strategy: "SandwichCandidate".to_owned(),
+            score: 10_000 + seq as u32,
+            protocol: "uniswap-v2".to_owned(),
+            category: "swap".to_owned(),
+            feature_engine_version: "feature-engine.v1".to_owned(),
+            scorer_version: "scorer.v1".to_owned(),
+            strategy_version: "strategy.sandwich.v1".to_owned(),
+            reasons: vec!["mev_score".to_owned()],
+            detected_unix_ms: 1_700_000_000_000 + seq as i64,
+        }
+    }
+
     #[test]
     fn in_memory_storage_inserts_and_queries_records() {
         let mut store = InMemoryStorage::default();
@@ -666,6 +784,7 @@ mod tests {
             mev_score: 80,
             urgency_score: 40,
             method_selector: Some([0x38, 0xed, 0x17, 0x39]),
+            feature_engine_version: "feature-engine.v1".to_owned(),
         });
         store.upsert_tx_lifecycle(TxLifecycleRecord {
             hash: hash(1),
@@ -683,6 +802,10 @@ mod tests {
         assert_eq!(store.tx_seen().len(), 1);
         assert_eq!(store.tx_full().len(), 1);
         assert_eq!(store.tx_features().len(), 1);
+        assert_eq!(
+            store.tx_features()[0].feature_engine_version,
+            "feature-engine.v1"
+        );
         assert_eq!(store.tx_lifecycle().len(), 1);
         assert_eq!(store.peer_stats().len(), 1);
         assert!(store.avg_write_latency_ns().is_some());
@@ -779,6 +902,47 @@ mod tests {
         assert!(!flushed.is_empty());
     }
 
+    #[tokio::test]
+    async fn single_writer_assigns_global_sequence_for_colliding_lane_seq_ids() {
+        let storage = Arc::new(RwLock::new(InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 8,
+            recent_tx_capacity: 8,
+            ..StorageConfig::default()
+        })));
+        let sink = Arc::new(NoopClickHouseSink);
+
+        let handle = spawn_single_writer(
+            storage.clone(),
+            sink,
+            StorageWriterConfig {
+                queue_capacity: 32,
+                flush_batch_size: 16,
+                flush_interval_ms: 20,
+                wal_path: None,
+            },
+        );
+
+        // Local lane sequence IDs intentionally collide (rpc/p2p both emit seq 1, 2).
+        handle
+            .enqueue(StorageWriteOp::AppendEvent(seen_event(1, "rpc-mainnet", 1)))
+            .await
+            .expect("enqueue rpc seq1");
+        handle
+            .enqueue(StorageWriteOp::AppendEvent(seen_event(1, "p2p-mainnet", 2)))
+            .await
+            .expect("enqueue p2p seq1");
+        handle
+            .enqueue(StorageWriteOp::AppendEvent(seen_event(2, "rpc-mainnet", 3)))
+            .await
+            .expect("enqueue rpc seq2");
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let events = storage.read().expect("storage lock").list_events();
+        let seq_ids = events.iter().map(|event| event.seq_id).collect::<Vec<_>>();
+        assert_eq!(seq_ids, vec![1, 2, 3]);
+    }
+
     #[test]
     fn event_store_appends_events() {
         let mut store = InMemoryStorage::default();
@@ -795,6 +959,46 @@ mod tests {
             }),
         });
         assert_eq!(store.list_events().len(), 1);
+    }
+
+    #[test]
+    fn list_events_returns_deterministic_order() {
+        let mut store = InMemoryStorage::default();
+        // Deliberately append out of canonical order.
+        store.append_event(seen_event(10, "peer-b", 2));
+        store.append_event(seen_event(9, "peer-z", 3));
+        store.append_event(seen_event(10, "peer-a", 4));
+
+        let events = store.list_events();
+        let keys = events
+            .into_iter()
+            .map(|event| {
+                let hash = event.payload.primary_hash();
+                (event.seq_id, event.source_id.0, hash)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys[0].0, 9);
+        assert_eq!(keys[1].0, 10);
+        assert_eq!(keys[2].0, 10);
+        assert!(keys[1].1 < keys[2].1);
+    }
+
+    #[test]
+    fn recent_transactions_are_sorted_by_seen_time_desc_then_hash() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 10,
+            ..StorageConfig::default()
+        });
+
+        store.append_event(decoded_event_with_ts(1, 1_700_000_000_100, 1));
+        store.append_event(decoded_event_with_ts(2, 1_700_000_000_300, 2));
+        store.append_event(decoded_event_with_ts(3, 1_700_000_000_200, 3));
+
+        let recent = store.recent_transactions(10);
+        let order = recent.into_iter().map(|row| row.hash).collect::<Vec<_>>();
+        assert_eq!(order, vec![hash(2), hash(3), hash(1)]);
     }
 
     #[test]
@@ -878,6 +1082,7 @@ mod tests {
                 mev_score: 80,
                 urgency_score: 40,
                 method_selector: Some([0x38, 0xed, 0x17, 0x39]),
+                feature_engine_version: "feature-engine.v1".to_owned(),
             });
             store.upsert_tx_lifecycle(TxLifecycleRecord {
                 hash,
@@ -898,6 +1103,25 @@ mod tests {
         assert_eq!(store.tx_features().len(), 2);
         assert_eq!(store.tx_lifecycle().len(), 2);
         assert_eq!(store.peer_stats().len(), 2);
+    }
+
+    #[test]
+    fn opportunities_table_is_bounded_and_latest_first() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 100,
+            table_capacity: 2,
+            write_latency_capacity: 100,
+        });
+
+        store.upsert_opportunity(opportunity_record(1));
+        store.upsert_opportunity(opportunity_record(2));
+        store.upsert_opportunity(opportunity_record(3));
+
+        let rows = store.opportunities();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tx_hash, hash(3));
+        assert_eq!(rows[1].tx_hash, hash(2));
     }
 
     #[test]

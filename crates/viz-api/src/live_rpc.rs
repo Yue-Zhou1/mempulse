@@ -2,17 +2,20 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
-use feature_engine::{FeatureAnalysis, FeatureInput, analyze_transaction};
+use feature_engine::{
+    FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
+};
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
+use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
-    EventStore, InMemoryStorage, StorageWriteHandle, StorageWriteOp, TxFeaturesRecord,
-    TxFullRecord, TxSeenRecord,
+    EventStore, InMemoryStorage, OpportunityRecord, StorageWriteHandle, StorageWriteOp,
+    TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -27,6 +30,8 @@ const ENV_ETH_WS_URL: &str = "VIZ_API_ETH_WS_URL";
 const ENV_ETH_HTTP_URL: &str = "VIZ_API_ETH_HTTP_URL";
 const ENV_SOURCE_ID: &str = "VIZ_API_SOURCE_ID";
 const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
+const SEARCHER_MIN_SCORE: u32 = 0;
+const SEARCHER_MAX_CANDIDATES: usize = 8;
 
 #[derive(Clone, Debug)]
 struct RpcEndpoint {
@@ -325,8 +330,7 @@ async fn process_pending_hash(
         let value_wei = format_optional_u128(tx.value_wei);
         let gas_price_wei = format_optional_u128(tx.gas_price_wei);
         let max_fee_per_gas_wei = format_optional_u128(tx.max_fee_per_gas_wei);
-        let max_priority_fee_per_gas_wei =
-            format_optional_u128(tx.max_priority_fee_per_gas_wei);
+        let max_priority_fee_per_gas_wei = format_optional_u128(tx.max_priority_fee_per_gas_wei);
         let max_fee_per_blob_gas_wei = format_optional_u128(tx.max_fee_per_blob_gas_wei);
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         let method_selector = format_method_selector_hex(analysis.method_selector);
@@ -395,26 +399,28 @@ async fn process_pending_hash(
 
     if let Some(tx) = fetched_tx {
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
+        let raw_tx = tx.input.clone();
+        let decoded = TxDecoded {
+            hash: tx.hash,
+            tx_type: tx.tx_type,
+            sender: tx.sender,
+            nonce: tx.nonce,
+            chain_id: tx.chain_id,
+            to: tx.to,
+            value_wei: tx.value_wei,
+            gas_limit: tx.gas_limit,
+            gas_price_wei: tx.gas_price_wei,
+            max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+            max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+            calldata_len: Some(raw_tx.len() as u32),
+        };
         append_event(
             writer,
             next_seq_id,
             source_id,
             now_unix_ms,
-            EventPayload::TxDecoded(TxDecoded {
-                hash: tx.hash,
-                tx_type: tx.tx_type,
-                sender: tx.sender,
-                nonce: tx.nonce,
-                chain_id: tx.chain_id,
-                to: tx.to,
-                value_wei: tx.value_wei,
-                gas_limit: tx.gas_limit,
-                gas_price_wei: tx.gas_price_wei,
-                max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
-                max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
-                max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
-                calldata_len: Some(tx.input.len() as u32),
-            }),
+            EventPayload::TxDecoded(decoded.clone()),
         )
         .await?;
         writer
@@ -431,8 +437,8 @@ async fn process_pending_hash(
                 max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
                 max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
                 max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
-                calldata_len: Some(tx.input.len() as u32),
-                raw_tx: tx.input,
+                calldata_len: Some(raw_tx.len() as u32),
+                raw_tx: raw_tx.clone(),
             }))
             .await?;
         writer
@@ -443,8 +449,14 @@ async fn process_pending_hash(
                 mev_score: analysis.mev_score,
                 urgency_score: analysis.urgency_score,
                 method_selector: analysis.method_selector,
+                feature_engine_version: feature_engine_version().to_owned(),
             }))
             .await?;
+        for opportunity in build_opportunity_records(&decoded, &raw_tx, now_unix_ms) {
+            writer
+                .enqueue(StorageWriteOp::UpsertOpportunity(opportunity))
+                .await?;
+        }
     }
 
     Ok(())
@@ -562,6 +574,37 @@ fn default_feature_analysis() -> FeatureAnalysis {
     }
 }
 
+fn build_opportunity_records(
+    decoded: &TxDecoded,
+    calldata: &[u8],
+    detected_unix_ms: i64,
+) -> Vec<OpportunityRecord> {
+    rank_opportunities(
+        &[SearcherInputTx {
+            decoded: decoded.clone(),
+            calldata: calldata.to_vec(),
+        }],
+        SearcherConfig {
+            min_score: SEARCHER_MIN_SCORE,
+            max_candidates: SEARCHER_MAX_CANDIDATES,
+        },
+    )
+    .into_iter()
+    .map(|candidate| OpportunityRecord {
+        tx_hash: candidate.tx_hash,
+        strategy: format!("{:?}", candidate.strategy),
+        score: candidate.score,
+        protocol: candidate.protocol,
+        category: candidate.category,
+        feature_engine_version: candidate.feature_engine_version,
+        scorer_version: candidate.scorer_version,
+        strategy_version: candidate.strategy_version,
+        reasons: candidate.reasons,
+        detected_unix_ms,
+    })
+    .collect()
+}
+
 async fn fetch_transaction_by_hash(
     client: &reqwest::Client,
     http_url: &str,
@@ -631,10 +674,7 @@ fn rpc_tx_to_live_tx(tx: RpcTransaction, hash_hex: &str) -> Result<LiveTx> {
         .max_priority_fee_per_gas
         .as_deref()
         .and_then(parse_hex_u128);
-    let max_fee_per_blob_gas_wei = tx
-        .max_fee_per_blob_gas
-        .as_deref()
-        .and_then(parse_hex_u128);
+    let max_fee_per_blob_gas_wei = tx.max_fee_per_blob_gas.as_deref().and_then(parse_hex_u128);
 
     Ok(LiveTx {
         hash,
@@ -820,5 +860,44 @@ mod tests {
         assert_eq!(live.max_fee_per_gas_wei, Some(20_000_000_000));
         assert_eq!(live.max_priority_fee_per_gas_wei, Some(2_000_000_000));
         assert_eq!(live.max_fee_per_blob_gas_wei, Some(3));
+    }
+
+    #[test]
+    fn build_opportunity_records_maps_ranked_candidates_to_storage_rows() {
+        let uniswap_v2_router = [
+            0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac,
+            0xb4, 0xc6, 0x59, 0xf2, 0x48, 0x8d,
+        ];
+        let calldata = vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4, 5, 6, 7, 8];
+        let decoded = TxDecoded {
+            hash: [0x44; 32],
+            tx_type: 2,
+            sender: [0x55; 20],
+            nonce: 42,
+            chain_id: Some(1),
+            to: Some(uniswap_v2_router),
+            value_wei: Some(1_000_000_000_000_000),
+            gas_limit: Some(320_000),
+            gas_price_wei: None,
+            max_fee_per_gas_wei: Some(45_000_000_000),
+            max_priority_fee_per_gas_wei: Some(7_000_000_000),
+            max_fee_per_blob_gas_wei: None,
+            calldata_len: Some(calldata.len() as u32),
+        };
+
+        let detected_unix_ms = 1_700_000_001_234;
+        let records = build_opportunity_records(&decoded, &calldata, detected_unix_ms);
+
+        assert!(!records.is_empty());
+        assert!(records.windows(2).all(|pair| pair[0].score >= pair[1].score));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.detected_unix_ms == detected_unix_ms)
+        );
+        assert_eq!(records[0].feature_engine_version, feature_engine::version());
+        assert_eq!(records[0].scorer_version, searcher::scorer_version());
+        assert!(records[0].strategy_version.starts_with("strategy."));
+        assert!(!records[0].reasons.is_empty());
     }
 }

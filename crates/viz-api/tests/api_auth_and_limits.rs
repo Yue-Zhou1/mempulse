@@ -5,12 +5,23 @@ use common::{AlertThresholdConfig, MetricSnapshot};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
-use viz_api::{AppState, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider, build_router};
+use viz_api::{
+    AppState, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider, build_router,
+};
 
 #[derive(Clone)]
 struct EmptyProvider;
 
 impl VizDataProvider for EmptyProvider {
+    fn events(
+        &self,
+        _after_seq_id: u64,
+        _event_types: &[String],
+        _limit: usize,
+    ) -> Vec<event_log::EventEnvelope> {
+        Vec::new()
+    }
+
     fn replay_points(&self) -> Vec<ReplayPoint> {
         Vec::new()
     }
@@ -24,6 +35,10 @@ impl VizDataProvider for EmptyProvider {
     }
 
     fn feature_details(&self, _limit: usize) -> Vec<viz_api::FeatureDetail> {
+        Vec::new()
+    }
+
+    fn opportunities(&self, _limit: usize, _min_score: u32) -> Vec<viz_api::OpportunityDetail> {
         Vec::new()
     }
 

@@ -1,16 +1,17 @@
 pub mod auth;
 pub mod live_rpc;
 
+use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{middleware, response::Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use auth::{ApiAuthConfig, ApiRateLimiter};
+use axum::{middleware, response::Response};
 use builder::RelayDryRunStatus;
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
+use event_log::{EventEnvelope, EventPayload};
 use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
 use replay::{ReplayMode, replay_frames};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use storage::{
 use tower_http::cors::{Any, CorsLayer};
 
 #[cfg(test)]
-use event_log::{EventEnvelope, EventPayload, TxDecoded};
+use event_log::{TxDecoded, TxFetched, TxSeen};
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,6 +68,21 @@ pub struct FeatureDetail {
     pub mev_score: u16,
     pub urgency_score: u16,
     pub method_selector: Option<String>,
+    pub feature_engine_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpportunityDetail {
+    pub tx_hash: String,
+    pub strategy: String,
+    pub score: u32,
+    pub protocol: String,
+    pub category: String,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
+    pub reasons: Vec<String>,
+    pub detected_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,10 +155,12 @@ fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
 }
 
 pub trait VizDataProvider: Send + Sync {
+    fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize) -> Vec<EventEnvelope>;
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
     fn feature_summary(&self) -> Vec<FeatureSummary>;
     fn feature_details(&self, limit: usize) -> Vec<FeatureDetail>;
+    fn opportunities(&self, limit: usize, min_score: u32) -> Vec<OpportunityDetail>;
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
@@ -171,6 +189,27 @@ impl InMemoryVizProvider {
 }
 
 impl VizDataProvider for InMemoryVizProvider {
+    fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize) -> Vec<EventEnvelope> {
+        self.storage
+            .read()
+            .ok()
+            .map(|storage| {
+                storage
+                    .list_events()
+                    .into_iter()
+                    .filter(|event| event.seq_id > after_seq_id)
+                    .filter(|event| {
+                        event_types.is_empty()
+                            || event_types.iter().any(|kind| {
+                                event_payload_type(&event.payload).eq_ignore_ascii_case(kind)
+                            })
+                    })
+                    .take(limit)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn replay_points(&self) -> Vec<ReplayPoint> {
         let events = self
             .storage
@@ -234,6 +273,7 @@ impl VizDataProvider for InMemoryVizProvider {
                         mev_score: feature.mev_score,
                         urgency_score: feature.urgency_score,
                         method_selector: format_method_selector(feature.method_selector),
+                        feature_engine_version: feature.feature_engine_version.clone(),
                     });
                     if out.len() >= limit {
                         break;
@@ -241,6 +281,33 @@ impl VizDataProvider for InMemoryVizProvider {
                 }
 
                 out
+            })
+            .unwrap_or_default()
+    }
+
+    fn opportunities(&self, limit: usize, min_score: u32) -> Vec<OpportunityDetail> {
+        self.storage
+            .read()
+            .ok()
+            .map(|storage| {
+                storage
+                    .opportunities()
+                    .into_iter()
+                    .filter(|row| row.score >= min_score)
+                    .take(limit)
+                    .map(|row| OpportunityDetail {
+                        tx_hash: format_bytes(&row.tx_hash),
+                        strategy: row.strategy,
+                        score: row.score,
+                        protocol: row.protocol,
+                        category: row.category,
+                        feature_engine_version: row.feature_engine_version,
+                        scorer_version: row.scorer_version,
+                        strategy_version: row.strategy_version,
+                        reasons: row.reasons,
+                        detected_unix_ms: row.detected_unix_ms,
+                    })
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -317,7 +384,11 @@ impl VizDataProvider for InMemoryVizProvider {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
         let hash = parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
-            let seen = storage.tx_seen().iter().rev().find(|seen| seen.hash == hash)?;
+            let seen = storage
+                .tx_seen()
+                .iter()
+                .rev()
+                .find(|seen| seen.hash == hash)?;
             let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
             Some(TransactionDetail {
                 hash: format_bytes(&seen.hash),
@@ -346,7 +417,12 @@ impl VizDataProvider for InMemoryVizProvider {
             .storage
             .read()
             .ok()
-            .map(|storage| (storage.tx_seen().len() as u64, storage.tx_full().len() as u64))
+            .map(|storage| {
+                (
+                    storage.tx_seen().len() as u64,
+                    storage.tx_full().len() as u64,
+                )
+            })
             .unwrap_or((0, 0));
         let queue_depth_capacity = 10_000_u64;
 
@@ -372,12 +448,14 @@ pub fn build_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     let protected = Router::new()
+        .route("/events", get(events))
         .route("/replay", get(replay))
         .route("/propagation", get(propagation))
         .route("/metrics/snapshot", get(metrics_snapshot))
         .route("/alerts/evaluate", get(alerts_evaluate))
         .route("/features", get(features))
         .route("/features/recent", get(features_recent))
+        .route("/opps/recent", get(opportunities_recent))
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
@@ -413,8 +491,7 @@ pub fn default_state() -> AppState {
             LiveRpcConfig::default()
         }
     };
-    let ingest_mode =
-        resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
+    let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
     let propagation = vec![
         PropagationEdge {
@@ -432,7 +509,10 @@ pub fn default_state() -> AppState {
     ];
     match ingest_mode {
         IngestSourceMode::Rpc => {
-            tracing::info!(ingest_mode = ingest_mode.as_str(), "starting rpc ingest mode");
+            tracing::info!(
+                ingest_mode = ingest_mode.as_str(),
+                "starting rpc ingest mode"
+            );
             start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
         }
         IngestSourceMode::P2p => {
@@ -452,7 +532,9 @@ pub fn default_state() -> AppState {
 
     let api_auth = ApiAuthConfig::from_env();
     if api_auth.enabled && api_auth.api_keys.is_empty() {
-        tracing::warn!("api auth enabled but no API keys configured; all protected routes will return unauthorized");
+        tracing::warn!(
+            "api auth enabled but no API keys configured; all protected routes will return unauthorized"
+        );
     }
     let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
 
@@ -521,6 +603,32 @@ fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
             selector[0], selector[1], selector[2], selector[3]
         )
     })
+}
+
+fn event_payload_type(payload: &EventPayload) -> &'static str {
+    match payload {
+        EventPayload::TxSeen(_) => "TxSeen",
+        EventPayload::TxFetched(_) => "TxFetched",
+        EventPayload::TxDecoded(_) => "TxDecoded",
+        EventPayload::TxReplaced(_) => "TxReplaced",
+        EventPayload::TxDropped(_) => "TxDropped",
+        EventPayload::TxConfirmedProvisional(_) => "TxConfirmedProvisional",
+        EventPayload::TxConfirmedFinal(_) => "TxConfirmedFinal",
+        EventPayload::TxReorged(_) => "TxReorged",
+    }
+}
+
+fn parse_event_type_filters(raw: Option<&str>) -> Vec<String> {
+    let mut filters = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    filters.sort_unstable();
+    filters.dedup();
+    filters
 }
 
 fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
@@ -606,6 +714,20 @@ async fn replay(State(state): State<AppState>) -> Json<Vec<ReplayPoint>> {
     Json(downsample(&values, state.downsample_limit))
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EventsQuery {
+    after: Option<u64>,
+    types: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn events(State(state): State<AppState>, Query(query): Query<EventsQuery>) -> Json<Vec<EventEnvelope>> {
+    let after_seq_id = query.after.unwrap_or(0);
+    let limit = query.limit.unwrap_or(1_000).clamp(1, 5_000);
+    let event_types = parse_event_type_filters(query.types.as_deref());
+    Json(state.provider.events(after_seq_id, &event_types, limit))
+}
+
 async fn propagation(State(state): State<AppState>) -> Json<Vec<PropagationEdge>> {
     let values = state.provider.propagation_edges();
     Json(downsample(&values, state.downsample_limit))
@@ -627,6 +749,7 @@ async fn features_recent(
 #[derive(Clone, Debug, Default, Deserialize)]
 struct TransactionsQuery {
     limit: Option<usize>,
+    min_score: Option<u32>,
 }
 
 async fn transactions(
@@ -635,6 +758,15 @@ async fn transactions(
 ) -> Json<Vec<TransactionSummary>> {
     let limit = query.limit.unwrap_or(25).clamp(1, 200);
     Json(state.provider.recent_transactions(limit))
+}
+
+async fn opportunities_recent(
+    State(state): State<AppState>,
+    Query(query): Query<TransactionsQuery>,
+) -> Json<Vec<OpportunityDetail>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 5_000);
+    let min_score = query.min_score.unwrap_or(0);
+    Json(state.provider.opportunities(limit, min_score))
 }
 
 async fn transactions_all(
@@ -708,6 +840,70 @@ mod tests {
     struct MockProvider;
 
     impl VizDataProvider for MockProvider {
+        fn events(
+            &self,
+            after_seq_id: u64,
+            event_types: &[String],
+            limit: usize,
+        ) -> Vec<EventEnvelope> {
+            let values = vec![
+                EventEnvelope {
+                    seq_id: 1,
+                    ingest_ts_unix_ms: 1_700_000_000_000,
+                    ingest_ts_mono_ns: 1_700_000_000_000_000_000,
+                    source_id: common::SourceId::new("mock"),
+                    payload: EventPayload::TxSeen(TxSeen {
+                        hash: [0x01; 32],
+                        peer_id: "rpc-ws".to_owned(),
+                        seen_at_unix_ms: 1_700_000_000_000,
+                        seen_at_mono_ns: 1_700_000_000_000_000_000,
+                    }),
+                },
+                EventEnvelope {
+                    seq_id: 2,
+                    ingest_ts_unix_ms: 1_700_000_000_050,
+                    ingest_ts_mono_ns: 1_700_000_000_050_000_000,
+                    source_id: common::SourceId::new("mock"),
+                    payload: EventPayload::TxFetched(TxFetched {
+                        hash: [0x02; 32],
+                        fetched_at_unix_ms: 1_700_000_000_050,
+                    }),
+                },
+                EventEnvelope {
+                    seq_id: 3,
+                    ingest_ts_unix_ms: 1_700_000_000_100,
+                    ingest_ts_mono_ns: 1_700_000_000_100_000_000,
+                    source_id: common::SourceId::new("mock"),
+                    payload: EventPayload::TxDecoded(TxDecoded {
+                        hash: [0x03; 32],
+                        tx_type: 2,
+                        sender: [0xaa; 20],
+                        nonce: 1,
+                        chain_id: Some(1),
+                        to: None,
+                        value_wei: None,
+                        gas_limit: None,
+                        gas_price_wei: None,
+                        max_fee_per_gas_wei: None,
+                        max_priority_fee_per_gas_wei: None,
+                        max_fee_per_blob_gas_wei: None,
+                        calldata_len: Some(4),
+                    }),
+                },
+            ];
+            values
+                .into_iter()
+                .filter(|event| event.seq_id > after_seq_id)
+                .filter(|event| {
+                    event_types.is_empty()
+                        || event_types.iter().any(|kind| {
+                            event_payload_type(&event.payload).eq_ignore_ascii_case(kind)
+                        })
+                })
+                .take(limit)
+                .collect()
+        }
+
         fn replay_points(&self) -> Vec<ReplayPoint> {
             vec![
                 ReplayPoint {
@@ -754,6 +950,7 @@ mod tests {
                     mev_score: 72,
                     urgency_score: 18,
                     method_selector: Some("0x38ed1739".to_owned()),
+                    feature_engine_version: "feature-engine.v1".to_owned(),
                 },
                 FeatureDetail {
                     hash: "0x02".to_owned(),
@@ -762,6 +959,7 @@ mod tests {
                     mev_score: 18,
                     urgency_score: 7,
                     method_selector: Some("0xa9059cbb".to_owned()),
+                    feature_engine_version: "feature-engine.v1".to_owned(),
                 },
             ];
             values.into_iter().take(limit).collect()
@@ -787,6 +985,40 @@ mod tests {
                 },
             ];
             values.into_iter().take(limit).collect()
+        }
+
+        fn opportunities(&self, limit: usize, min_score: u32) -> Vec<OpportunityDetail> {
+            let values = vec![
+                OpportunityDetail {
+                    tx_hash: "0x11".to_owned(),
+                    strategy: "SandwichCandidate".to_owned(),
+                    score: 12_000,
+                    protocol: "uniswap-v2".to_owned(),
+                    category: "swap".to_owned(),
+                    feature_engine_version: "feature-engine.v1".to_owned(),
+                    scorer_version: "scorer.v1".to_owned(),
+                    strategy_version: "strategy.sandwich.v1".to_owned(),
+                    reasons: vec!["mev_score=90*120".to_owned()],
+                    detected_unix_ms: 1_700_000_000_111,
+                },
+                OpportunityDetail {
+                    tx_hash: "0x22".to_owned(),
+                    strategy: "BackrunCandidate".to_owned(),
+                    score: 9_500,
+                    protocol: "uniswap-v3".to_owned(),
+                    category: "swap".to_owned(),
+                    feature_engine_version: "feature-engine.v1".to_owned(),
+                    scorer_version: "scorer.v1".to_owned(),
+                    strategy_version: "strategy.backrun.v1".to_owned(),
+                    reasons: vec!["urgency_score=20*20".to_owned()],
+                    detected_unix_ms: 1_700_000_000_101,
+                },
+            ];
+            values
+                .into_iter()
+                .filter(|row| row.score >= min_score)
+                .take(limit)
+                .collect()
         }
 
         fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
@@ -910,6 +1142,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_route_filters_by_after_and_types() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events?after=1&types=TxDecoded&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Vec<EventEnvelope> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].seq_id, 3);
+        assert!(matches!(payload[0].payload, EventPayload::TxDecoded(_)));
+    }
+
+    #[tokio::test]
     async fn default_state_initializes_live_rpc_without_env() {
         let state = default_state();
         let _ = state.provider.replay_points();
@@ -927,7 +1181,10 @@ mod tests {
 
     #[test]
     fn resolve_ingest_source_mode_accepts_p2p_and_hybrid() {
-        assert_eq!(resolve_ingest_source_mode(Some("p2p")), IngestSourceMode::P2p);
+        assert_eq!(
+            resolve_ingest_source_mode(Some("p2p")),
+            IngestSourceMode::P2p
+        );
         assert_eq!(
             resolve_ingest_source_mode(Some("hybrid")),
             IngestSourceMode::Hybrid
@@ -1105,6 +1362,29 @@ mod tests {
         assert_eq!(payload.len(), 2);
         assert_eq!(payload[0].protocol, "uniswap-v2");
         assert_eq!(payload[0].mev_score, 72);
+        assert_eq!(payload[0].feature_engine_version, "feature-engine.v1");
+    }
+
+    #[tokio::test]
+    async fn opportunities_recent_route_applies_min_score_filter() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/opps/recent?limit=10&min_score=10000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: Vec<OpportunityDetail> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].strategy, "SandwichCandidate");
+        assert_eq!(payload[0].scorer_version, "scorer.v1");
     }
 
     #[tokio::test]
