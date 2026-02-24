@@ -3,6 +3,7 @@ mod mempool_state;
 use common::TxHash;
 use event_log::{EventEnvelope, EventPayload, sort_deterministic};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use mempool_state::{MempoolState, StateTransition, TxLifecycleStatus};
@@ -27,6 +28,13 @@ pub struct ReplayFrame {
 pub struct LifecycleCheckpoint {
     pub seq_id: u64,
     pub pending_hashes: Vec<TxHash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointHash {
+    pub seq_id: u64,
+    pub pending_count: usize,
+    pub checkpoint_hash: [u8; 32],
 }
 
 pub fn replay_frames(
@@ -152,6 +160,62 @@ pub fn lifecycle_parity(
         .collect()
 }
 
+pub fn deterministic_checkpoint_hashes(
+    events: &[EventEnvelope],
+    stride: usize,
+) -> Vec<CheckpointHash> {
+    replay_frames(events, ReplayMode::DeterministicEventReplay, stride.max(1))
+        .into_iter()
+        .map(|frame| CheckpointHash {
+            seq_id: frame.seq_hi,
+            pending_count: frame.pending.len(),
+            checkpoint_hash: frame_checkpoint_hash(&frame),
+        })
+        .collect()
+}
+
+pub fn checkpoint_hash_parity_percent(
+    reference_events: &[EventEnvelope],
+    candidate_events: &[EventEnvelope],
+    stride: usize,
+) -> f64 {
+    let reference = deterministic_checkpoint_hashes(reference_events, stride.max(1));
+    let candidate = deterministic_checkpoint_hashes(candidate_events, stride.max(1));
+    if reference.is_empty() {
+        return if candidate.is_empty() { 100.0 } else { 0.0 };
+    }
+
+    let candidate_by_seq: BTreeMap<u64, [u8; 32]> = candidate
+        .into_iter()
+        .map(|checkpoint| (checkpoint.seq_id, checkpoint.checkpoint_hash))
+        .collect();
+
+    let matched = reference
+        .iter()
+        .filter(|checkpoint| {
+            candidate_by_seq
+                .get(&checkpoint.seq_id)
+                .is_some_and(|hash| *hash == checkpoint.checkpoint_hash)
+        })
+        .count();
+
+    (matched as f64 / reference.len() as f64) * 100.0
+}
+
+fn frame_checkpoint_hash(frame: &ReplayFrame) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(frame.seq_hi.to_le_bytes());
+    hasher.update(frame.timestamp_unix_ms.to_le_bytes());
+    hasher.update((frame.pending.len() as u64).to_le_bytes());
+    for hash in &frame.pending {
+        hasher.update(hash);
+    }
+    let digest = hasher.finalize();
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 pub fn simulate_deterministic_window(
     events: &[EventEnvelope],
     chain_context: &SimulationChainContext,
@@ -270,5 +334,33 @@ mod tests {
         assert_eq!(parity.get(&1), Some(&true));
         assert_eq!(parity.get(&2), Some(&true));
         assert_eq!(parity.get(&3), Some(&true));
+    }
+
+    #[test]
+    fn checkpoint_hash_parity_meets_slo_for_reordered_input() {
+        let mut events = Vec::new();
+        let mut seq = 1_u64;
+        for idx in 0_u8..120_u8 {
+            events.push(decoded(seq, idx.wrapping_add(1), idx, idx as u64));
+            seq = seq.saturating_add(1);
+            if idx % 3 == 0 {
+                events.push(envelope(
+                    seq,
+                    EventPayload::TxDropped(TxDropped {
+                        hash: hash(idx.wrapping_add(1)),
+                        reason: "evicted".to_owned(),
+                    }),
+                ));
+                seq = seq.saturating_add(1);
+            }
+        }
+        let mut reordered = events.clone();
+        reordered.reverse();
+
+        let parity = crate::checkpoint_hash_parity_percent(&events, &reordered, 7);
+        assert!(
+            parity >= 99.99,
+            "checkpoint hash parity below SLO: {parity:.4}%"
+        );
     }
 }
