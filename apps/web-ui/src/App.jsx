@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { resolveApiBase } from './api-base.js';
 import { mergeTransactionHistory } from './tx-history.js';
+import { normalizeScreenId } from './screen-mode.js';
 import { BlurFade } from './components/magicui/blur-fade.jsx';
 import { NumberTicker } from './components/magicui/number-ticker.jsx';
 import { ShineBorder } from './components/magicui/shine-border.jsx';
@@ -119,16 +120,21 @@ export default function App() {
 
   const [statusMessage, setStatusMessage] = useState('Connecting to API...');
   const [hasError, setHasError] = useState(false);
+  const [activeScreen, setActiveScreen] = useState(() =>
+    normalizeScreenId(window.location.hash.replace(/^#/, '')),
+  );
   const [query, setQuery] = useState('');
   const [timelineIndex, setTimelineIndex] = useState(0);
   const [followLatest, setFollowLatest] = useState(true);
   const [selectedHash, setSelectedHash] = useState(null);
+  const [selectedOpportunityHash, setSelectedOpportunityHash] = useState(null);
   const [dialogHash, setDialogHash] = useState(null);
   const [dialogError, setDialogError] = useState('');
   const [dialogLoading, setDialogLoading] = useState(false);
 
   const [replayFrames, setReplayFrames] = useState([]);
   const [propagationEdges, setPropagationEdges] = useState([]);
+  const [opportunityRows, setOpportunityRows] = useState([]);
   const [featureSummaryRows, setFeatureSummaryRows] = useState([]);
   const [featureDetailRows, setFeatureDetailRows] = useState([]);
   const [recentTxRows, setRecentTxRows] = useState([]);
@@ -139,6 +145,23 @@ export default function App() {
   useEffect(() => {
     transactionRowsRef.current = transactionRows;
   }, [transactionRows]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setActiveScreen(normalizeScreenId(window.location.hash.replace(/^#/, '')));
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const expectedHash = `#${activeScreen}`;
+    if (window.location.hash !== expectedHash) {
+      window.history.replaceState(null, '', expectedHash);
+    }
+  }, [activeScreen]);
 
   useEffect(() => {
     let mounted = true;
@@ -152,11 +175,12 @@ export default function App() {
       setHasError(false);
 
       try {
-        const [txRecent, replay, propagation, featureSummary, featureDetails] =
+        const [txRecent, replay, propagation, opportunities, featureSummary, featureDetails] =
           await Promise.all([
             fetchJson(apiBase, `/transactions?limit=${txPollLimit}`),
             fetchJson(apiBase, '/replay'),
             fetchJson(apiBase, '/propagation'),
+            fetchJson(apiBase, `/opps/recent?limit=${featurePollLimit}`),
             fetchJson(apiBase, '/features'),
             fetchJson(apiBase, `/features/recent?limit=${featurePollLimit}`),
           ]);
@@ -176,6 +200,7 @@ export default function App() {
         setTransactionRows(nextTransactions);
         setReplayFrames(replay);
         setPropagationEdges(propagation);
+        setOpportunityRows(opportunities);
         setFeatureSummaryRows(featureSummary);
         setFeatureDetailRows(featureDetails);
 
@@ -195,10 +220,16 @@ export default function App() {
           }
           return nextTransactions[0]?.hash ?? null;
         });
+        setSelectedOpportunityHash((current) => {
+          if (current && opportunities.some((row) => row.tx_hash === current)) {
+            return current;
+          }
+          return opportunities[0]?.tx_hash ?? null;
+        });
 
         const lastUpdated = new Date().toLocaleTimeString();
         setStatusMessage(
-          `Connected · replay=${replay.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · ${lastUpdated}`,
+          `Connected · replay=${replay.length} · opps=${opportunities.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · ${lastUpdated}`,
         );
       } catch (error) {
         if (!mounted) {
@@ -323,6 +354,10 @@ export default function App() {
     }
     return recentTxRows.find((row) => row.hash === selectedTransaction.hash) ?? null;
   }, [recentTxRows, selectedTransaction]);
+  const selectedOpportunity = useMemo(
+    () => opportunityRows.find((row) => row.tx_hash === selectedOpportunityHash) ?? null,
+    [opportunityRows, selectedOpportunityHash],
+  );
 
   const dialogTransaction = useMemo(() => {
     if (!dialogHash) {
@@ -350,8 +385,51 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_20%_10%,#e2e8f0_0%,#f8fafc_46%,#f1f5f9_100%)] p-4 text-zinc-900">
-      <div className="mx-auto h-[calc(100vh-2rem)] max-w-[1700px] overflow-hidden rounded-2xl border border-zinc-300/90 bg-zinc-100 shadow-[0_20px_80px_-40px_rgba(15,23,42,0.55)]">
-        <div className="grid h-full grid-cols-1 lg:grid-cols-[260px_minmax(360px,1fr)_minmax(440px,1fr)]">
+      <div className="mx-auto flex h-[calc(100vh-2rem)] max-w-[1700px] flex-col overflow-hidden rounded-2xl border border-zinc-300/90 bg-zinc-100 shadow-[0_20px_80px_-40px_rgba(15,23,42,0.55)]">
+        <div className="border-b border-zinc-300 bg-zinc-100/80 px-4 py-3 backdrop-blur">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveScreen('radar')}
+              className={cn(
+                'rounded-lg border px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition',
+                activeScreen === 'radar'
+                  ? 'border-zinc-900 bg-zinc-900 text-white'
+                  : 'border-zinc-300 bg-zinc-50 text-zinc-700 hover:bg-zinc-200',
+              )}
+            >
+              Mempool Radar
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveScreen('opps')}
+              className={cn(
+                'rounded-lg border px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition',
+                activeScreen === 'opps'
+                  ? 'border-zinc-900 bg-zinc-900 text-white'
+                  : 'border-zinc-300 bg-zinc-50 text-zinc-700 hover:bg-zinc-200',
+              )}
+            >
+              Opp Console
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveScreen('replay')}
+              className={cn(
+                'rounded-lg border px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition',
+                activeScreen === 'replay'
+                  ? 'border-zinc-900 bg-zinc-900 text-white'
+                  : 'border-zinc-300 bg-zinc-50 text-zinc-700 hover:bg-zinc-200',
+              )}
+            >
+              Replay Debugger
+            </button>
+            <div className="ml-auto text-xs text-zinc-500">{statusMessage}</div>
+          </div>
+        </div>
+
+        {activeScreen === 'radar' ? (
+          <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[260px_minmax(360px,1fr)_minmax(440px,1fr)]">
           <aside className="overflow-auto border-b border-zinc-300 bg-zinc-100 p-4 lg:border-b-0 lg:border-r">
             <BlurFade inView className="space-y-4">
               <div className="rounded-xl border border-zinc-300 bg-white p-3">
@@ -687,7 +765,182 @@ export default function App() {
               </BlurFade>
             </div>
           </section>
-        </div>
+          </div>
+        ) : null}
+
+        {activeScreen === 'opps' ? (
+          <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[420px_minmax(500px,1fr)]">
+            <section className="min-h-0 overflow-auto border-b border-zinc-300 p-4 lg:border-b-0 lg:border-r">
+              <div className="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                Opportunity Pipeline
+              </div>
+              <div className="space-y-2">
+                {opportunityRows.map((opportunity) => {
+                  const isActive = selectedOpportunityHash === opportunity.tx_hash;
+                  return (
+                    <button
+                      type="button"
+                      key={`${opportunity.tx_hash}-${opportunity.strategy}`}
+                      onClick={() => setSelectedOpportunityHash(opportunity.tx_hash)}
+                      className={cn(
+                        'w-full rounded-xl border p-3 text-left transition',
+                        isActive
+                          ? 'border-zinc-900 bg-zinc-900 text-zinc-100'
+                          : 'border-zinc-300 bg-white text-zinc-800 hover:border-zinc-400',
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold">{opportunity.strategy}</div>
+                        <div className={cn('text-xs', isActive ? 'text-zinc-400' : 'text-zinc-500')}>
+                          score {opportunity.score}
+                        </div>
+                      </div>
+                      <div className={cn('mt-1 text-xs', isActive ? 'text-zinc-300' : 'text-zinc-500')}>
+                        {opportunity.protocol} · {opportunity.category}
+                      </div>
+                      <div className={cn('mt-1 text-xs', isActive ? 'text-zinc-300' : 'text-zinc-500')}>
+                        tx {shortHex(opportunity.tx_hash, 14, 10)} · {formatRelativeTime(opportunity.detected_unix_ms)}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              {opportunityRows.length === 0 ? (
+                <div className="mt-4 rounded-xl border border-dashed border-zinc-300 bg-white p-6 text-sm text-zinc-500">
+                  No opportunities available.
+                </div>
+              ) : null}
+            </section>
+
+            <section className="min-h-0 overflow-auto p-4">
+              <div className="rounded-xl border border-zinc-300 bg-white p-4">
+                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                  Selected Opportunity
+                </div>
+                {selectedOpportunity ? (
+                  <div className="mt-3 space-y-3 text-sm">
+                    <div>
+                      <div className="text-xs text-zinc-500">Transaction</div>
+                      <div className="font-mono text-[13px]">{selectedOpportunity.tx_hash}</div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <div className="text-xs text-zinc-500">Strategy</div>
+                        <div>{selectedOpportunity.strategy}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-zinc-500">Score</div>
+                        <div>{selectedOpportunity.score}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-zinc-500">Protocol</div>
+                        <div>{selectedOpportunity.protocol}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-zinc-500">Category</div>
+                        <div>{selectedOpportunity.category}</div>
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-zinc-300 bg-zinc-50 p-3">
+                      <div className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                        Rule Versions
+                      </div>
+                      <div className="mt-2 text-xs text-zinc-700">
+                        feature-engine: {selectedOpportunity.feature_engine_version}
+                      </div>
+                      <div className="text-xs text-zinc-700">scorer: {selectedOpportunity.scorer_version}</div>
+                      <div className="text-xs text-zinc-700">
+                        strategy: {selectedOpportunity.strategy_version}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500">Reasons</div>
+                      <ul className="mt-1 space-y-1 text-xs text-zinc-700">
+                        {selectedOpportunity.reasons?.length
+                          ? selectedOpportunity.reasons.map((reason, index) => (
+                              <li key={`${reason}-${index}`} className="rounded-md bg-zinc-50 px-2 py-1">
+                                {reason}
+                              </li>
+                            ))
+                          : [<li key="none" className="rounded-md bg-zinc-50 px-2 py-1">No reasons provided.</li>]}
+                      </ul>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3 text-sm text-zinc-500">Select an opportunity from the left pane.</div>
+                )}
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {activeScreen === 'replay' ? (
+          <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[460px_minmax(500px,1fr)]">
+            <section className="min-h-0 overflow-auto border-b border-zinc-300 p-4 lg:border-b-0 lg:border-r">
+              <div className="text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                Replay Timeline
+              </div>
+              <div className="mt-3 rounded-xl border border-zinc-300 bg-white p-4">
+                <input
+                  type="range"
+                  min="0"
+                  max={Math.max(0, replayFrames.length - 1)}
+                  value={timelineIndex}
+                  onChange={(event) => {
+                    setTimelineIndex(Number(event.target.value));
+                    setFollowLatest(false);
+                  }}
+                  className="w-full"
+                />
+                <div className="mt-2 flex items-center justify-between text-xs text-zinc-500">
+                  <div>frame {replayFrames.length ? timelineIndex + 1 : 0}/{replayFrames.length}</div>
+                  <div>seq {currentFrame?.seq_hi ?? '-'} · pending {currentFrame?.pending_count ?? 0}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFollowLatest(true);
+                    if (replayFrames.length) {
+                      setTimelineIndex(replayFrames.length - 1);
+                    }
+                  }}
+                  className={cn(
+                    'mt-3 rounded-lg border px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition',
+                    followLatest
+                      ? 'border-zinc-900 bg-zinc-900 text-white'
+                      : 'border-zinc-300 bg-zinc-50 text-zinc-700 hover:bg-zinc-200',
+                  )}
+                >
+                  Follow live
+                </button>
+              </div>
+            </section>
+
+            <section className="min-h-0 overflow-auto p-4">
+              <div className="rounded-xl border border-zinc-300 bg-white p-4">
+                <div className="mb-2 text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                  Frame Stream
+                </div>
+                <div className="space-y-2">
+                  {replayFrames.slice(-160).reverse().map((frame) => (
+                    <div
+                      key={frame.seq_hi}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-xs',
+                        frame.seq_hi === currentFrame?.seq_hi
+                          ? 'border-zinc-900 bg-zinc-900 text-zinc-100'
+                          : 'border-zinc-300 bg-zinc-50 text-zinc-700',
+                      )}
+                    >
+                      <div>seq {frame.seq_hi}</div>
+                      <div>{formatTime(frame.timestamp_unix_ms)} · pending {frame.pending_count}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          </div>
+        ) : null}
       </div>
 
       {dialogHash ? (

@@ -409,7 +409,7 @@ Alerts:
 ### Phase 3: Delivery (API/UI/Alerts)
 
 - [x]  Full API (`events/replay/tx/opp/sim/bundle`)
-- [ ]  Three-screen UI
+- [x]  Three-screen UI
 - [x]  Prometheus metrics + alert rules
 
 **Acceptance**
