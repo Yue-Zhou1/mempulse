@@ -1,13 +1,31 @@
 #![forbid(unsafe_code)]
 
-use crate::{OpportunityCandidate, scoring::ScoreBreakdown};
-use feature_engine::FeaturedTransaction;
+use crate::{
+    OpportunityCandidate,
+    scoring::{ScoreBreakdown, scorer_version},
+};
+use feature_engine::{FeaturedTransaction, version as feature_engine_version};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum StrategyKind {
     SandwichCandidate,
     BackrunCandidate,
     ArbCandidate,
+}
+
+pub const SANDWICH_STRATEGY_VERSION: &str = "strategy.sandwich.v1";
+pub const BACKRUN_STRATEGY_VERSION: &str = "strategy.backrun.v1";
+pub const ARB_STRATEGY_VERSION: &str = "strategy.arb.v1";
+
+#[inline]
+pub const fn strategy_version(kind: StrategyKind) -> &'static str {
+    match kind {
+        StrategyKind::SandwichCandidate => SANDWICH_STRATEGY_VERSION,
+        StrategyKind::BackrunCandidate => BACKRUN_STRATEGY_VERSION,
+        StrategyKind::ArbCandidate => ARB_STRATEGY_VERSION,
+    }
 }
 
 pub trait Strategy {
@@ -42,7 +60,10 @@ impl Strategy for SandwichCandidateStrategy {
         let reasons = vec![
             format!("mev_score={}*120", analysis.mev_score),
             format!("urgency_score={}*25", analysis.urgency_score),
-            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            format!(
+                "calldata/gas structural bonus={}",
+                breakdown.structural_component
+            ),
             "strategy bonus=500".to_owned(),
         ];
         Some(candidate(
@@ -70,7 +91,10 @@ impl Strategy for BackrunCandidateStrategy {
         let reasons = vec![
             format!("mev_score={}*100", analysis.mev_score),
             format!("urgency_score={}*20", analysis.urgency_score),
-            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            format!(
+                "calldata/gas structural bonus={}",
+                breakdown.structural_component
+            ),
             "strategy bonus=300".to_owned(),
         ];
         Some(candidate(
@@ -98,7 +122,10 @@ impl Strategy for ArbCandidateStrategy {
         let reasons = vec![
             format!("mev_score={}*90", analysis.mev_score),
             format!("urgency_score={}*15", analysis.urgency_score),
-            format!("calldata/gas structural bonus={}", breakdown.structural_component),
+            format!(
+                "calldata/gas structural bonus={}",
+                breakdown.structural_component
+            ),
             "strategy bonus=200".to_owned(),
         ];
         Some(candidate(
@@ -133,6 +160,9 @@ fn candidate(
     OpportunityCandidate {
         tx_hash: featured.hash,
         strategy,
+        feature_engine_version: feature_engine_version().to_owned(),
+        scorer_version: scorer_version().to_owned(),
+        strategy_version: strategy_version(strategy).to_owned(),
         score: breakdown.total(),
         protocol: featured.analysis.protocol.to_owned(),
         category: featured.analysis.category.to_owned(),

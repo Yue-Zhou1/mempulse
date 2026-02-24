@@ -70,7 +70,11 @@ pub fn simulate_deterministic(
             calldata: None,
         })
         .collect::<Vec<_>>();
-    simulate_with_mode(chain_context, &inputs, SimulationMode::SyntheticDeterministic)
+    simulate_with_mode(
+        chain_context,
+        &inputs,
+        SimulationMode::SyntheticDeterministic,
+    )
 }
 
 pub fn simulate_with_mode(

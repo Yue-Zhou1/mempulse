@@ -24,12 +24,8 @@ impl Devp2pRuntime {
         now_unix_ms: i64,
         now_mono_ns: u64,
     ) -> Vec<EventEnvelope> {
-        self.service.handle_new_pooled_transaction_hashes(
-            peer_id,
-            hashes,
-            now_unix_ms,
-            now_mono_ns,
-        )
+        self.service
+            .handle_new_pooled_transaction_hashes(peer_id, hashes, now_unix_ms, now_mono_ns)
     }
 
     pub async fn ingest_pooled_transactions(

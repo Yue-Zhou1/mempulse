@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+pub const SCORER_VERSION: &str = "scorer.v1";
+
+#[inline]
+pub const fn scorer_version() -> &'static str {
+    SCORER_VERSION
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
     pub mev_component: u32,

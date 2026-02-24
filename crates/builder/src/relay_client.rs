@@ -160,7 +160,9 @@ impl RelayClient {
 
 fn backoff_delay_ms(initial_backoff_ms: u64, retry_index: u32) -> u64 {
     let retry_shift = retry_index.min(16);
-    initial_backoff_ms.max(1).saturating_mul(1_u64 << retry_shift)
+    initial_backoff_ms
+        .max(1)
+        .saturating_mul(1_u64 << retry_shift)
 }
 
 fn unix_ms_now() -> i64 {

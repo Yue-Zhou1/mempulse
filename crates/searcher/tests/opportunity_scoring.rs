@@ -10,7 +10,13 @@ fn address(v: u8) -> Address {
     [v; 20]
 }
 
-fn tx(hash_v: u8, to: Address, gas_limit: u64, priority_fee_wei: u128, calldata_len: u32) -> TxDecoded {
+fn tx(
+    hash_v: u8,
+    to: Address,
+    gas_limit: u64,
+    priority_fee_wei: u128,
+    calldata_len: u32,
+) -> TxDecoded {
     TxDecoded {
         hash: hash(hash_v),
         tx_type: 2,
@@ -31,8 +37,8 @@ fn tx(hash_v: u8, to: Address, gas_limit: u64, priority_fee_wei: u128, calldata_
 #[test]
 fn opportunity_scoring_is_deterministic_and_prunes() {
     let uniswap_v2 = [
-        0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac,
-        0xb4, 0xc6, 0x59, 0xf2, 0x48, 0x8d,
+        0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac, 0xb4,
+        0xc6, 0x59, 0xf2, 0x48, 0x8d,
     ];
     let unknown_dex = address(0x44);
     let erc20 = address(0xee);
@@ -65,8 +71,16 @@ fn opportunity_scoring_is_deterministic_and_prunes() {
 
     assert_eq!(ranked_a, ranked_b);
     assert_eq!(ranked_a.len(), 3);
-    assert!(ranked_a.iter().all(|candidate| candidate.score >= config.min_score));
-    assert!(ranked_a.windows(2).all(|window| window[0].score >= window[1].score));
+    assert!(
+        ranked_a
+            .iter()
+            .all(|candidate| candidate.score >= config.min_score)
+    );
+    assert!(
+        ranked_a
+            .windows(2)
+            .all(|window| window[0].score >= window[1].score)
+    );
     assert_eq!(ranked_a[0].strategy, StrategyKind::SandwichCandidate);
     assert_eq!(ranked_a[0].tx_hash, hash(0x10));
 }

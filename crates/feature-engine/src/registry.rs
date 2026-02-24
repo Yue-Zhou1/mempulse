@@ -53,8 +53,10 @@ impl ProtocolRegistry {
     pub fn default_mainnet() -> &'static Self {
         static REGISTRY: OnceLock<ProtocolRegistry> = OnceLock::new();
         REGISTRY.get_or_init(|| {
-            ProtocolRegistry::from_json(include_str!("../../../configs/protocol_registry.mainnet.json"))
-                .expect("mainnet protocol registry must parse")
+            ProtocolRegistry::from_json(include_str!(
+                "../../../configs/protocol_registry.mainnet.json"
+            ))
+            .expect("mainnet protocol registry must parse")
         })
     }
 

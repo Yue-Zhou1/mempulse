@@ -141,15 +141,19 @@ fn resolve_out_dir() -> PathBuf {
 fn mock_template() -> BlockTemplate {
     BlockTemplate {
         slot: 123_456,
-        parent_hash: "0x1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+        parent_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
+            .to_owned(),
         block_hash: "0x2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
-        builder_pubkey: "0x3333333333333333333333333333333333333333333333333333333333333333".to_owned(),
+        builder_pubkey: "0x3333333333333333333333333333333333333333333333333333333333333333"
+            .to_owned(),
         tx_count: 14,
         gas_used: 18_900_000,
     }
 }
 
-async fn mock_relay_flaky(State(state): State<MockRelayState>) -> (StatusCode, Json<serde_json::Value>) {
+async fn mock_relay_flaky(
+    State(state): State<MockRelayState>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let n = state.requests.fetch_add(1, Ordering::SeqCst);
     if n == 0 {
         return (

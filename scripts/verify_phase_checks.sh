@@ -9,6 +9,9 @@ fi
 echo "[verify] running workspace tests"
 cargo test --workspace
 
+echo "[verify] running replay checkpoint parity gate"
+cargo test -p replay checkpoint_hash_parity_meets_slo_for_reordered_input -- --nocapture
+
 echo "[verify] building replay and viz binaries"
 cargo build -p replay --bin replay-cli
 cargo build -p viz-api --bin viz-api

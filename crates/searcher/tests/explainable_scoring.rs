@@ -1,6 +1,8 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
+use searcher::{
+    SearcherConfig, SearcherInputTx, rank_opportunities, scorer_version, strategy_version,
+};
 
 fn hash(v: u8) -> TxHash {
     [v; 32]
@@ -31,8 +33,8 @@ fn tx(hash_v: u8, to: Address) -> TxDecoded {
 #[test]
 fn ranked_candidates_include_score_breakdown_and_reasons() {
     let uniswap_v2 = [
-        0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac,
-        0xb4, 0xc6, 0x59, 0xf2, 0x48, 0x8d,
+        0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac, 0xb4,
+        0xc6, 0x59, 0xf2, 0x48, 0x8d,
     ];
     let batch = vec![SearcherInputTx {
         decoded: tx(0x44, uniswap_v2),
@@ -49,7 +51,14 @@ fn ranked_candidates_include_score_breakdown_and_reasons() {
 
     let top = ranked.first().expect("at least one candidate");
     assert!(!top.reasons.is_empty());
-    assert!(top.reasons.iter().any(|reason| reason.contains("mev_score")));
+    assert!(
+        top.reasons
+            .iter()
+            .any(|reason| reason.contains("mev_score"))
+    );
+    assert_eq!(top.feature_engine_version, feature_engine::version());
+    assert_eq!(top.scorer_version, scorer_version());
+    assert_eq!(top.strategy_version, strategy_version(top.strategy));
     assert_eq!(
         top.score,
         top.breakdown.mev_component

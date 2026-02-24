@@ -100,5 +100,8 @@ struct TokenBucket {
 }
 
 fn parse_env_bool(raw: &str) -> bool {
-    matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

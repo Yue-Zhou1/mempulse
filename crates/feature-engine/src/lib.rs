@@ -4,6 +4,13 @@ use common::{Address, TxHash};
 use event_log::TxDecoded;
 use registry::ProtocolRegistry;
 
+pub const FEATURE_ENGINE_VERSION: &str = "feature-engine.v1";
+
+#[inline]
+pub const fn version() -> &'static str {
+    FEATURE_ENGINE_VERSION
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureInput<'a> {
     pub to: Option<&'a Address>,
@@ -118,14 +125,12 @@ fn classify_category(method_selector: Option<[u8; 4]>) -> &'static str {
         | Some([0x7f, 0xf3, 0x6a, 0xb5])
         | Some([0x18, 0xcb, 0xaf, 0xe5])
         | Some([0x4a, 0x25, 0xd9, 0x4a])
-        | Some([0xfb, 0x3b, 0xdb, 0x41]) =>
-            "swap",
+        | Some([0xfb, 0x3b, 0xdb, 0x41]) => "swap",
         // Uniswap V3 swaps.
         Some([0x04, 0xe4, 0x5a, 0xaf])
         | Some([0xb8, 0x58, 0x18, 0x3f])
         | Some([0x50, 0x23, 0xb4, 0xdf])
-        | Some([0x09, 0xb8, 0x13, 0x46]) =>
-            "swap",
+        | Some([0x09, 0xb8, 0x13, 0x46]) => "swap",
         // Common ERC20 operations.
         Some([0xa9, 0x05, 0x9c, 0xbb]) | Some([0x23, 0xb8, 0x72, 0xdd]) => "transfer",
         Some([0x09, 0x5e, 0xa7, 0xb3]) => "approval",
@@ -226,5 +231,11 @@ mod tests {
         assert_eq!(analysis.category, "transfer");
         assert_eq!(analysis.method_selector, Some([0xa9, 0x05, 0x9c, 0xbb]));
         assert!(analysis.mev_score <= 30);
+    }
+
+    #[test]
+    fn exposes_feature_engine_version() {
+        assert_eq!(version(), FEATURE_ENGINE_VERSION);
+        assert!(!version().is_empty());
     }
 }

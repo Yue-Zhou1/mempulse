@@ -251,7 +251,10 @@ fn hash_from_u64(value: u64) -> TxHash {
     for (idx, byte) in out.iter_mut().enumerate() {
         let shift = ((idx % 8) * 8) as u32;
         let salt = (idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        *byte = value.wrapping_add(salt).rotate_left((idx % 13) as u32).wrapping_shr(shift) as u8;
+        *byte = value
+            .wrapping_add(salt)
+            .rotate_left((idx % 13) as u32)
+            .wrapping_shr(shift) as u8;
     }
     out
 }

@@ -1,17 +1,18 @@
 #![forbid(unsafe_code)]
 
-mod strategies;
 mod scoring;
+mod strategies;
 
 use common::TxHash;
 use event_log::TxDecoded;
 use feature_engine::analyze_decoded_transaction;
-use serde::{Deserialize, Serialize};
 use scoring::ScoreBreakdown;
+use serde::{Deserialize, Serialize};
 use strategies::default_strategies;
 
-pub use strategies::StrategyKind;
 pub use scoring::ScoreBreakdown as OpportunityScoreBreakdown;
+pub use scoring::scorer_version;
+pub use strategies::{StrategyKind, strategy_version};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearcherInputTx {
@@ -38,6 +39,9 @@ impl Default for SearcherConfig {
 pub struct OpportunityCandidate {
     pub tx_hash: TxHash,
     pub strategy: StrategyKind,
+    pub feature_engine_version: String,
+    pub scorer_version: String,
+    pub strategy_version: String,
     pub score: u32,
     pub protocol: String,
     pub category: String,
@@ -45,7 +49,10 @@ pub struct OpportunityCandidate {
     pub reasons: Vec<String>,
 }
 
-pub fn rank_opportunities(batch: &[SearcherInputTx], config: SearcherConfig) -> Vec<OpportunityCandidate> {
+pub fn rank_opportunities(
+    batch: &[SearcherInputTx],
+    config: SearcherConfig,
+) -> Vec<OpportunityCandidate> {
     let strategies = default_strategies();
     let mut candidates = Vec::new();
 

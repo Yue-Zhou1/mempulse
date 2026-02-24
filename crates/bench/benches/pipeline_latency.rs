@@ -7,9 +7,13 @@ fn pipeline_latency_bench(c: &mut Criterion) {
     for batch_size in [64_usize, 256, 1024] {
         let batch = synthetic_batch(batch_size);
         group.throughput(Throughput::Elements(batch_size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(batch_size), &batch, |b, input| {
-            b.iter(|| black_box(run_pipeline_once(black_box(input))));
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch,
+            |b, input| {
+                b.iter(|| black_box(run_pipeline_once(black_box(input))));
+            },
+        );
     }
     group.finish();
 }

@@ -1,6 +1,8 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
-use sim_engine::{AccountSeed, ChainContext, SimulationMode, SimulationTxInput, StateProvider, simulate_with_mode};
+use sim_engine::{
+    AccountSeed, ChainContext, SimulationMode, SimulationTxInput, StateProvider, simulate_with_mode,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn hash(v: u8) -> TxHash {
