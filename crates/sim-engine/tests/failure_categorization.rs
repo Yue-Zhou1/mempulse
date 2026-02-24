@@ -29,6 +29,8 @@ struct FixedNonceProvider {
     nonce: u64,
 }
 
+static ZERO_NONCE_PROVIDER: FixedNonceProvider = FixedNonceProvider { nonce: 0 };
+
 impl StateProvider for FixedNonceProvider {
     fn account_seed(&self, _address: Address) -> anyhow::Result<Option<AccountSeed>> {
         Ok(Some(AccountSeed {
@@ -40,7 +42,6 @@ impl StateProvider for FixedNonceProvider {
 
 #[test]
 fn rpc_backed_nonce_mismatch_is_categorized_and_trace_id_is_present() {
-    let provider = FixedNonceProvider { nonce: 0 };
     let txs = vec![SimulationTxInput {
         decoded: TxDecoded {
             hash: hash(1),
@@ -60,8 +61,12 @@ fn rpc_backed_nonce_mismatch_is_categorized_and_trace_id_is_present() {
         calldata: Some(vec![0xde, 0xad, 0xbe, 0xef]),
     }];
 
-    let batch = simulate_with_mode(&context(), &txs, SimulationMode::RpcBacked(&provider))
-        .expect("simulation batch");
+    let batch = simulate_with_mode(
+        &context(),
+        &txs,
+        SimulationMode::RpcBacked(&ZERO_NONCE_PROVIDER),
+    )
+    .expect("simulation batch");
 
     assert_eq!(batch.tx_results.len(), 1);
     let result = &batch.tx_results[0];

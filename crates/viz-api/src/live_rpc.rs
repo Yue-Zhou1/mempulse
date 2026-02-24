@@ -38,8 +38,8 @@ const SEARCHER_MAX_CANDIDATES: usize = 8;
 
 #[derive(Clone, Debug)]
 struct RpcEndpoint {
-    ws_url: &'static str,
-    http_url: &'static str,
+    ws_url: String,
+    http_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -54,12 +54,12 @@ impl Default for LiveRpcConfig {
         Self {
             endpoints: vec![
                 RpcEndpoint {
-                    ws_url: PRIMARY_PUBLIC_WS_URL,
-                    http_url: PRIMARY_PUBLIC_HTTP_URL,
+                    ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
+                    http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
                 },
                 RpcEndpoint {
-                    ws_url: FALLBACK_PUBLIC_WS_URL,
-                    http_url: FALLBACK_PUBLIC_HTTP_URL,
+                    ws_url: FALLBACK_PUBLIC_WS_URL.to_owned(),
+                    http_url: FALLBACK_PUBLIC_HTTP_URL.to_owned(),
                 },
             ],
             source_id: SourceId::new("rpc-live"),
@@ -95,20 +95,13 @@ impl LiveRpcConfig {
 
         let mut config = Self::default();
         if let Some(ws_url) = ws_override {
-            let ws_url_static: &'static str = Box::leak(ws_url.into_boxed_str());
-            let http_url_static: &'static str = Box::leak(
-                http_override
-                    .unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned())
-                    .into_boxed_str(),
-            );
             config.endpoints = vec![RpcEndpoint {
-                ws_url: ws_url_static,
-                http_url: http_url_static,
+                ws_url,
+                http_url: http_override.unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned()),
             }];
         } else if let Some(http_url) = http_override {
-            let http_url_static: &'static str = Box::leak(http_url.into_boxed_str());
             if let Some(primary) = config.endpoints.first_mut() {
-                primary.http_url = http_url_static;
+                primary.http_url = http_url;
             }
         }
 
@@ -118,11 +111,15 @@ impl LiveRpcConfig {
     }
 
     pub fn primary_ws_url(&self) -> Option<&str> {
-        self.endpoints.first().map(|endpoint| endpoint.ws_url)
+        self.endpoints
+            .first()
+            .map(|endpoint| endpoint.ws_url.as_str())
     }
 
     pub fn primary_http_url(&self) -> Option<&str> {
-        self.endpoints.first().map(|endpoint| endpoint.http_url)
+        self.endpoints
+            .first()
+            .map(|endpoint| endpoint.http_url.as_str())
     }
 
     pub fn source_id(&self) -> &SourceId {
@@ -205,7 +202,7 @@ async fn run_ws_session(
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
-    let (ws_stream, _) = connect_async(endpoint.ws_url)
+    let (ws_stream, _) = connect_async(endpoint.ws_url.as_str())
         .await
         .with_context(|| format!("connect {}", endpoint.ws_url))?;
     let (mut write, mut read) = ws_stream.split();
@@ -307,20 +304,21 @@ async fn process_pending_hash(
     }
 
     let now_unix_ms = current_unix_ms();
-    let fetched_tx = match fetch_transaction_by_hash(client, endpoint.http_url, hash_hex).await {
-        Ok(tx) => tx,
-        Err(err) => {
-            let error_chain = format_error_chain(&err);
-            tracing::warn!(
-                error = %err,
-                error_chain = %error_chain,
-                hash = hash_hex,
-                http_url = endpoint.http_url,
-                "fetch tx by hash failed"
-            );
-            None
-        }
-    };
+    let fetched_tx =
+        match fetch_transaction_by_hash(client, endpoint.http_url.as_str(), hash_hex).await {
+            Ok(tx) => tx,
+            Err(err) => {
+                let error_chain = format_error_chain(&err);
+                tracing::warn!(
+                    error = %err,
+                    error_chain = %error_chain,
+                    hash = hash_hex,
+                    http_url = endpoint.http_url,
+                    "fetch tx by hash failed"
+                );
+                None
+            }
+        };
 
     let feature_analysis = fetched_tx
         .as_ref()

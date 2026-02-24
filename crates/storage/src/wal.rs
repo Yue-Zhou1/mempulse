@@ -37,12 +37,8 @@ impl StorageWal {
             .open(&segment_path)
             .with_context(|| format!("open WAL segment {} for append", segment_path.display()))?;
         let encoded = serde_json::to_string(event).context("serialize WAL event")?;
-        writeln!(file, "{encoded}").with_context(|| {
-            format!(
-                "append WAL event to segment {}",
-                segment_path.display()
-            )
-        })?;
+        writeln!(file, "{encoded}")
+            .with_context(|| format!("append WAL event to segment {}", segment_path.display()))?;
         Ok(())
     }
 
@@ -116,8 +112,8 @@ impl StorageWal {
         for entry in fs::read_dir(&parent)
             .with_context(|| format!("read WAL directory {}", parent.display()))?
         {
-            let entry = entry
-                .with_context(|| format!("read WAL directory entry {}", parent.display()))?;
+            let entry =
+                entry.with_context(|| format!("read WAL directory entry {}", parent.display()))?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -171,9 +167,8 @@ fn read_events_from_path(path: &Path) -> Result<Vec<EventEnvelope>> {
         let line = line.context("read WAL line")?;
         if line.trim().is_empty() {
             continue;
-            }
-        let event: EventEnvelope =
-            serde_json::from_str(&line).context("decode WAL event line")?;
+        }
+        let event: EventEnvelope = serde_json::from_str(&line).context("decode WAL event line")?;
         events.push(event);
     }
     Ok(events)

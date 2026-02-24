@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { resolveApiBase } from './api-base.js';
+import { readWindowRuntimeConfig, resolveUiRuntimeConfig } from './ui-config.js';
 import { mergeTransactionHistory } from './tx-history.js';
 import { normalizeScreenId } from './screen-mode.js';
 import { BlurFade } from './components/magicui/blur-fade.jsx';
@@ -8,11 +9,14 @@ import { NumberTicker } from './components/magicui/number-ticker.jsx';
 import { ShineBorder } from './components/magicui/shine-border.jsx';
 import { cn } from './lib/utils.js';
 
-const refreshIntervalMs = 2000;
-const txPollLimit = 250;
-const featurePollLimit = 600;
-const maxTransactionHistory = 1500;
-const maxRenderedTransactions = 300;
+const snapshotFeatureLimit = 600;
+const snapshotOppLimit = 600;
+const snapshotReplayLimit = 1000;
+const snapshotThrottleMs = 1200;
+const streamBatchLimit = 512;
+const streamIntervalMs = 200;
+const streamInitialReconnectMs = 1000;
+const streamMaxReconnectMs = 30000;
 const storageKey = 'vizApiBase';
 
 function getStoredApiBase() {
@@ -73,6 +77,31 @@ async function fetchJson(apiBase, path) {
   return response.json();
 }
 
+function buildDashboardSnapshotPath(txLimit) {
+  const params = new URLSearchParams({
+    tx_limit: String(txLimit),
+    feature_limit: String(snapshotFeatureLimit),
+    opp_limit: String(snapshotOppLimit),
+    replay_limit: String(snapshotReplayLimit),
+  });
+  return `/dashboard/snapshot?${params.toString()}`;
+}
+
+function resolveStreamUrl(apiBase, afterSeqId) {
+  const url = new URL(apiBase, window.location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/stream`;
+  const params = new URLSearchParams({
+    limit: String(streamBatchLimit),
+    interval_ms: String(streamIntervalMs),
+  });
+  if (Number.isFinite(afterSeqId) && afterSeqId > 0) {
+    params.set('after', String(afterSeqId));
+  }
+  url.search = params.toString();
+  return url.toString();
+}
+
 function SidebarNavRow({ label, value, active = false }) {
   return (
     <button
@@ -117,6 +146,22 @@ export default function App() {
   }
 
   const apiBase = apiConfig.apiBase;
+  const uiConfig = useMemo(
+    () =>
+      resolveUiRuntimeConfig({
+        runtime: readWindowRuntimeConfig(),
+        env: import.meta.env,
+      }),
+    [],
+  );
+  const {
+    snapshotTxLimit,
+    detailCacheLimit,
+    maxTransactionHistory,
+    maxRenderedTransactions,
+    transactionRetentionMs,
+    transactionRetentionMinutes,
+  } = uiConfig;
 
   const [statusMessage, setStatusMessage] = useState('Connecting to API...');
   const [hasError, setHasError] = useState(false);
@@ -141,10 +186,22 @@ export default function App() {
   const [transactionRows, setTransactionRows] = useState([]);
   const [transactionDetailsByHash, setTransactionDetailsByHash] = useState({});
   const transactionRowsRef = useRef([]);
+  const followLatestRef = useRef(followLatest);
+  const latestSeqIdRef = useRef(0);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef(null);
+  const snapshotTimerRef = useRef(null);
+  const streamSocketRef = useRef(null);
+  const snapshotInFlightRef = useRef(false);
+  const nextSnapshotAtRef = useRef(0);
 
   useEffect(() => {
     transactionRowsRef.current = transactionRows;
   }, [transactionRows]);
+
+  useEffect(() => {
+    followLatestRef.current = followLatest;
+  }, [followLatest]);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -164,90 +221,240 @@ export default function App() {
   }, [activeScreen]);
 
   useEffect(() => {
-    let mounted = true;
+    let cancelled = false;
+    const snapshotPath = buildDashboardSnapshotPath(snapshotTxLimit);
 
-    const loadData = async () => {
-      if (!mounted) {
+    const cleanupSocket = () => {
+      if (streamSocketRef.current) {
+        const socket = streamSocketRef.current;
+        streamSocketRef.current = null;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+      }
+    };
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    const clearSnapshotTimer = () => {
+      if (snapshotTimerRef.current) {
+        window.clearTimeout(snapshotTimerRef.current);
+        snapshotTimerRef.current = null;
+      }
+    };
+
+    const applySnapshot = (snapshot, sourceLabel) => {
+      const replay = Array.isArray(snapshot?.replay) ? snapshot.replay : [];
+      const propagation = Array.isArray(snapshot?.propagation) ? snapshot.propagation : [];
+      const opportunities = Array.isArray(snapshot?.opportunities) ? snapshot.opportunities : [];
+      const featureSummary = Array.isArray(snapshot?.feature_summary)
+        ? snapshot.feature_summary
+        : [];
+      const featureDetails = Array.isArray(snapshot?.feature_details)
+        ? snapshot.feature_details
+        : [];
+      const txRecent = Array.isArray(snapshot?.transactions) ? snapshot.transactions : [];
+
+      const nextTransactions = mergeTransactionHistory(
+        transactionRowsRef.current,
+        txRecent,
+        maxTransactionHistory,
+        {
+          nowUnixMs: Date.now(),
+          maxAgeMs: transactionRetentionMs,
+        },
+      );
+      transactionRowsRef.current = nextTransactions;
+
+      setRecentTxRows(txRecent);
+      setTransactionRows(nextTransactions);
+      setTransactionDetailsByHash((current) => {
+        const liveHashes = new Set(nextTransactions.map((row) => row.hash));
+        const next = {};
+        for (const [hash, detail] of Object.entries(current)) {
+          if (liveHashes.has(hash)) {
+            next[hash] = detail;
+          }
+        }
+        return next;
+      });
+      setReplayFrames(replay);
+      setPropagationEdges(propagation);
+      setOpportunityRows(opportunities);
+      setFeatureSummaryRows(featureSummary);
+      setFeatureDetailRows(featureDetails);
+
+      setTimelineIndex((current) => {
+        if (!replay.length) {
+          return 0;
+        }
+        if (followLatestRef.current) {
+          return replay.length - 1;
+        }
+        return Math.min(current, replay.length - 1);
+      });
+
+      setSelectedHash((current) => {
+        if (current && nextTransactions.some((row) => row.hash === current)) {
+          return current;
+        }
+        return nextTransactions[0]?.hash ?? null;
+      });
+      setSelectedOpportunityHash((current) => {
+        if (current && opportunities.some((row) => row.tx_hash === current)) {
+          return current;
+        }
+        return opportunities[0]?.tx_hash ?? null;
+      });
+
+      const latestSeqId = Number.isFinite(snapshot?.latest_seq_id)
+        ? snapshot.latest_seq_id
+        : replay[replay.length - 1]?.seq_hi ?? 0;
+      latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
+
+      const lastUpdated = new Date().toLocaleTimeString();
+      setStatusMessage(
+        `Connected(${sourceLabel}) · replay=${replay.length} · opps=${opportunities.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
+      );
+    };
+
+    const syncSnapshot = async (sourceLabel) => {
+      if (cancelled || snapshotInFlightRef.current) {
         return;
       }
-
-      setStatusMessage(`Loading from ${apiBase} ...`);
-      setHasError(false);
-
+      snapshotInFlightRef.current = true;
       try {
-        const [txRecent, replay, propagation, opportunities, featureSummary, featureDetails] =
-          await Promise.all([
-            fetchJson(apiBase, `/transactions?limit=${txPollLimit}`),
-            fetchJson(apiBase, '/replay'),
-            fetchJson(apiBase, '/propagation'),
-            fetchJson(apiBase, `/opps/recent?limit=${featurePollLimit}`),
-            fetchJson(apiBase, '/features'),
-            fetchJson(apiBase, `/features/recent?limit=${featurePollLimit}`),
-          ]);
-
-        if (!mounted) {
+        const snapshot = await fetchJson(apiBase, snapshotPath);
+        if (cancelled) {
           return;
         }
-
-        const nextTransactions = mergeTransactionHistory(
-          transactionRowsRef.current,
-          txRecent,
-          maxTransactionHistory,
-        );
-        transactionRowsRef.current = nextTransactions;
-
-        setRecentTxRows(txRecent);
-        setTransactionRows(nextTransactions);
-        setReplayFrames(replay);
-        setPropagationEdges(propagation);
-        setOpportunityRows(opportunities);
-        setFeatureSummaryRows(featureSummary);
-        setFeatureDetailRows(featureDetails);
-
-        setTimelineIndex((current) => {
-          if (!replay.length) {
-            return 0;
-          }
-          if (followLatest) {
-            return replay.length - 1;
-          }
-          return Math.min(current, replay.length - 1);
-        });
-
-        setSelectedHash((current) => {
-          if (current && nextTransactions.some((row) => row.hash === current)) {
-            return current;
-          }
-          return nextTransactions[0]?.hash ?? null;
-        });
-        setSelectedOpportunityHash((current) => {
-          if (current && opportunities.some((row) => row.tx_hash === current)) {
-            return current;
-          }
-          return opportunities[0]?.tx_hash ?? null;
-        });
-
-        const lastUpdated = new Date().toLocaleTimeString();
-        setStatusMessage(
-          `Connected · replay=${replay.length} · opps=${opportunities.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · ${lastUpdated}`,
-        );
+        setHasError(false);
+        applySnapshot(snapshot, sourceLabel);
       } catch (error) {
-        if (!mounted) {
+        if (cancelled) {
           return;
         }
         setHasError(true);
-        setStatusMessage(`API unavailable: ${error.message}`);
+        setStatusMessage(`Snapshot sync failed: ${error.message}`);
+      } finally {
+        snapshotInFlightRef.current = false;
       }
     };
 
-    loadData();
-    const timer = window.setInterval(loadData, refreshIntervalMs);
+    const scheduleSnapshot = (sourceLabel, immediate = false) => {
+      if (cancelled || snapshotTimerRef.current) {
+        return;
+      }
+      const now = Date.now();
+      const delay = immediate
+        ? 0
+        : Math.max(0, nextSnapshotAtRef.current - now);
+      snapshotTimerRef.current = window.setTimeout(async () => {
+        snapshotTimerRef.current = null;
+        nextSnapshotAtRef.current = Date.now() + snapshotThrottleMs;
+        await syncSnapshot(sourceLabel);
+      }, delay);
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimerRef.current) {
+        return;
+      }
+      const attempt = reconnectAttemptsRef.current;
+      const delay = Math.min(
+        streamMaxReconnectMs,
+        streamInitialReconnectMs * 2 ** attempt,
+      );
+      reconnectAttemptsRef.current = Math.min(attempt + 1, 12);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connectStream();
+      }, delay);
+    };
+
+    const connectStream = () => {
+      if (cancelled) {
+        return;
+      }
+      cleanupSocket();
+      const streamUrl = resolveStreamUrl(apiBase, latestSeqIdRef.current);
+      const socket = new WebSocket(streamUrl);
+      streamSocketRef.current = socket;
+
+      socket.onopen = () => {
+        reconnectAttemptsRef.current = 0;
+        setHasError(false);
+        scheduleSnapshot('ws-open', true);
+      };
+
+      socket.onmessage = (message) => {
+        if (cancelled) {
+          return;
+        }
+        let payload;
+        try {
+          payload = JSON.parse(message.data);
+        } catch {
+          return;
+        }
+
+        if (payload?.event === 'hello') {
+          scheduleSnapshot('ws-hello', true);
+          return;
+        }
+
+        if (typeof payload?.seq_id !== 'number') {
+          return;
+        }
+
+        const seqId = payload.seq_id;
+        if (seqId <= latestSeqIdRef.current) {
+          return;
+        }
+
+        const hasGap =
+          latestSeqIdRef.current > 0 && seqId > latestSeqIdRef.current + 1;
+        latestSeqIdRef.current = seqId;
+        scheduleSnapshot(hasGap ? 'ws-gap-resync' : 'ws-delta', hasGap);
+      };
+
+      socket.onerror = () => {
+        socket.close();
+      };
+
+      socket.onclose = () => {
+        if (cancelled) {
+          return;
+        }
+        scheduleReconnect();
+      };
+    };
+
+    setStatusMessage(`Connecting stream to ${apiBase} ...`);
+    setHasError(false);
+    scheduleSnapshot('bootstrap', true);
+    connectStream();
 
     return () => {
-      mounted = false;
-      window.clearInterval(timer);
+      cancelled = true;
+      clearReconnectTimer();
+      clearSnapshotTimer();
+      cleanupSocket();
     };
-  }, [apiBase, followLatest]);
+  }, [
+    apiBase,
+    maxTransactionHistory,
+    snapshotTxLimit,
+    transactionRetentionMinutes,
+    transactionRetentionMs,
+  ]);
 
   useEffect(() => {
     if (!dialogHash) {
@@ -266,10 +473,21 @@ export default function App() {
         if (cancelled) {
           return;
         }
-        setTransactionDetailsByHash((current) => ({
-          ...current,
-          [dialogHash]: detail,
-        }));
+        setTransactionDetailsByHash((current) => {
+          const next = {
+            ...current,
+            [dialogHash]: detail,
+          };
+          const hashes = Object.keys(next);
+          if (hashes.length <= detailCacheLimit) {
+            return next;
+          }
+          const evictCount = hashes.length - detailCacheLimit;
+          for (let index = 0; index < evictCount; index += 1) {
+            delete next[hashes[index]];
+          }
+          return next;
+        });
         setDialogLoading(false);
       })
       .catch((error) => {
@@ -485,8 +703,9 @@ export default function App() {
                 {statusMessage}
               </div>
               <div className="mt-1 text-[11px] text-zinc-500">
-                Retaining latest {maxTransactionHistory} transactions; rendering up to{' '}
-                {maxRenderedTransactions} rows.
+                Retaining latest {maxTransactionHistory} transactions from last{' '}
+                {transactionRetentionMinutes} minutes; rendering up to {maxRenderedTransactions}{' '}
+                rows.
               </div>
             </div>
 

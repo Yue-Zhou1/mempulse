@@ -108,7 +108,10 @@ fn wal_segments_roll_over_and_scan_across_segments() {
 
     let scanned = wal.scan(6, 4).expect("scan segmented wal");
     assert_eq!(
-        scanned.into_iter().map(|event| event.seq_id).collect::<Vec<_>>(),
+        scanned
+            .into_iter()
+            .map(|event| event.seq_id)
+            .collect::<Vec<_>>(),
         vec![7, 8, 9, 10]
     );
 

@@ -42,3 +42,24 @@ test('mergeTransactionHistory returns empty rows when max is zero', () => {
   const merged = mergeTransactionHistory([{ hash: '0x01' }], [{ hash: '0x02' }], 0);
   assert.deepEqual(merged, []);
 });
+
+test('mergeTransactionHistory prunes rows older than the live window', () => {
+  const nowUnixMs = 1_000_000;
+  const merged = mergeTransactionHistory(
+    [
+      { hash: '0x01', seen_unix_ms: 989_000 },
+      { hash: '0x02', seen_unix_ms: 995_500 },
+    ],
+    [
+      { hash: '0x03', seen_unix_ms: 999_000 },
+      { hash: '0x02', seen_unix_ms: 995_500 },
+    ],
+    10,
+    { nowUnixMs, maxAgeMs: 10_000 },
+  );
+
+  assert.deepEqual(
+    merged.map((row) => row.hash),
+    ['0x03', '0x02'],
+  );
+});

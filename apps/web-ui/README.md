@@ -38,6 +38,49 @@ and renders:
 - searchable transaction list with protocol/category tags
 - detail pane for transaction metadata + feature-engine analysis
 
+## UI tuning config (recommended)
+
+Use a two-layer config model for memory/perf tuning:
+
+1. Runtime overrides in `runtime-config.js` (preferred for production changes without rebuilds)
+2. Build-time defaults from `VITE_*` env vars
+
+Precedence is: runtime config > env config > built-in defaults.
+
+### Runtime config (no rebuild)
+
+Edit `apps/web-ui/public/runtime-config.js` (or replace the deployed `/runtime-config.js` file):
+
+```js
+window.__MEMPULSE_UI_CONFIG__ = {
+  txSnapshotLimit: 160,
+  txHistoryLimit: 600,
+  txRenderLimit: 120,
+  txRetentionMs: 240000,
+  detailCacheLimit: 128,
+};
+```
+
+Recommended in production:
+- Serve `/runtime-config.js` with short/no-cache headers.
+- Keep values numeric only.
+
+### Env defaults (requires rebuild/restart)
+
+Create `apps/web-ui/.env.local` (or set env vars in CI/CD):
+
+```bash
+VITE_UI_TX_SNAPSHOT_LIMIT=120
+VITE_UI_TX_HISTORY_LIMIT=300
+VITE_UI_TX_RENDER_LIMIT=150
+VITE_UI_TX_RETENTION_MS=300000
+VITE_UI_DETAIL_CACHE_LIMIT=96
+```
+
+Notes:
+- These are build-time frontend variables (`VITE_*`), so changing them requires rebuilding/restarting the UI.
+- They are not secrets; never put credentials in frontend env vars.
+
 ## One-Command Demo
 
 From repository root:

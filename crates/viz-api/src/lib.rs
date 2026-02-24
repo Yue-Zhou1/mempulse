@@ -21,10 +21,12 @@ use replay::{
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, NoopClickHouseSink,
     StorageWriterConfig, spawn_single_writer,
 };
+use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
 
 #[cfg(test)]
@@ -142,6 +144,17 @@ pub struct StreamHello {
     pub message: String,
     pub replay_points: usize,
     pub propagation_edges: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    pub replay: Vec<ReplayPoint>,
+    pub propagation: Vec<PropagationEdge>,
+    pub opportunities: Vec<OpportunityDetail>,
+    pub feature_summary: Vec<FeatureSummary>,
+    pub feature_details: Vec<FeatureDetail>,
+    pub transactions: Vec<TransactionSummary>,
+    pub latest_seq_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -594,6 +607,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/features/recent", get(features_recent))
         .route("/opps", get(opportunities))
         .route("/opps/recent", get(opportunities_recent))
+        .route("/dashboard/snapshot", get(dashboard_snapshot))
         .route("/tx/{hash}", get(transaction_by_hash))
         .route("/sim/{id}", get(sim_by_id))
         .route("/bundle/{id}", get(bundle_by_id))
@@ -769,7 +783,7 @@ fn map_lifecycle_status(status: &TxLifecycleStatus) -> (String, Option<String>) 
     }
 }
 
-fn event_payload_type(payload: &EventPayload) -> &'static str {
+fn event_payload_type(payload: &EventPayload) -> &str {
     match payload {
         EventPayload::TxSeen(_) => "TxSeen",
         EventPayload::TxFetched(_) => "TxFetched",
@@ -997,6 +1011,42 @@ struct TransactionsQuery {
     limit: Option<usize>,
     min_score: Option<u32>,
     status: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct DashboardSnapshotQuery {
+    tx_limit: Option<usize>,
+    feature_limit: Option<usize>,
+    opp_limit: Option<usize>,
+    min_score: Option<u32>,
+    replay_limit: Option<usize>,
+}
+
+async fn dashboard_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<DashboardSnapshotQuery>,
+) -> Json<DashboardSnapshot> {
+    let tx_limit = query.tx_limit.unwrap_or(250).clamp(1, 500);
+    let feature_limit = query.feature_limit.unwrap_or(600).clamp(1, 2_000);
+    let opp_limit = query.opp_limit.unwrap_or(600).clamp(1, 2_000);
+    let min_score = query.min_score.unwrap_or(0);
+    let replay_limit = query
+        .replay_limit
+        .unwrap_or(state.downsample_limit)
+        .clamp(50, 5_000);
+
+    let replay_points = state.provider.replay_points();
+    let latest_seq_id = replay_points.last().map(|point| point.seq_hi).unwrap_or(0);
+
+    Json(DashboardSnapshot {
+        replay: downsample(&replay_points, replay_limit),
+        propagation: downsample(&state.provider.propagation_edges(), state.downsample_limit),
+        opportunities: state.provider.opportunities(opp_limit, min_score),
+        feature_summary: downsample(&state.provider.feature_summary(), state.downsample_limit),
+        feature_details: state.provider.feature_details(feature_limit),
+        transactions: state.provider.recent_transactions(tx_limit),
+        latest_seq_id,
+    })
 }
 
 async fn transactions(
@@ -1273,32 +1323,89 @@ fn sim_id_for_result(result: &RelayDryRunResult) -> String {
     )
 }
 
-async fn stream(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct StreamQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+    interval_ms: Option<u64>,
+}
+
+async fn stream(
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
     let hello = StreamHello {
         event: "hello".to_owned(),
         message: "viz-api stream connected".to_owned(),
         replay_points: state.provider.replay_points().len(),
         propagation_edges: state.provider.propagation_edges().len(),
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, hello))
+    let after_seq_id = query.after.unwrap_or(0);
+    let batch_limit = query.limit.unwrap_or(256).clamp(1, 5_000);
+    let interval_ms = query.interval_ms.unwrap_or(250).clamp(50, 5_000);
+    let provider = state.provider.clone();
+    ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            hello,
+            provider,
+            after_seq_id,
+            batch_limit,
+            interval_ms,
+        )
+    })
 }
 
-async fn handle_socket(mut socket: WebSocket, hello: StreamHello) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    hello: StreamHello,
+    provider: Arc<dyn VizDataProvider>,
+    mut after_seq_id: u64,
+    batch_limit: usize,
+    interval_ms: u64,
+) {
     if let Ok(payload) = serde_json::to_string(&hello) {
         if socket.send(Message::Text(payload.into())).await.is_err() {
             return;
         }
     }
 
-    while let Some(Ok(message)) = socket.recv().await {
-        match message {
-            Message::Close(_) => break,
-            Message::Ping(data) => {
-                if socket.send(Message::Pong(data)).await.is_err() {
-                    break;
+    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let events = provider.events(after_seq_id, &[], batch_limit);
+                if events.is_empty() {
+                    continue;
+                }
+                for event in events {
+                    if event.seq_id <= after_seq_id {
+                        continue;
+                    }
+                    after_seq_id = event.seq_id;
+                    let payload = match serde_json::to_string(&event) {
+                        Ok(payload) => payload,
+                        Err(_) => continue,
+                    };
+                    if socket.send(Message::Text(payload.into())).await.is_err() {
+                        return;
+                    }
                 }
             }
-            _ => {}
+            maybe_message = socket.recv() => match maybe_message {
+                None => break,
+                Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(data))) => {
+                    if socket.send(Message::Pong(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            },
         }
     }
 }
@@ -1875,6 +1982,30 @@ mod tests {
         let payload: Vec<TransactionSummary> = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0].hash, "0x01");
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_route_returns_aggregated_payload() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/snapshot?tx_limit=1&feature_limit=1&opp_limit=1&replay_limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: DashboardSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.transactions.len(), 1);
+        assert_eq!(payload.feature_details.len(), 1);
+        assert_eq!(payload.opportunities.len(), 1);
+        assert!(!payload.replay.is_empty());
+        assert_eq!(payload.latest_seq_id, 3);
     }
 
     #[tokio::test]

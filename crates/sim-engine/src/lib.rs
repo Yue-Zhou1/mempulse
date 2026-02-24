@@ -5,8 +5,8 @@ mod state_provider;
 use anyhow::Result;
 use common::{Address, TxHash};
 use event_log::TxDecoded;
-use revm::context_interface::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context_interface::ContextTr;
+use revm::context_interface::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::database::InMemoryDB;
 use revm::primitives::{Address as RevmAddress, Bytes, U256, hardfork::SpecId};
 use revm::state::AccountInfo;
@@ -129,8 +129,11 @@ pub fn simulate_with_mode(
                 let success = result_and_state.result.is_success();
                 let state_diff_hash = hash_state_diff(&result_and_state.state);
                 let fail_category = categorize_execution_result(&result_and_state.result);
-                let trace_id =
-                    trace_id_from_execution(tx.decoded.hash, &result_and_state.result, state_diff_hash);
+                let trace_id = trace_id_from_execution(
+                    tx.decoded.hash,
+                    &result_and_state.result,
+                    state_diff_hash,
+                );
 
                 aggregate.update(tx.decoded.hash);
                 aggregate.update(gas_used.to_le_bytes());
@@ -291,7 +294,9 @@ fn categorize_execution_result(
     }
 }
 
-fn categorize_simulation_error<DBError>(error: &EVMError<DBError, InvalidTransaction>) -> SimulationFailCategory {
+fn categorize_simulation_error<DBError>(
+    error: &EVMError<DBError, InvalidTransaction>,
+) -> SimulationFailCategory {
     match error {
         EVMError::Transaction(invalid) => match invalid {
             InvalidTransaction::NonceTooHigh { .. } | InvalidTransaction::NonceTooLow { .. } => {
