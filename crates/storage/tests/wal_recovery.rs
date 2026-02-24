@@ -90,3 +90,58 @@ fn wal_scan_returns_events_after_seq_with_limit() {
 
     let _ = std::fs::remove_file(wal_path);
 }
+
+#[test]
+fn wal_segments_roll_over_and_scan_across_segments() {
+    let wal_path = temp_wal_path("segments");
+    let wal = StorageWal::with_segment_size(&wal_path, 256).expect("create segmented wal");
+
+    for seq in 1_u64..=12_u64 {
+        wal.append_event(&decoded_event(seq, seq as u8))
+            .expect("append event to segmented wal");
+    }
+
+    let recovered = wal.recover_events().expect("recover segmented wal events");
+    assert_eq!(recovered.len(), 12);
+    assert_eq!(recovered.first().map(|event| event.seq_id), Some(1));
+    assert_eq!(recovered.last().map(|event| event.seq_id), Some(12));
+
+    let scanned = wal.scan(6, 4).expect("scan segmented wal");
+    assert_eq!(
+        scanned.into_iter().map(|event| event.seq_id).collect::<Vec<_>>(),
+        vec![7, 8, 9, 10]
+    );
+
+    let base_name = wal
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("wal base filename");
+    let segment_prefix = format!("{base_name}.seg.");
+    let parent = wal.path().parent().expect("wal parent directory");
+    let segment_count = std::fs::read_dir(parent)
+        .expect("list wal parent")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&segment_prefix))
+        })
+        .count();
+    assert!(
+        segment_count >= 2,
+        "expected multiple WAL segments, got {segment_count}"
+    );
+
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(&segment_prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(wal_path);
+}

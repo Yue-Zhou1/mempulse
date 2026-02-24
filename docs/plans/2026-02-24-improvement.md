@@ -370,7 +370,7 @@ Alerts:
 
 - [x]  Global Sequencer (`global_seq + WAL append + broadcast`)
 - [x]  Sort all visible collection outputs
-- [ ]  Write rule versions into events
+- [x]  Write rule versions into events
 - [x]  Determinism replay test (checkpoint parity)
 
 **Acceptance**
@@ -383,7 +383,7 @@ Alerts:
 
 - [x]  devp2p runtime trait abstraction/integration (or integrate with reth-network)
 - [x]  All queues bounded + drop events
-- [ ]  WAL segments + scan API
+- [x]  WAL segments + scan API
 - [x]  ClickHouse sink batch writes (acceleration only)
 
 **Acceptance**
