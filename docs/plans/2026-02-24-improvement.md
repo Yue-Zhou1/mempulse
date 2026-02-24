@@ -397,8 +397,8 @@ Alerts:
 - [x]  checkpoint/snapshot
 - [x]  Reorg invalidation/reopen event closed loop
 - [x]  Ranking componentization + stable sorting
-- [ ]  Sim trace capture + improved failure categorization
-- [ ]  Relay health + circuit breaker/downweighting
+- [x]  Sim trace capture + improved failure categorization
+- [x]  Relay health + circuit breaker/downweighting
 
 **Acceptance**
 

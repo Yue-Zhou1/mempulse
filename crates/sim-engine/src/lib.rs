@@ -5,6 +5,7 @@ mod state_provider;
 use anyhow::Result;
 use common::{Address, TxHash};
 use event_log::TxDecoded;
+use revm::context_interface::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
 use revm::context_interface::ContextTr;
 use revm::database::InMemoryDB;
 use revm::primitives::{Address as RevmAddress, Bytes, U256, hardfork::SpecId};
@@ -36,6 +37,8 @@ pub struct TxSimulationResult {
     pub success: bool,
     pub gas_used: u64,
     pub state_diff_hash: TxHash,
+    pub fail_category: Option<SimulationFailCategory>,
+    pub trace_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,6 +53,15 @@ pub struct SimulationTxInput {
     pub decoded: TxDecoded,
     #[serde(default)]
     pub calldata: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SimulationFailCategory {
+    Revert,
+    OutOfGas,
+    NonceMismatch,
+    StateMismatch,
+    Unknown,
 }
 
 #[derive(Clone, Copy)]
@@ -111,23 +123,55 @@ pub fn simulate_with_mode(
     let mut tx_results = Vec::with_capacity(txs.len());
     for tx in txs {
         let tx_env = tx_env_from_input(chain_context, tx);
-        let result_and_state = evm.transact(tx_env)?;
-        let gas_used = result_and_state.result.gas_used();
-        let success = result_and_state.result.is_success();
-        let state_diff_hash = hash_state_diff(&result_and_state.state);
+        match evm.transact(tx_env) {
+            Ok(result_and_state) => {
+                let gas_used = result_and_state.result.gas_used();
+                let success = result_and_state.result.is_success();
+                let state_diff_hash = hash_state_diff(&result_and_state.state);
+                let fail_category = categorize_execution_result(&result_and_state.result);
+                let trace_id =
+                    trace_id_from_execution(tx.decoded.hash, &result_and_state.result, state_diff_hash);
 
-        aggregate.update(tx.decoded.hash);
-        aggregate.update(gas_used.to_le_bytes());
-        aggregate.update([u8::from(success)]);
-        aggregate.update(state_diff_hash);
+                aggregate.update(tx.decoded.hash);
+                aggregate.update(gas_used.to_le_bytes());
+                aggregate.update([u8::from(success)]);
+                aggregate.update(state_diff_hash);
+                aggregate.update(trace_id.to_le_bytes());
+                let fail_tag = fail_category.map_or(0_u8, fail_category_tag);
+                aggregate.update([fail_tag]);
 
-        evm.db().commit(result_and_state.state);
-        tx_results.push(TxSimulationResult {
-            hash: tx.decoded.hash,
-            success,
-            gas_used,
-            state_diff_hash,
-        });
+                evm.db().commit(result_and_state.state);
+                tx_results.push(TxSimulationResult {
+                    hash: tx.decoded.hash,
+                    success,
+                    gas_used,
+                    state_diff_hash,
+                    fail_category,
+                    trace_id,
+                });
+            }
+            Err(error) => {
+                let fail_category = categorize_simulation_error(&error);
+                let trace_id = trace_id_from_error(tx.decoded.hash, &error);
+                let state_diff_hash = [0_u8; 32];
+
+                aggregate.update(tx.decoded.hash);
+                aggregate.update(0_u64.to_le_bytes());
+                aggregate.update([0_u8]);
+                aggregate.update(state_diff_hash);
+                aggregate.update(trace_id.to_le_bytes());
+                aggregate.update([fail_category_tag(fail_category)]);
+
+                tx_results.push(TxSimulationResult {
+                    hash: tx.decoded.hash,
+                    success: false,
+                    gas_used: 0,
+                    state_diff_hash,
+                    fail_category: Some(fail_category),
+                    trace_id,
+                });
+            }
+        }
     }
 
     Ok(SimulationBatchResult {
@@ -232,6 +276,74 @@ fn hash_state_diff(state: &revm::state::EvmState) -> TxHash {
     }
 
     hasher.finalize().into()
+}
+
+fn categorize_execution_result(
+    result: &ExecutionResult<HaltReason>,
+) -> Option<SimulationFailCategory> {
+    match result {
+        ExecutionResult::Success { .. } => None,
+        ExecutionResult::Revert { .. } => Some(SimulationFailCategory::Revert),
+        ExecutionResult::Halt { reason, .. } => match reason {
+            HaltReason::OutOfGas(_) => Some(SimulationFailCategory::OutOfGas),
+            _ => Some(SimulationFailCategory::Unknown),
+        },
+    }
+}
+
+fn categorize_simulation_error<DBError>(error: &EVMError<DBError, InvalidTransaction>) -> SimulationFailCategory {
+    match error {
+        EVMError::Transaction(invalid) => match invalid {
+            InvalidTransaction::NonceTooHigh { .. } | InvalidTransaction::NonceTooLow { .. } => {
+                SimulationFailCategory::NonceMismatch
+            }
+            InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+            | InvalidTransaction::GasFloorMoreThanGasLimit { .. }
+            | InvalidTransaction::GasPriceLessThanBasefee => SimulationFailCategory::OutOfGas,
+            _ => SimulationFailCategory::Unknown,
+        },
+        EVMError::Database(_) => SimulationFailCategory::StateMismatch,
+        EVMError::Header(_) | EVMError::Custom(_) => SimulationFailCategory::Unknown,
+    }
+}
+
+fn trace_id_from_execution(
+    hash: TxHash,
+    result: &ExecutionResult<HaltReason>,
+    state_diff_hash: TxHash,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(hash);
+    hasher.update(format!("{result:?}").as_bytes());
+    hasher.update(state_diff_hash);
+    digest_trace_id(hasher)
+}
+
+fn trace_id_from_error<DBError: std::fmt::Debug>(
+    hash: TxHash,
+    error: &EVMError<DBError, InvalidTransaction>,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(hash);
+    hasher.update(format!("{error:?}").as_bytes());
+    digest_trace_id(hasher)
+}
+
+fn digest_trace_id(hasher: Sha256) -> u64 {
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn fail_category_tag(category: SimulationFailCategory) -> u8 {
+    match category {
+        SimulationFailCategory::Revert => 1,
+        SimulationFailCategory::OutOfGas => 2,
+        SimulationFailCategory::NonceMismatch => 3,
+        SimulationFailCategory::StateMismatch => 4,
+        SimulationFailCategory::Unknown => 5,
+    }
 }
 
 fn to_revm_address(address: Address) -> RevmAddress {

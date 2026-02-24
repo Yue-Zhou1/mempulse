@@ -59,6 +59,61 @@ async fn relay_submission_dry_run_retries_and_records_trace() {
     server.abort();
 }
 
+#[tokio::test]
+async fn relay_health_downweights_and_opens_circuit_after_repeated_failures() {
+    let state = MockRelayState {
+        requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = Router::new()
+        .route("/relay/v1/builder/blocks", post(mock_relay_always_fails))
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        serve(listener, app).await.unwrap();
+    });
+
+    let client = RelayClient::new(RelayClientConfig {
+        relay_url: format!("http://{addr}/relay/v1/builder/blocks"),
+        max_retries: 0,
+        initial_backoff_ms: 1,
+        request_timeout_ms: 2_000,
+    })
+    .expect("client");
+    let template = BlockTemplate {
+        slot: 1234,
+        parent_hash: "0x11".to_owned(),
+        block_hash: "0x22".to_owned(),
+        builder_pubkey: "0x33".to_owned(),
+        tx_count: 12,
+        gas_used: 18_500_000,
+    };
+
+    let first = client.submit_dry_run(&template).await.expect("first dry-run");
+    assert!(!first.accepted);
+    assert_eq!(first.final_state, "exhausted");
+    assert!(client.health_status().downweighted);
+    assert!(!client.health_status().circuit_open);
+
+    let second = client
+        .submit_dry_run(&template)
+        .await
+        .expect("second dry-run");
+    assert!(!second.accepted);
+    assert_eq!(second.final_state, "exhausted");
+    let requests_after_second = state.requests.load(Ordering::SeqCst);
+    assert!(requests_after_second >= 2);
+    assert!(client.health_status().circuit_open);
+
+    let third = client.submit_dry_run(&template).await.expect("third dry-run");
+    assert!(!third.accepted);
+    assert_eq!(third.final_state, "circuit_open");
+    assert_eq!(state.requests.load(Ordering::SeqCst), requests_after_second);
+
+    server.abort();
+}
+
 async fn mock_relay(State(state): State<MockRelayState>) -> (StatusCode, Json<serde_json::Value>) {
     let n = state.requests.fetch_add(1, Ordering::SeqCst);
     if n == 0 {
@@ -73,5 +128,15 @@ async fn mock_relay(State(state): State<MockRelayState>) -> (StatusCode, Json<se
             "status": "ok",
             "relay": "mock"
         })),
+    )
+}
+
+async fn mock_relay_always_fails(
+    State(state): State<MockRelayState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "relay overloaded" })),
     )
 }
