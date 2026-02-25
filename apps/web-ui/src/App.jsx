@@ -7,6 +7,12 @@ import {
 } from './market-stats.js';
 import { mergeTransactionHistory } from './tx-history.js';
 import { normalizeScreenId } from './screen-mode.js';
+import {
+  MAINNET_FILTER_ALL,
+  MAINNET_FILTER_OPTIONS,
+  filterRowsByMainnet,
+  normalizeMainnetFilter,
+} from './mainnet-filter.js';
 import { cn } from './lib/utils.js';
 
 const snapshotFeatureLimit = 600;
@@ -25,6 +31,18 @@ const archiveOppPageSize = 20;
 const storageKey = 'vizApiBase';
 const tickerPageSize = 50;
 const tickerPageLimit = 10;
+const MAINNET_LABEL_BY_CHAIN_ID = new Map([
+  [1, 'Ethereum'],
+  [8453, 'Base'],
+  [10, 'Optimism'],
+  [137, 'Polygon'],
+]);
+const MAINNET_ROW_CLASS_BY_LABEL = new Map([
+  ['Ethereum', 'bg-[#fffdf7] hover:bg-[#f6f1e4]'],
+  ['Base', 'bg-[#f2f8ff] hover:bg-[#e6f1ff]'],
+  ['Optimism', 'bg-[#fff1f1] hover:bg-[#ffe3e3]'],
+  ['Polygon', 'bg-[#f4f1ff] hover:bg-[#ebe5ff]'],
+]);
 
 function getStoredApiBase() {
   try {
@@ -88,6 +106,122 @@ function formatTickerTime(unixMs) {
   const mi = String(date.getMinutes()).padStart(2, '0');
   const ss = String(date.getSeconds()).padStart(2, '0');
   return `${yyyy}/${mm}/${dd} ${hh}:${mi}:${ss}`;
+}
+
+function parseChainIdValue(chainId) {
+  if (Number.isFinite(chainId)) {
+    return Number(chainId);
+  }
+  if (typeof chainId !== 'string') {
+    return null;
+  }
+  const trimmed = chainId.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveMainnetLabel(chainId, sourceId) {
+  const normalizedChainId = parseChainIdValue(chainId);
+  if (normalizedChainId != null) {
+    const knownLabel = MAINNET_LABEL_BY_CHAIN_ID.get(normalizedChainId);
+    if (knownLabel) {
+      return knownLabel;
+    }
+    return `Chain ${normalizedChainId}`;
+  }
+
+  const normalizedSource = String(sourceId ?? '').toLowerCase();
+  if (!normalizedSource) {
+    return 'Unknown';
+  }
+  if (normalizedSource.includes('base')) {
+    return 'Base';
+  }
+  if (normalizedSource.includes('optimism')) {
+    return 'Optimism';
+  }
+  if (normalizedSource.includes('polygon')) {
+    return 'Polygon';
+  }
+  if (normalizedSource.includes('eth') || normalizedSource.includes('ethereum')) {
+    return 'Ethereum';
+  }
+  return 'Unknown';
+}
+
+function resolveMainnetRowClasses(mainnetLabel) {
+  return MAINNET_ROW_CLASS_BY_LABEL.get(mainnetLabel) ?? 'bg-[#fffdf7] hover:bg-black/5';
+}
+
+function normalizeChainStatusRows(rawRows) {
+  if (!Array.isArray(rawRows)) {
+    return [];
+  }
+  return rawRows
+    .filter((row) => row && typeof row === 'object')
+    .map((row) => ({
+      chain_key: String(row.chain_key ?? 'unknown'),
+      chain_id: Number.isFinite(row.chain_id) ? Number(row.chain_id) : null,
+      source_id: String(row.source_id ?? '-'),
+      state: String(row.state ?? 'unknown'),
+      endpoint_index: Number.isFinite(row.endpoint_index) ? Number(row.endpoint_index) : 0,
+      endpoint_count: Number.isFinite(row.endpoint_count) ? Number(row.endpoint_count) : 0,
+      ws_url: String(row.ws_url ?? ''),
+      http_url: String(row.http_url ?? ''),
+      last_pending_unix_ms: Number.isFinite(row.last_pending_unix_ms)
+        ? Number(row.last_pending_unix_ms)
+        : null,
+      silent_for_ms: Number.isFinite(row.silent_for_ms) ? Number(row.silent_for_ms) : null,
+      updated_unix_ms: Number.isFinite(row.updated_unix_ms) ? Number(row.updated_unix_ms) : null,
+      last_error: row.last_error ? String(row.last_error) : '',
+      rotation_count: Number.isFinite(row.rotation_count) ? Number(row.rotation_count) : 0,
+    }))
+    .sort((left, right) => left.chain_key.localeCompare(right.chain_key));
+}
+
+function formatChainStatusChainKey(chainKey) {
+  const normalized = String(chainKey ?? '').trim();
+  if (!normalized) {
+    return 'Unknown';
+  }
+  const first = normalized.split('-')[0] ?? normalized;
+  return first.charAt(0).toUpperCase() + first.slice(1);
+}
+
+function formatDurationToken(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) {
+    return '0s';
+  }
+  const totalSeconds = Math.floor(durationMs / 1000);
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m`;
+  }
+  const totalHours = Math.floor(totalMinutes / 60);
+  return `${totalHours}h`;
+}
+
+function chainStatusTone(state) {
+  const normalized = String(state ?? '').toLowerCase();
+  if (normalized === 'active') {
+    return 'bg-[#e7f1e8] text-[#244d30] border-[#2e5f3a]';
+  }
+  if (normalized === 'connecting' || normalized === 'subscribed' || normalized === 'booting') {
+    return 'bg-[#fff2dc] text-[#6d4c18] border-[#8a621f]';
+  }
+  if (normalized === 'rotating') {
+    return 'bg-[#ebe5ff] text-[#3f2f72] border-[#5a4aa2]';
+  }
+  if (normalized === 'silent_timeout' || normalized === 'error') {
+    return 'bg-[#fde8e8] text-[#6b2020] border-[#7a2d2d]';
+  }
+  return 'bg-[#fffdf7] text-zinc-700 border-zinc-700';
 }
 
 async function fetchJson(apiBase, path) {
@@ -368,6 +502,140 @@ function RollingPercent({ value, durationMs = 520, className, suffix = '%' }) {
   );
 }
 
+function NewspaperFilterSelect({
+  id,
+  value,
+  onChange,
+  options,
+  label = 'Mainnet',
+  compact = false,
+  ariaLabel,
+  className,
+}) {
+  const containerRef = useRef(null);
+  const [isOpen, setIsOpen] = useState(false);
+  const selectedOption = useMemo(
+    () => options.find((option) => option.value === value) ?? options[0] ?? null,
+    [options, value],
+  );
+  const triggerLabel = selectedOption?.label ?? 'Select Mainnet';
+
+  const menuId = `${id}-menu`;
+  const triggerId = `${id}-trigger`;
+
+  const selectOption = useCallback((nextValue) => {
+    if (typeof onChange === 'function') {
+      onChange({ target: { value: nextValue } });
+    }
+    setIsOpen(false);
+  }, [onChange]);
+
+  const onTriggerClick = useCallback(() => {
+    setIsOpen((current) => !current);
+  }, []);
+
+  const onMenuClick = useCallback((event) => {
+    const node = event.target;
+    if (!(node instanceof Element)) {
+      return;
+    }
+    const optionNode = node.closest('[data-option-value]');
+    if (!(optionNode instanceof HTMLElement)) {
+      return;
+    }
+    const nextValue = optionNode.getAttribute('data-option-value');
+    if (!nextValue) {
+      return;
+    }
+    selectOption(nextValue);
+  }, [selectOption]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return undefined;
+    }
+    const onPointerDown = (event) => {
+      const node = event.target;
+      if (!(node instanceof Node)) {
+        return;
+      }
+      if (!containerRef.current?.contains(node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    setIsOpen(false);
+  }, [value]);
+
+  return (
+    <div
+      className={cn('news-filter-control', compact ? 'news-filter-control-compact' : '', className)}
+      ref={containerRef}
+    >
+      <span className="news-filter-label news-mono">{label}</span>
+      <div className={cn('news-filter-dropdown', isOpen ? 'news-filter-dropdown-active' : '')}>
+        <button
+          type="button"
+          id={triggerId}
+          aria-expanded={isOpen}
+          aria-haspopup="listbox"
+          aria-controls={menuId}
+          onClick={onTriggerClick}
+          className="news-filter-trigger"
+          aria-label={ariaLabel ?? `${label}: ${triggerLabel}`}
+        >
+          <span className="news-filter-trigger-text">{triggerLabel}</span>
+          <span
+            className={cn('news-filter-arrow news-mono', isOpen ? 'news-filter-arrow-open' : '')}
+            aria-hidden="true"
+          >
+            ▼
+          </span>
+        </button>
+        <div
+          id={menuId}
+          role="listbox"
+          aria-labelledby={triggerId}
+          className="news-filter-menu"
+        >
+          <ul className="news-filter-list" onClick={onMenuClick}>
+            {options.map((option, index) => {
+              const isSelected = option.value === value;
+              return (
+                <li key={option.value} className="news-filter-item">
+                  <div
+                    className={cn(
+                      'news-filter-option',
+                      isSelected ? 'news-filter-option-active' : '',
+                    )}
+                    role="option"
+                    aria-selected={isSelected}
+                    data-option-value={option.value}
+                  >
+                    <span>{option.label}</span>
+                    {isSelected ? <span className="news-filter-option-mark">•</span> : null}
+                  </div>
+                  {index < options.length - 1 ? <div className="news-filter-separator" aria-hidden="true" /> : null}
+                </li>
+              );
+            })}
+          </ul>
+          <div className="news-filter-menu-footer news-mono">
+            <span>Vol. Mainnet</span>
+            <span>{triggerLabel}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const apiConfig = resolveApiBase({
     search: window.location.search,
@@ -403,6 +671,10 @@ export default function App() {
     normalizeScreenId(window.location.hash.replace(/^#/, '')),
   );
   const [query, setQuery] = useState('');
+  const [chainStatusRows, setChainStatusRows] = useState([]);
+  const [liveMainnetFilter, setLiveMainnetFilter] = useState(MAINNET_FILTER_ALL);
+  const [archiveMainnetFilter, setArchiveMainnetFilter] = useState(MAINNET_FILTER_ALL);
+  const [showTickerFilters, setShowTickerFilters] = useState(false);
   const [transactionPage, setTransactionPage] = useState(1);
   const [timelineIndex, setTimelineIndex] = useState(0);
   const [followLatest, setFollowLatest] = useState(true);
@@ -457,7 +729,7 @@ export default function App() {
 
   useEffect(() => {
     setTransactionPage(1);
-  }, [query]);
+  }, [query, liveMainnetFilter]);
 
   const closeDialog = useCallback(() => {
     setDialogHash(null);
@@ -664,6 +936,7 @@ export default function App() {
         ? snapshot.feature_details
         : [];
       const txRecent = Array.isArray(snapshot?.transactions) ? snapshot.transactions : [];
+      const chainStatus = normalizeChainStatusRows(snapshot?.chain_ingest_status);
 
       const nextTransactions = mergeTransactionHistory(
         transactionRowsRef.current,
@@ -693,6 +966,7 @@ export default function App() {
       setOpportunityRows(opportunities);
       setFeatureSummaryRows(featureSummary);
       setFeatureDetailRows(featureDetails);
+      setChainStatusRows(chainStatus);
       setMarketStats((current) =>
         resolveMarketStatsSnapshot(snapshot?.market_stats, current),
       );
@@ -935,25 +1209,40 @@ export default function App() {
   }, [featureDetailRows]);
 
   const filteredTransactions = useMemo(() => {
+    const scopedRows = filterRowsByMainnet(
+      transactionRows,
+      (row) => resolveMainnetLabel(row.chain_id, row.source_id),
+      liveMainnetFilter,
+    );
     const needle = query.trim().toLowerCase();
     if (!needle) {
-      return transactionRows;
+      return scopedRows;
     }
 
-    return transactionRows.filter((row) => {
+    return scopedRows.filter((row) => {
       const feature = featureByHash.get(row.hash);
       return (
         row.hash?.toLowerCase().includes(needle) ||
         row.peer?.toLowerCase().includes(needle) ||
         row.sender?.toLowerCase().includes(needle) ||
         row.source_id?.toLowerCase().includes(needle) ||
+        resolveMainnetLabel(row.chain_id, row.source_id).toLowerCase().includes(needle) ||
         String(row.tx_type ?? '').toLowerCase().includes(needle) ||
         String(row.nonce ?? '').includes(needle) ||
         feature?.protocol?.toLowerCase().includes(needle) ||
         feature?.category?.toLowerCase().includes(needle)
       );
     });
-  }, [featureByHash, query, transactionRows]);
+  }, [featureByHash, liveMainnetFilter, query, transactionRows]);
+  const filteredOpportunityRows = useMemo(
+    () =>
+      filterRowsByMainnet(
+        opportunityRows,
+        (row) => resolveMainnetLabel(row.chain_id, row.source_id),
+        liveMainnetFilter,
+      ),
+    [liveMainnetFilter, opportunityRows],
+  );
 
   const selectedTransaction = useMemo(
     () => transactionRows.find((row) => row.hash === selectedHash) ?? null,
@@ -980,8 +1269,8 @@ export default function App() {
     return recentTxRows.find((row) => row.hash === selectedTransaction.hash) ?? null;
   }, [recentTxRows, selectedTransaction]);
   const selectedOpportunity = useMemo(
-    () => opportunityRows.find((row) => opportunityRowKey(row) === selectedOpportunityKey) ?? null,
-    [opportunityRows, selectedOpportunityKey],
+    () => filteredOpportunityRows.find((row) => opportunityRowKey(row) === selectedOpportunityKey) ?? null,
+    [filteredOpportunityRows, selectedOpportunityKey],
   );
   const selectedArchiveTx = useMemo(
     () => archiveTxRows.find((row) => row.hash === selectedArchiveTxHash) ?? null,
@@ -991,6 +1280,18 @@ export default function App() {
     () => archiveOppRows.find((row) => opportunityRowKey(row) === selectedArchiveOppKey) ?? null,
     [archiveOppRows, selectedArchiveOppKey],
   );
+  const selectedTransactionMainnet = selectedTransaction
+    ? resolveMainnetLabel(selectedTransaction.chain_id, selectedTransaction.source_id)
+    : '-';
+  const selectedOpportunityMainnet = selectedOpportunity
+    ? resolveMainnetLabel(selectedOpportunity.chain_id, selectedOpportunity.source_id)
+    : '-';
+  const selectedArchiveTxMainnet = selectedArchiveTx
+    ? resolveMainnetLabel(selectedArchiveTx.chain_id, selectedArchiveTx.source_id)
+    : '-';
+  const selectedArchiveOppMainnet = selectedArchiveOpp
+    ? resolveMainnetLabel(selectedArchiveOpp.chain_id, selectedArchiveOpp.source_id)
+    : '-';
 
   const dialogTransaction = useMemo(() => {
     if (!dialogHash) {
@@ -1016,6 +1317,10 @@ export default function App() {
   const detailSeenUnixMs = dialogDetail?.first_seen_unix_ms ?? dialogTransaction?.seen_unix_ms;
   const detailSeenAt = formatTime(detailSeenUnixMs);
   const detailSeenRelative = formatRelativeTime(detailSeenUnixMs);
+  const dialogMainnet = resolveMainnetLabel(
+    dialogDetail?.chain_id ?? dialogTransaction?.chain_id,
+    dialogTransaction?.source_id ?? dialogDetail?.source_id,
+  );
 
   const currentFrame = replayFrames[timelineIndex] ?? null;
   const latestReplayFrames = useMemo(
@@ -1049,32 +1354,44 @@ export default function App() {
   );
   const archiveNeedle = archiveQuery.trim().toLowerCase();
   const filteredArchiveTxRows = useMemo(() => {
+    const scopedRows = filterRowsByMainnet(
+      archiveTxRows,
+      (row) => resolveMainnetLabel(row.chain_id, row.source_id),
+      archiveMainnetFilter,
+    );
     if (!archiveNeedle) {
-      return archiveTxRows;
+      return scopedRows;
     }
-    return archiveTxRows.filter((row) => (
+    return scopedRows.filter((row) => (
       row.hash?.toLowerCase().includes(archiveNeedle) ||
       row.sender?.toLowerCase().includes(archiveNeedle) ||
       row.peer?.toLowerCase().includes(archiveNeedle) ||
+      resolveMainnetLabel(row.chain_id, row.source_id).toLowerCase().includes(archiveNeedle) ||
       row.protocol?.toLowerCase().includes(archiveNeedle) ||
       row.category?.toLowerCase().includes(archiveNeedle) ||
       row.lifecycle_status?.toLowerCase().includes(archiveNeedle) ||
       String(row.nonce ?? '').includes(archiveNeedle)
     ));
-  }, [archiveNeedle, archiveTxRows]);
+  }, [archiveMainnetFilter, archiveNeedle, archiveTxRows]);
   const filteredArchiveOppRows = useMemo(() => {
+    const scopedRows = filterRowsByMainnet(
+      archiveOppRows,
+      (row) => resolveMainnetLabel(row.chain_id, row.source_id),
+      archiveMainnetFilter,
+    );
     if (!archiveNeedle) {
-      return archiveOppRows;
+      return scopedRows;
     }
-    return archiveOppRows.filter((row) => (
+    return scopedRows.filter((row) => (
       row.tx_hash?.toLowerCase().includes(archiveNeedle) ||
       row.strategy?.toLowerCase().includes(archiveNeedle) ||
+      resolveMainnetLabel(row.chain_id, row.source_id).toLowerCase().includes(archiveNeedle) ||
       row.protocol?.toLowerCase().includes(archiveNeedle) ||
       row.category?.toLowerCase().includes(archiveNeedle) ||
       row.status?.toLowerCase().includes(archiveNeedle) ||
       row.reasons?.some((reason) => reason?.toLowerCase().includes(archiveNeedle))
     ));
-  }, [archiveNeedle, archiveOppRows]);
+  }, [archiveMainnetFilter, archiveNeedle, archiveOppRows]);
   const archiveTxPageCount = Math.max(
     1,
     Math.ceil(filteredArchiveTxRows.length / archiveTxPageSize),
@@ -1116,7 +1433,31 @@ export default function App() {
   useEffect(() => {
     setArchiveTxPage(1);
     setArchiveOppPage(1);
-  }, [archiveQuery]);
+  }, [archiveMainnetFilter, archiveQuery]);
+  useEffect(() => {
+    setSelectedOpportunityKey((current) => {
+      if (current && filteredOpportunityRows.some((row) => opportunityRowKey(row) === current)) {
+        return current;
+      }
+      return filteredOpportunityRows[0] ? opportunityRowKey(filteredOpportunityRows[0]) : null;
+    });
+  }, [filteredOpportunityRows]);
+  useEffect(() => {
+    setSelectedArchiveTxHash((current) => {
+      if (current && filteredArchiveTxRows.some((row) => row.hash === current)) {
+        return current;
+      }
+      return filteredArchiveTxRows[0]?.hash ?? null;
+    });
+  }, [filteredArchiveTxRows]);
+  useEffect(() => {
+    setSelectedArchiveOppKey((current) => {
+      if (current && filteredArchiveOppRows.some((row) => opportunityRowKey(row) === current)) {
+        return current;
+      }
+      return filteredArchiveOppRows[0] ? opportunityRowKey(filteredArchiveOppRows[0]) : null;
+    });
+  }, [filteredArchiveOppRows]);
   const {
     totalSignalVolume,
     totalTxCount,
@@ -1138,6 +1479,34 @@ export default function App() {
     const total = rows.reduce((sum, row) => sum + row.count, 0);
     return { topMixRows: rows, mixTotal: total };
   }, [featureSummaryRows]);
+  const chainStatusBadges = useMemo(
+    () =>
+      chainStatusRows.map((row) => {
+        const displayState = row.state.replaceAll('_', ' ');
+        const silentToken = row.silent_for_ms == null ? '-' : formatDurationToken(row.silent_for_ms);
+        const endpointToken = row.endpoint_count > 0
+          ? `${Math.min(row.endpoint_index + 1, row.endpoint_count)}/${row.endpoint_count}`
+          : '-/-';
+        const titleParts = [
+          `${row.chain_key} (${row.source_id})`,
+          `state=${displayState}`,
+          `endpoint=${endpointToken}`,
+          row.ws_url ? `ws=${row.ws_url}` : '',
+          row.last_error ? `error=${row.last_error}` : '',
+        ].filter(Boolean);
+        return {
+          key: row.chain_key,
+          chainLabel: formatChainStatusChainKey(row.chain_key),
+          stateLabel: displayState,
+          silentToken,
+          endpointToken,
+          rotations: row.rotation_count,
+          tone: chainStatusTone(row.state),
+          title: titleParts.join('\n'),
+        };
+      }),
+    [chainStatusRows],
+  );
   const onShowRadar = useCallback(() => {
     setActiveScreen('radar');
   }, []);
@@ -1149,6 +1518,12 @@ export default function App() {
   }, []);
   const onSearchChange = useCallback((event) => {
     setQuery(event.target.value);
+  }, []);
+  const onTickerFilterToggle = useCallback(() => {
+    setShowTickerFilters((current) => !current);
+  }, []);
+  const onLiveMainnetFilterChange = useCallback((event) => {
+    setLiveMainnetFilter(normalizeMainnetFilter(event.target.value));
   }, []);
   const onTickerFollowClick = useCallback(() => {
     setFollowLatest(true);
@@ -1183,6 +1558,9 @@ export default function App() {
   }, [transactionPageCount]);
   const onArchiveQueryChange = useCallback((event) => {
     setArchiveQuery(event.target.value);
+  }, []);
+  const onArchiveMainnetFilterChange = useCallback((event) => {
+    setArchiveMainnetFilter(normalizeMainnetFilter(event.target.value));
   }, []);
   const onArchiveTxPagePrev = useCallback(() => {
     setArchiveTxPage((current) => Math.max(1, current - 1));
@@ -1287,8 +1665,26 @@ export default function App() {
             >
               Archives
             </button>
-            <div className="news-mono ml-auto text-[11px] uppercase tracking-[0.12em] text-zinc-700">
-              {statusMessage}
+            <div className="ml-auto flex min-w-[20rem] flex-1 flex-col items-end gap-1">
+              <div className="news-mono text-right text-[11px] uppercase tracking-[0.12em] text-zinc-700">
+                {statusMessage}
+              </div>
+              {chainStatusBadges.length ? (
+                <div className="news-chain-status-strip">
+                  {chainStatusBadges.map((badge) => (
+                    <div
+                      key={badge.key}
+                      className={cn(
+                        'news-chain-status-chip news-mono border px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-[0.08em]',
+                        badge.tone,
+                      )}
+                      title={badge.title}
+                    >
+                      {badge.chainLabel} {badge.stateLabel} · {badge.silentToken} · ep {badge.endpointToken} · r{badge.rotations}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </div>
         </header>
@@ -1297,9 +1693,6 @@ export default function App() {
           <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 overflow-hidden bg-[#f7f1e6] p-4 lg:grid-cols-[minmax(0,1fr)_minmax(360px,420px)] xl:grid-cols-[minmax(0,1fr)_460px]">
             <main className="flex min-h-0 flex-col overflow-hidden lg:border-r-2 lg:border-zinc-900 lg:pr-6">
               <div className="mb-4 text-center">
-                <h2 className="news-headline text-3xl font-bold italic md:text-4xl">
-                  Real-Time Transaction Monitor
-                </h2>
                 <div className="news-mono mt-1 flex items-center justify-center gap-2 text-[11px] uppercase tracking-[0.12em] text-zinc-700">
                   <span className="inline-block size-2 animate-pulse rounded-full bg-zinc-900" />
                   <span>Live Wire Service • Updates Continuously</span>
@@ -1311,7 +1704,11 @@ export default function App() {
                 <div className="flex gap-2">
                   <button
                     type="button"
-                    className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors"
+                    onClick={onTickerFilterToggle}
+                    className={cn(
+                      'news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                      showTickerFilters || liveMainnetFilter !== MAINNET_FILTER_ALL ? 'news-tab-active' : '',
+                    )}
                   >
                     Filter
                   </button>
@@ -1330,10 +1727,20 @@ export default function App() {
                   type="search"
                   value={query}
                   onChange={onSearchChange}
-                  placeholder="Search hash, sender, source, protocol, category"
+                  placeholder="Search hash, sender, source, mainnet, protocol, category"
                   className="news-mono w-full border border-zinc-900 bg-[#fffdf7] px-3 py-2 text-sm outline-none transition-colors focus:bg-white"
                 />
               </div>
+              {showTickerFilters ? (
+                <div className="mb-2 flex flex-wrap items-center gap-2 border border-zinc-900 bg-[#fffdf7] px-3 py-2">
+                  <NewspaperFilterSelect
+                    id="live-mainnet-filter"
+                    value={liveMainnetFilter}
+                    onChange={onLiveMainnetFilterChange}
+                    options={MAINNET_FILTER_OPTIONS}
+                  />
+                </div>
+              ) : null}
 
               <div className={cn('news-mono mb-3 text-[10px] uppercase tracking-[0.12em]', hasError ? 'text-rose-700' : 'text-zinc-700')}>
                 {statusMessage}
@@ -1344,13 +1751,14 @@ export default function App() {
                   className="news-list-scroll h-full border-b-2 border-zinc-900"
                   onClick={onTickerListClick}
                 >
-                  <table className="news-tx-table news-mono min-w-[1248px] w-full table-fixed border-collapse">
+                  <table className="news-tx-table news-mono min-w-[1360px] w-full table-fixed border-collapse">
                     <thead className="sticky top-0 z-10 border-b border-zinc-900 bg-zinc-900 text-[#f7f1e6]">
                       <tr className="text-[13px] font-bold uppercase tracking-[0.1em]">
                         <th scope="col" className="w-[170px] px-2 py-2 text-left">Timestamp</th>
                         <th scope="col" className="w-[170px] px-2 py-2 text-left">Ref. ID</th>
                         <th scope="col" className="w-[170px] px-2 py-2 text-left">Sender</th>
-                        <th scope="col" className="w-[84px] px-2 py-2 text-left">Source</th>
+                        <th scope="col" className="w-[92px] px-2 py-2 text-left">Source</th>
+                        <th scope="col" className="w-[92px] px-2 py-2 text-left">Mainnet</th>
                         <th scope="col" className="w-[66px] px-2 py-2 text-left">Type</th>
                         <th scope="col" className="w-[72px] px-2 py-2 text-left">Nonce</th>
                         <th scope="col" className="w-[102px] px-2 py-2 text-left">Protocol</th>
@@ -1374,6 +1782,8 @@ export default function App() {
                         const categoryValue = feature?.category ?? '-';
                         const senderValue = row?.sender ?? '-';
                         const sourceValue = row?.source_id ?? '-';
+                        const mainnetValue = resolveMainnetLabel(row?.chain_id, row?.source_id);
+                        const mainnetRowClasses = resolveMainnetRowClasses(mainnetValue);
                         const nonceValue = row?.nonce ?? '-';
                         const txTypeValue = row?.tx_type ?? '-';
 
@@ -1387,7 +1797,7 @@ export default function App() {
                                 ? 'bg-zinc-900 text-[#f7f1e6]'
                                 : status === 'Flagged'
                                   ? 'bg-zinc-900 text-[#f7f1e6]'
-                                  : 'bg-[#fffdf7] text-zinc-800 hover:bg-black/5',
+                                  : `${mainnetRowClasses} text-zinc-800`,
                             )}
                           >
                             <td className="px-2 py-2 align-middle whitespace-nowrap">{formatTickerTime(row.seen_unix_ms)}</td>
@@ -1404,6 +1814,11 @@ export default function App() {
                             <td className="px-2 py-2 align-middle">
                               <span className="block truncate" title={sourceValue}>
                                 {sourceValue}
+                              </span>
+                            </td>
+                            <td className="px-2 py-2 align-middle">
+                              <span className="block truncate" title={mainnetValue}>
+                                {mainnetValue}
                               </span>
                             </td>
                             <td className="px-2 py-2 align-middle">{txTypeValue}</td>
@@ -1652,19 +2067,29 @@ export default function App() {
                   Selected Brief
                 </h4>
                 <div className="news-mono text-xs uppercase tracking-[0.1em]">
-                  <div className="mb-1.5">
-                    <span className="block text-zinc-500">Tx</span>
-                    <span className="block truncate">{selectedTransaction ? shortHex(selectedTransaction.hash, 18, 8) : '-'}</span>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+                    <div className="col-span-2">
+                      <span className="block text-zinc-500">Tx</span>
+                      <span className="block truncate">{selectedTransaction ? shortHex(selectedTransaction.hash, 18, 8) : '-'}</span>
+                    </div>
+                    <div>
+                      <span className="block text-zinc-500">Protocol</span>
+                      <span className="block">{selectedFeature?.protocol ?? '-'}</span>
+                    </div>
+                    <div>
+                      <span className="block text-zinc-500">Category</span>
+                      <span className="block">{selectedFeature?.category ?? '-'}</span>
+                    </div>
+                    <div>
+                      <span className="block text-zinc-500">Mainnet</span>
+                      <span className="block">{selectedTransactionMainnet}</span>
+                    </div>
+                    <div>
+                      <span className="block text-zinc-500">Source</span>
+                      <span className="block">{selectedRecent?.source_id ?? selectedTransaction?.source_id ?? '-'}</span>
+                    </div>
                   </div>
-                  <div className="mb-1.5">
-                    <span className="block text-zinc-500">Protocol</span>
-                    <span className="block">{selectedFeature?.protocol ?? '-'}</span>
-                  </div>
-                  <div className="mb-1.5">
-                    <span className="block text-zinc-500">Category</span>
-                    <span className="block">{selectedFeature?.category ?? '-'}</span>
-                  </div>
-                  <div className="grid grid-cols-2 gap-1.5 border-t border-zinc-900 pt-1.5">
+                  <div className="mt-1.5 grid grid-cols-2 gap-1.5 border-t border-zinc-900 pt-1.5">
                     <div>
                       <span className="block text-zinc-500">Mev</span>
                       <span className="text-base font-bold">{selectedFeature?.mev_score ?? '-'}</span>
@@ -1691,11 +2116,20 @@ export default function App() {
               <div className="news-kicker mb-3">
                 Opportunity Pipeline
               </div>
+              <div className="mb-3 flex items-center gap-2">
+                <NewspaperFilterSelect
+                  id="opps-mainnet-filter"
+                  value={liveMainnetFilter}
+                  onChange={onLiveMainnetFilterChange}
+                  options={MAINNET_FILTER_OPTIONS}
+                />
+              </div>
               <div className="space-y-2" onClick={onOpportunityListClick}>
-                {opportunityRows.map((opportunity) => {
+                {filteredOpportunityRows.map((opportunity) => {
                   const rowKey = opportunityRowKey(opportunity);
                   const isActive = selectedOpportunityKey === rowKey;
                   const tone = opportunityCandidateTone(opportunity, isActive);
+                  const mainnet = resolveMainnetLabel(opportunity.chain_id, opportunity.source_id);
                   return (
                     <button
                       type="button"
@@ -1713,7 +2147,7 @@ export default function App() {
                         </div>
                       </div>
                       <div className={cn('news-mono mt-1 text-[11px] uppercase tracking-[0.1em]', tone.subtle)}>
-                        {opportunity.protocol} · {opportunity.category}
+                        {mainnet} · {opportunity.protocol} · {opportunity.category}
                       </div>
                       <div className={cn('news-mono mt-1 text-[11px] uppercase tracking-[0.1em]', tone.subtle)}>
                         tx {shortHex(opportunity.tx_hash, 14, 10)} · {formatRelativeTime(opportunity.detected_unix_ms)}
@@ -1722,7 +2156,7 @@ export default function App() {
                   );
                 })}
               </div>
-              {opportunityRows.length === 0 ? (
+              {filteredOpportunityRows.length === 0 ? (
                 <div className="news-dotted-box mt-4 bg-[#fffdf7] p-6 text-sm text-zinc-700">
                   No opportunities available.
                 </div>
@@ -1752,6 +2186,10 @@ export default function App() {
                       <div>
                         <div className="news-kicker">Protocol</div>
                         <div>{selectedOpportunity.protocol}</div>
+                      </div>
+                      <div>
+                        <div className="news-kicker">Mainnet</div>
+                        <div>{selectedOpportunityMainnet}</div>
                       </div>
                       <div>
                         <div className="news-kicker">Category</div>
@@ -1818,11 +2256,19 @@ export default function App() {
                 <input
                   value={archiveQuery}
                   onChange={onArchiveQueryChange}
-                  placeholder="Search hash, sender, protocol, category, status"
+                  placeholder="Search hash, sender, mainnet, protocol, category, status"
                   className="news-mono min-w-[18rem] flex-1 border border-zinc-900 bg-[#fffdf7] px-3 py-2 text-[12px] uppercase tracking-[0.08em] outline-none focus:bg-white"
                 />
+                <NewspaperFilterSelect
+                  id="archive-mainnet-filter"
+                  value={archiveMainnetFilter}
+                  onChange={onArchiveMainnetFilterChange}
+                  options={MAINNET_FILTER_OPTIONS}
+                  compact
+                  ariaLabel="Archive mainnet filter"
+                />
                 <div className="news-mono text-[11px] uppercase tracking-[0.1em] text-zinc-700">
-                  tx:{archiveTxRows.length} · opps:{archiveOppRows.length}
+                  tx:{filteredArchiveTxRows.length}/{archiveTxRows.length} · opps:{filteredArchiveOppRows.length}/{archiveOppRows.length}
                 </div>
               </div>
 
@@ -1844,6 +2290,8 @@ export default function App() {
                     {archiveTxPageRows.map((row) => {
                       const isActive = selectedArchiveTxHash === row.hash;
                       const lifecycle = row.lifecycle_status ?? 'pending';
+                      const mainnet = resolveMainnetLabel(row.chain_id, row.source_id);
+                      const mainnetRowClasses = resolveMainnetRowClasses(mainnet);
                       return (
                         <button
                           key={row.hash}
@@ -1853,14 +2301,14 @@ export default function App() {
                             'w-full cursor-pointer border px-3 py-2 text-left transition-colors',
                             isActive
                               ? 'border-zinc-900 bg-zinc-900 text-[#f7f1e6]'
-                              : 'border-zinc-900 bg-[#fffdf7] text-zinc-900 hover:bg-zinc-100/60',
+                              : `border-zinc-900 ${mainnetRowClasses} text-zinc-900`,
                           )}
                         >
                           <div className="news-mono text-[11px] uppercase tracking-[0.1em]">
                             {shortHex(row.hash, 16, 10)}
                           </div>
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', isActive ? 'text-zinc-300' : 'text-zinc-700')}>
-                            {formatTime(row.first_seen_unix_ms)} · {row.protocol ?? 'unknown'} / {row.category ?? 'pending'}
+                            {formatTime(row.first_seen_unix_ms)} · {mainnet} · {row.protocol ?? 'unknown'} / {row.category ?? 'pending'}
                           </div>
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', isActive ? 'text-zinc-300' : 'text-zinc-700')}>
                             {lifecycle} · mev {row.mev_score ?? '-'} · urgency {row.urgency_score ?? '-'}
@@ -1921,6 +2369,7 @@ export default function App() {
                       const rowKey = opportunityRowKey(row);
                       const isActive = selectedArchiveOppKey === rowKey;
                       const tone = opportunityCandidateTone(row, isActive);
+                      const mainnet = resolveMainnetLabel(row.chain_id, row.source_id);
                       return (
                         <button
                           key={rowKey}
@@ -1935,7 +2384,7 @@ export default function App() {
                             </div>
                           </div>
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', tone.subtle)}>
-                            {row.protocol} · {row.category} · {row.status}
+                            {mainnet} · {row.protocol} · {row.category} · {row.status}
                           </div>
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', tone.subtle)}>
                             tx {shortHex(row.tx_hash, 14, 10)} · {formatRelativeTime(row.detected_unix_ms)}
@@ -2009,6 +2458,10 @@ export default function App() {
                         <div>{selectedArchiveTx.protocol ?? 'unknown'}</div>
                       </div>
                       <div>
+                        <div className="news-kicker">Mainnet</div>
+                        <div>{selectedArchiveTxMainnet}</div>
+                      </div>
+                      <div>
                         <div className="news-kicker">Category</div>
                         <div>{selectedArchiveTx.category ?? 'pending'}</div>
                       </div>
@@ -2054,6 +2507,10 @@ export default function App() {
                       <div>
                         <div className="news-kicker">Protocol</div>
                         <div>{selectedArchiveOpp.protocol}</div>
+                      </div>
+                      <div>
+                        <div className="news-kicker">Mainnet</div>
+                        <div>{selectedArchiveOppMainnet}</div>
                       </div>
                       <div>
                         <div className="news-kicker">Category</div>
@@ -2120,12 +2577,15 @@ export default function App() {
                 </button>
               </div>
               <div className="news-mono mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-900 pt-2 text-[16px] uppercase tracking-[0.1em] text-zinc-700">
-                <span>Source Edition · {dialogTransaction?.source_id ?? '-'}</span>
+                <div className="flex flex-wrap items-center gap-3">
+                  <span>Source Edition · {dialogTransaction?.source_id ?? '-'}</span>
+                  <span>Mainnet · {dialogMainnet}</span>
+                </div>
                 <span>{detailSeenRelative}</span>
               </div>
             </div>
 
-            <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+            <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,70%)_minmax(0,30%)]">
               <section className="news-detail-section">
                 <div className="news-kicker border-b border-zinc-900 pb-1">
                   Ledger Entry
@@ -2133,7 +2593,7 @@ export default function App() {
                 <dl className="news-detail-kv mt-3">
                   <dt>Sender</dt>
                   <dd
-                    className="news-mono text-[18px] whitespace-nowrap overflow-hidden text-ellipsis"
+                    className="news-mono break-all text-[18px]"
                     title={detailSender}
                   >
                     {detailSender}
@@ -2142,6 +2602,8 @@ export default function App() {
                   <dd>{dialogTransaction?.tx_type ?? '-'}</dd>
                   <dt>Seen At</dt>
                   <dd>{detailSeenAt}</dd>
+                  <dt>Mainnet</dt>
+                  <dd>{dialogMainnet}</dd>
                   <dt>Method</dt>
                   <dd className="news-mono text-[18px]">{dialogFeature?.method_selector ?? '-'}</dd>
                 </dl>

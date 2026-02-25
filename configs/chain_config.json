@@ -1,0 +1,64 @@
+{
+  "chains": [
+    {
+      "chain_key": "eth-mainnet",
+      "chain_id": 1,
+      "source_id": "rpc-eth-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://eth.drpc.org",
+          "http_url": "https://eth.drpc.org"
+        },
+        {
+          "ws_url": "wss://ethereum-rpc.publicnode.com",
+          "http_url": "https://ethereum-rpc.publicnode.com"
+        }
+      ]
+    },
+    {
+      "chain_key": "base-mainnet",
+      "chain_id": 8453,
+      "source_id": "rpc-base-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://base-rpc.publicnode.com",
+          "http_url": "https://base-rpc.publicnode.com"
+        },
+        {
+          "ws_url": "wss://base.drpc.org",
+          "http_url": "https://base.drpc.org"
+        }
+      ]
+    },
+    {
+      "chain_key": "optimism-mainnet",
+      "chain_id": 10,
+      "source_id": "rpc-optimism-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://optimism-rpc.publicnode.com",
+          "http_url": "https://optimism-rpc.publicnode.com"
+        },
+        {
+          "ws_url": "wss://optimism.drpc.org",
+          "http_url": "https://optimism.drpc.org"
+        }
+      ]
+    },
+    {
+      "chain_key": "polygon-mainnet",
+      "chain_id": 137,
+      "source_id": "rpc-polygon-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://polygon-bor-rpc.publicnode.com",
+          "http_url": "https://polygon-bor-rpc.publicnode.com"
+        },
+        {
+          "ws_url": "wss://polygon.drpc.org",
+          "http_url": "https://polygon.drpc.org"
+        }
+      ]
+    }
+  ]
+}

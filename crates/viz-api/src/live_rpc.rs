@@ -11,9 +11,12 @@ use feature_engine::{
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
-use serde::{Deserialize, de::IgnoredAny};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,12 +38,16 @@ const ENV_ETH_WS_URL: &str = "VIZ_API_ETH_WS_URL";
 const ENV_ETH_HTTP_URL: &str = "VIZ_API_ETH_HTTP_URL";
 const ENV_SOURCE_ID: &str = "VIZ_API_SOURCE_ID";
 const ENV_CHAINS: &str = "VIZ_API_CHAINS";
+const ENV_CHAIN_CONFIG_PATH: &str = "VIZ_API_CHAIN_CONFIG_PATH";
+const DEFAULT_CHAIN_CONFIG_PATH: &str = "configs/chain_config.json";
 const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
 const ENV_RPC_BATCH_SIZE: &str = "VIZ_API_RPC_BATCH_SIZE";
 const ENV_RPC_MAX_IN_FLIGHT: &str = "VIZ_API_RPC_MAX_IN_FLIGHT";
 const ENV_RPC_RETRY_ATTEMPTS: &str = "VIZ_API_RPC_RETRY_ATTEMPTS";
 const ENV_RPC_RETRY_BACKOFF_MS: &str = "VIZ_API_RPC_RETRY_BACKOFF_MS";
 const ENV_RPC_BATCH_FLUSH_MS: &str = "VIZ_API_RPC_BATCH_FLUSH_MS";
+const ENV_SILENT_CHAIN_TIMEOUT_SECS: &str = "VIZ_API_SILENT_CHAIN_TIMEOUT_SECS";
+const DEFAULT_SILENT_CHAIN_TIMEOUT_SECS: u64 = 20;
 const SEARCHER_MIN_SCORE: u32 = 0;
 const SEARCHER_MAX_CANDIDATES: usize = 8;
 
@@ -130,8 +137,140 @@ pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> Li
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveRpcChainStatus {
+    pub chain_key: String,
+    pub chain_id: Option<u64>,
+    pub source_id: String,
+    pub state: String,
+    pub endpoint_index: usize,
+    pub endpoint_count: usize,
+    pub ws_url: String,
+    pub http_url: String,
+    pub last_pending_unix_ms: Option<i64>,
+    pub silent_for_ms: Option<u64>,
+    pub updated_unix_ms: i64,
+    pub last_error: Option<String>,
+    pub rotation_count: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LiveRpcChainStatusRecord {
+    chain_key: String,
+    chain_id: Option<u64>,
+    source_id: String,
+    state: String,
+    endpoint_index: usize,
+    endpoint_count: usize,
+    ws_url: String,
+    http_url: String,
+    last_pending_unix_ms: Option<i64>,
+    updated_unix_ms: i64,
+    last_error: Option<String>,
+    rotation_count: u64,
+}
+
+static LIVE_RPC_CHAIN_STATUS: OnceLock<Arc<RwLock<BTreeMap<String, LiveRpcChainStatusRecord>>>> =
+    OnceLock::new();
+
+fn live_rpc_chain_status_store()
+-> &'static Arc<RwLock<BTreeMap<String, LiveRpcChainStatusRecord>>> {
+    LIVE_RPC_CHAIN_STATUS.get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
+}
+
+pub fn live_rpc_chain_status_snapshot() -> Vec<LiveRpcChainStatus> {
+    let now_unix_ms = current_unix_ms();
+    let records = live_rpc_chain_status_store()
+        .read()
+        .map(|rows| rows.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    records
+        .into_iter()
+        .map(|record| {
+            let silent_for_ms = record.last_pending_unix_ms.and_then(|last_seen| {
+                let elapsed_ms = now_unix_ms.saturating_sub(last_seen);
+                u64::try_from(elapsed_ms).ok()
+            });
+            LiveRpcChainStatus {
+                chain_key: record.chain_key,
+                chain_id: record.chain_id,
+                source_id: record.source_id,
+                state: record.state,
+                endpoint_index: record.endpoint_index,
+                endpoint_count: record.endpoint_count,
+                ws_url: record.ws_url,
+                http_url: record.http_url,
+                last_pending_unix_ms: record.last_pending_unix_ms,
+                silent_for_ms,
+                updated_unix_ms: record.updated_unix_ms,
+                last_error: record.last_error,
+                rotation_count: record.rotation_count,
+            }
+        })
+        .collect()
+}
+
+fn reset_live_rpc_chain_status() {
+    if let Ok(mut rows) = live_rpc_chain_status_store().write() {
+        rows.clear();
+    }
+}
+
+fn update_live_rpc_chain_status(
+    chain: &ChainRpcConfig,
+    endpoint: &RpcEndpoint,
+    endpoint_index: usize,
+    state: &str,
+    last_error: Option<String>,
+    observed_pending: bool,
+    increment_rotation: bool,
+) {
+    let now_unix_ms = current_unix_ms();
+    let mut rows = match live_rpc_chain_status_store().write() {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    let entry = rows
+        .entry(chain.chain_key.clone())
+        .or_insert_with(|| LiveRpcChainStatusRecord {
+            chain_key: chain.chain_key.clone(),
+            chain_id: chain.chain_id,
+            source_id: chain.source_id.to_string(),
+            state: state.to_owned(),
+            endpoint_index,
+            endpoint_count: chain.endpoints.len(),
+            ws_url: endpoint.ws_url.clone(),
+            http_url: endpoint.http_url.clone(),
+            last_pending_unix_ms: None,
+            updated_unix_ms: now_unix_ms,
+            last_error: None,
+            rotation_count: 0,
+        });
+    entry.chain_id = chain.chain_id;
+    entry.source_id = chain.source_id.to_string();
+    entry.state = state.to_owned();
+    entry.endpoint_index = endpoint_index;
+    entry.endpoint_count = chain.endpoints.len();
+    entry.ws_url = endpoint.ws_url.clone();
+    entry.http_url = endpoint.http_url.clone();
+    entry.updated_unix_ms = now_unix_ms;
+    entry.last_error = last_error;
+    if observed_pending || state == "subscribed" {
+        entry.last_pending_unix_ms = Some(now_unix_ms);
+    }
+    if increment_rotation {
+        entry.rotation_count = entry.rotation_count.saturating_add(1);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RpcEndpoint {
+    ws_url: String,
+    http_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EnvRpcEndpointConfig {
     ws_url: String,
     http_url: String,
 }
@@ -141,10 +280,21 @@ struct EnvChainConfig {
     chain_key: String,
     #[serde(default)]
     chain_id: Option<u64>,
-    ws_url: String,
-    http_url: String,
+    #[serde(default)]
+    ws_url: Option<String>,
+    #[serde(default)]
+    http_url: Option<String>,
+    #[serde(default)]
+    endpoints: Vec<EnvRpcEndpointConfig>,
     #[serde(default)]
     source_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum ChainConfigInput {
+    Wrapped { chains: Vec<EnvChainConfig> },
+    List(Vec<EnvChainConfig>),
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +336,7 @@ pub struct LiveRpcConfig {
     chains: Vec<ChainRpcConfig>,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
+    silent_chain_timeout_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +380,7 @@ impl Default for LiveRpcConfig {
             }],
             max_seen_hashes: 10_000,
             batch_fetch: BatchFetchConfig::default(),
+            silent_chain_timeout_secs: DEFAULT_SILENT_CHAIN_TIMEOUT_SECS,
         }
     }
 }
@@ -247,11 +399,10 @@ impl LiveRpcConfig {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let source_id = std::env::var(ENV_SOURCE_ID)
+        let source_id_override = std::env::var(ENV_SOURCE_ID)
             .ok()
             .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "rpc-live".to_owned());
+            .filter(|value| !value.is_empty());
         let max_seen_hashes = std::env::var(ENV_MAX_SEEN_HASHES)
             .ok()
             .map(|value| value.trim().to_owned())
@@ -275,8 +426,14 @@ impl LiveRpcConfig {
         let flush_interval_ms = parse_env_u64(ENV_RPC_BATCH_FLUSH_MS)?
             .unwrap_or(BatchFetchConfig::default().flush_interval_ms)
             .max(1);
+        let silent_chain_timeout_secs = parse_env_u64(ENV_SILENT_CHAIN_TIMEOUT_SECS)?
+            .unwrap_or(DEFAULT_SILENT_CHAIN_TIMEOUT_SECS)
+            .max(1);
 
         let mut config = Self::default();
+        if let Some(file_chains) = load_chain_configs_from_file()? {
+            config.chains = file_chains;
+        }
         if let Some(chains_override) = chains_override {
             config.chains = parse_env_chain_configs(&chains_override)?;
         } else {
@@ -296,8 +453,10 @@ impl LiveRpcConfig {
                 }
             }
 
-            if let Some(primary_chain) = config.chains.first_mut() {
-                primary_chain.source_id = SourceId::new(source_id);
+            if let Some(source_id_override) = source_id_override {
+                if let Some(primary_chain) = config.chains.first_mut() {
+                    primary_chain.source_id = SourceId::new(source_id_override);
+                }
             }
         }
         config.max_seen_hashes = max_seen_hashes;
@@ -308,6 +467,7 @@ impl LiveRpcConfig {
             retry_backoff_ms,
             flush_interval_ms,
         };
+        config.silent_chain_timeout_secs = silent_chain_timeout_secs;
         Ok(config)
     }
 
@@ -338,6 +498,10 @@ impl LiveRpcConfig {
 
     pub fn batch_fetch(&self) -> BatchFetchConfig {
         self.batch_fetch
+    }
+
+    pub fn silent_chain_timeout_secs(&self) -> u64 {
+        self.silent_chain_timeout_secs
     }
 }
 
@@ -384,6 +548,20 @@ pub fn rotate_endpoint_index(current: usize, endpoint_count: usize) -> usize {
     }
 }
 
+pub fn should_rotate_silent_chain(
+    last_pending_unix_ms: i64,
+    now_unix_ms: i64,
+    timeout_seconds: u64,
+) -> bool {
+    if timeout_seconds == 0 {
+        return false;
+    }
+    let timeout_ms = timeout_seconds.saturating_mul(1_000);
+    let elapsed_ms = now_unix_ms.saturating_sub(last_pending_unix_ms);
+    let elapsed_ms_u64 = u64::try_from(elapsed_ms).unwrap_or(0);
+    elapsed_ms_u64 >= timeout_ms
+}
+
 fn parse_env_usize(key: &str) -> Result<Option<usize>> {
     std::env::var(key)
         .ok()
@@ -405,30 +583,81 @@ fn parse_env_u64(key: &str) -> Result<Option<u64>> {
 }
 
 fn parse_env_chain_configs(raw: &str) -> Result<Vec<ChainRpcConfig>> {
-    let env_chains: Vec<EnvChainConfig> =
-        serde_json::from_str(raw).context("decode VIZ_API_CHAINS json")?;
-    if env_chains.is_empty() {
-        return Err(anyhow!("{ENV_CHAINS} must contain at least one chain"));
-    }
+    let env_chains = decode_chain_configs(raw, "VIZ_API_CHAINS")?;
     env_chains
         .into_iter()
         .map(parse_env_chain_config)
         .collect::<Result<Vec<_>>>()
 }
 
+fn load_chain_configs_from_file() -> Result<Option<Vec<ChainRpcConfig>>> {
+    if let Some(path_override) = std::env::var(ENV_CHAIN_CONFIG_PATH)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(read_chain_configs_from_path(PathBuf::from(
+            path_override,
+        ))?));
+    }
+
+    for path in default_chain_config_paths() {
+        match read_chain_configs_from_path(path.clone()) {
+            Ok(chains) => return Ok(Some(chains)),
+            Err(err) if is_file_not_found_error(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(None)
+}
+
+fn default_chain_config_paths() -> [PathBuf; 2] {
+    [
+        PathBuf::from(DEFAULT_CHAIN_CONFIG_PATH),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(DEFAULT_CHAIN_CONFIG_PATH),
+    ]
+}
+
+fn read_chain_configs_from_path(path: PathBuf) -> Result<Vec<ChainRpcConfig>> {
+    let payload = fs::read_to_string(&path)
+        .with_context(|| format!("read chain config file '{}'", path.display()))?;
+    let source_label = format!("chain config file '{}'", path.display());
+    let env_chains = decode_chain_configs(&payload, &source_label)?;
+    env_chains
+        .into_iter()
+        .map(parse_env_chain_config)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn decode_chain_configs(raw: &str, source_label: &str) -> Result<Vec<EnvChainConfig>> {
+    let env_chains = match serde_json::from_str::<ChainConfigInput>(raw)
+        .with_context(|| format!("decode {source_label} json"))?
+    {
+        ChainConfigInput::Wrapped { chains } => chains,
+        ChainConfigInput::List(chains) => chains,
+    };
+
+    if env_chains.is_empty() {
+        return Err(anyhow!("{source_label} must contain at least one chain"));
+    }
+    Ok(env_chains)
+}
+
+fn is_file_not_found_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .map(|io_err| io_err.kind() == ErrorKind::NotFound)
+        .unwrap_or(false)
+}
+
 fn parse_env_chain_config(chain: EnvChainConfig) -> Result<ChainRpcConfig> {
     let chain_key = chain.chain_key.trim();
     if chain_key.is_empty() {
-        return Err(anyhow!("chain_key in {ENV_CHAINS} cannot be empty"));
+        return Err(anyhow!("chain_key cannot be empty"));
     }
-    let ws_url = chain.ws_url.trim();
-    if ws_url.is_empty() {
-        return Err(anyhow!("ws_url for chain '{chain_key}' cannot be empty"));
-    }
-    let http_url = chain.http_url.trim();
-    if http_url.is_empty() {
-        return Err(anyhow!("http_url for chain '{chain_key}' cannot be empty"));
-    }
+    let endpoints = parse_chain_endpoints(&chain, chain_key)?;
 
     let source_id = chain
         .source_id
@@ -439,11 +668,39 @@ fn parse_env_chain_config(chain: EnvChainConfig) -> Result<ChainRpcConfig> {
     Ok(ChainRpcConfig {
         chain_key: chain_key.to_owned(),
         chain_id: chain.chain_id,
-        endpoints: vec![RpcEndpoint {
-            ws_url: ws_url.to_owned(),
-            http_url: http_url.to_owned(),
-        }],
+        endpoints,
         source_id: SourceId::new(source_id),
+    })
+}
+
+fn parse_chain_endpoints(chain: &EnvChainConfig, chain_key: &str) -> Result<Vec<RpcEndpoint>> {
+    if !chain.endpoints.is_empty() {
+        return chain
+            .endpoints
+            .iter()
+            .map(|endpoint| parse_endpoint_urls(chain_key, &endpoint.ws_url, &endpoint.http_url))
+            .collect();
+    }
+
+    let ws_url = chain.ws_url.as_deref().unwrap_or_default();
+    let http_url = chain.http_url.as_deref().unwrap_or_default();
+    let endpoint = parse_endpoint_urls(chain_key, ws_url, http_url)?;
+    Ok(vec![endpoint])
+}
+
+fn parse_endpoint_urls(chain_key: &str, ws_url: &str, http_url: &str) -> Result<RpcEndpoint> {
+    let ws_url = ws_url.trim();
+    if ws_url.is_empty() {
+        return Err(anyhow!("ws_url for chain '{chain_key}' cannot be empty"));
+    }
+    let http_url = http_url.trim();
+    if http_url.is_empty() {
+        return Err(anyhow!("http_url for chain '{chain_key}' cannot be empty"));
+    }
+
+    Ok(RpcEndpoint {
+        ws_url: ws_url.to_owned(),
+        http_url: http_url.to_owned(),
     })
 }
 
@@ -466,14 +723,24 @@ pub fn start_live_rpc_feed(
         current_seq_hi(&storage).saturating_add(1).max(1),
     ));
     reset_live_rpc_drop_metrics();
+    reset_live_rpc_chain_status();
     let max_seen_hashes = config.max_seen_hashes;
     let batch_fetch = config.batch_fetch;
+    let silent_chain_timeout_secs = config.silent_chain_timeout_secs;
 
     for chain in config.chains {
         let writer = writer.clone();
         let next_seq_id = next_seq_id.clone();
         handle.spawn(async move {
-            run_chain_worker(writer, chain, max_seen_hashes, batch_fetch, next_seq_id).await;
+            run_chain_worker(
+                writer,
+                chain,
+                max_seen_hashes,
+                batch_fetch,
+                silent_chain_timeout_secs,
+                next_seq_id,
+            )
+            .await;
         });
     }
 }
@@ -483,6 +750,7 @@ async fn run_chain_worker(
     chain: ChainRpcConfig,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
+    silent_chain_timeout_secs: u64,
     next_seq_id: Arc<AtomicU64>,
 ) {
     let client = match reqwest::Client::builder()
@@ -510,9 +778,29 @@ async fn run_chain_worker(
     let mut seen_hashes = FastSet::default();
     let mut seen_order = VecDeque::new();
     let mut endpoint_index = 0usize;
+    if let Some(initial_endpoint) = chain.endpoints.first() {
+        update_live_rpc_chain_status(
+            &chain,
+            initial_endpoint,
+            endpoint_index,
+            "booting",
+            None,
+            false,
+            false,
+        );
+    }
 
     loop {
         let endpoint = &chain.endpoints[endpoint_index];
+        update_live_rpc_chain_status(
+            &chain,
+            endpoint,
+            endpoint_index,
+            "connecting",
+            None,
+            false,
+            false,
+        );
         tracing::info!(
             chain_key = %chain.chain_key,
             chain_id = ?chain.chain_id,
@@ -526,8 +814,10 @@ async fn run_chain_worker(
                 writer: &writer,
                 chain: &chain,
                 endpoint,
+                endpoint_index,
                 max_seen_hashes,
                 batch_fetch,
+                silent_chain_timeout_secs,
                 client: &client,
                 next_seq_id: &next_seq_id,
             },
@@ -538,6 +828,20 @@ async fn run_chain_worker(
 
         if let Err(err) = session_result {
             let error_chain = format_error_chain(&err);
+            let state = if error_chain.contains("silent_chain_timeout") {
+                "silent_timeout"
+            } else {
+                "error"
+            };
+            update_live_rpc_chain_status(
+                &chain,
+                endpoint,
+                endpoint_index,
+                state,
+                Some(error_chain.clone()),
+                false,
+                false,
+            );
             tracing::warn!(
                 error = %err,
                 error_chain = %error_chain,
@@ -548,6 +852,26 @@ async fn run_chain_worker(
                 "live rpc websocket session ended for chain; rotating endpoint"
             );
             endpoint_index = rotate_endpoint_index(endpoint_index, chain.endpoints.len());
+            let next_endpoint = &chain.endpoints[endpoint_index];
+            update_live_rpc_chain_status(
+                &chain,
+                next_endpoint,
+                endpoint_index,
+                "rotating",
+                Some(error_chain),
+                false,
+                true,
+            );
+        } else {
+            update_live_rpc_chain_status(
+                &chain,
+                endpoint,
+                endpoint_index,
+                "disconnected",
+                None,
+                false,
+                false,
+            );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -557,8 +881,10 @@ struct LiveRpcSessionContext<'a> {
     writer: &'a StorageWriteHandle,
     chain: &'a ChainRpcConfig,
     endpoint: &'a RpcEndpoint,
+    endpoint_index: usize,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
+    silent_chain_timeout_secs: u64,
     client: &'a reqwest::Client,
     next_seq_id: &'a Arc<AtomicU64>,
 }
@@ -589,11 +915,21 @@ async fn run_ws_session(
         ws_url = session.endpoint.ws_url,
         "subscribed to eth_subscribe:newPendingTransactions"
     );
+    update_live_rpc_chain_status(
+        session.chain,
+        session.endpoint,
+        session.endpoint_index,
+        "subscribed",
+        None,
+        false,
+        false,
+    );
 
     let mut subscription_id: Option<String> = None;
     let flush_interval = Duration::from_millis(session.batch_fetch.flush_interval_ms);
     let mut pending_hashes = VecDeque::new();
     let in_flight = Arc::new(Semaphore::new(session.batch_fetch.max_in_flight));
+    let mut last_pending_unix_ms = current_unix_ms();
     loop {
         match tokio::time::timeout(flush_interval, read.next()).await {
             Ok(Some(frame)) => {
@@ -602,6 +938,16 @@ async fn run_ws_session(
                     Message::Text(text) => {
                         if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
                             pending_hashes.push_back(hash_hex.to_owned());
+                            last_pending_unix_ms = current_unix_ms();
+                            update_live_rpc_chain_status(
+                                session.chain,
+                                session.endpoint,
+                                session.endpoint_index,
+                                "active",
+                                None,
+                                true,
+                                false,
+                            );
                         }
                     }
                     Message::Ping(payload) => {
@@ -632,6 +978,16 @@ async fn run_ws_session(
                 )
                 .await?;
             }
+        }
+        if should_rotate_silent_chain(
+            last_pending_unix_ms,
+            current_unix_ms(),
+            session.silent_chain_timeout_secs,
+        ) {
+            return Err(anyhow!(
+                "silent_chain_timeout: no pending notifications for {}s",
+                session.silent_chain_timeout_secs
+            ));
         }
     }
     flush_pending_hash_batches(

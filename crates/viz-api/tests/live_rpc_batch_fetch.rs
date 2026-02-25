@@ -1,5 +1,6 @@
 use viz_api::live_rpc::{
     coalesce_hash_batches, dispatchable_batch_count, retry_backoff_delay_ms, rotate_endpoint_index,
+    should_rotate_silent_chain,
 };
 
 fn sample_hashes(n: usize) -> Vec<String> {
@@ -36,4 +37,12 @@ fn live_rpc_batch_fetch_retry_and_fallback_endpoint_behavior() {
 
     assert_eq!(rotate_endpoint_index(0, 2), 1);
     assert_eq!(rotate_endpoint_index(1, 2), 0);
+}
+
+#[test]
+fn live_rpc_silent_chain_timeout_triggers_rotation_after_threshold() {
+    let start_unix_ms = 1_000_000_i64;
+    assert!(!should_rotate_silent_chain(start_unix_ms, start_unix_ms + 19_000, 20));
+    assert!(should_rotate_silent_chain(start_unix_ms, start_unix_ms + 20_000, 20));
+    assert!(should_rotate_silent_chain(start_unix_ms, start_unix_ms + 45_000, 20));
 }

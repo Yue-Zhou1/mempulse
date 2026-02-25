@@ -1,4 +1,4 @@
-# prototype03
+# Mempulse
 
 ## Workspace Layout
 
@@ -60,54 +60,62 @@ The legacy implementation plan now lives at:
 
 ## Real Mempool Mode
 
-`viz-api` can ingest real pending transactions from an Ethereum RPC provider.
+`viz-api` can ingest real pending transactions from Ethereum-compatible RPC providers.
 
-Set environment variables before starting `viz-api`:
+Chain workers are loaded from `configs/chain_config.json` by default. Override file path with:
 
-- `VIZ_API_ETH_WS_URL` (optional override): WebSocket endpoint for `eth_subscribe newPendingTransactions`
-- `VIZ_API_ETH_HTTP_URL` (optional override): HTTP endpoint for `eth_getTransactionByHash`
-- `VIZ_API_SOURCE_ID` (optional): source label (default: `rpc-live`)
-- `VIZ_API_CHAINS` (optional): JSON array for chain-scoped ingest workers (overrides single-chain vars)
+- `VIZ_API_CHAIN_CONFIG_PATH` (optional): custom chain config JSON path
+
+Legacy env-based overrides are still supported:
+
+- `VIZ_API_CHAINS` (optional): JSON chain list override (takes priority over file)
+- `VIZ_API_ETH_WS_URL` (optional): single-chain WebSocket override for the primary chain
+- `VIZ_API_ETH_HTTP_URL` (optional): single-chain HTTP override for the primary chain
+- `VIZ_API_SOURCE_ID` (optional): single-chain source label override for the primary chain
 - `VIZ_API_MAX_SEEN_HASHES` (optional): dedup cache size for live feed (default: `10000`)
 - `VIZ_API_RPC_BATCH_SIZE` (optional): hashes per `eth_getTransactionByHash` batch request (default: `32`)
 - `VIZ_API_RPC_MAX_IN_FLIGHT` (optional): per-chain in-flight RPC batch cap (default: `4`)
 - `VIZ_API_RPC_RETRY_ATTEMPTS` (optional): retry count after initial batch request failure (default: `2`)
 - `VIZ_API_RPC_RETRY_BACKOFF_MS` (optional): base retry backoff in milliseconds (default: `100`)
 - `VIZ_API_RPC_BATCH_FLUSH_MS` (optional): max wait before flushing queued hashes into batch fetch (default: `40`)
+- `VIZ_API_SILENT_CHAIN_TIMEOUT_SECS` (optional): rotate to the next endpoint when a chain receives no pending notifications for this many seconds (default: `20`)
 
-Example:
+File-based multi-chain example (`configs/chain_config.json`):
 
-```bash
-export VIZ_API_ETH_WS_URL="wss://YOUR_PROVIDER_WS_URL"
-export VIZ_API_ETH_HTTP_URL="https://YOUR_PROVIDER_HTTP_URL"
-export VIZ_API_RPC_BATCH_SIZE="32"
-export VIZ_API_RPC_MAX_IN_FLIGHT="4"
-cargo run -p viz-api --bin viz-api
+```json
+{
+  "chains": [
+    {
+      "chain_key": "eth-mainnet",
+      "chain_id": 1,
+      "source_id": "rpc-eth-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://YOUR_ETH_WS_URL",
+          "http_url": "https://YOUR_ETH_HTTP_URL"
+        }
+      ]
+    },
+    {
+      "chain_key": "base-mainnet",
+      "chain_id": 8453,
+      "source_id": "rpc-base-mainnet",
+      "endpoints": [
+        {
+          "ws_url": "wss://YOUR_BASE_WS_URL",
+          "http_url": "https://YOUR_BASE_HTTP_URL"
+        }
+      ]
+    }
+  ]
+}
 ```
 
-Multi-chain example:
+Start:
 
 ```bash
-export VIZ_API_CHAINS='[
-  {
-    "chain_key": "eth-mainnet",
-    "chain_id": 1,
-    "ws_url": "wss://YOUR_ETH_WS_URL",
-    "http_url": "https://YOUR_ETH_HTTP_URL",
-    "source_id": "rpc-eth-mainnet"
-  },
-  {
-    "chain_key": "base-mainnet",
-    "chain_id": 8453,
-    "ws_url": "wss://YOUR_BASE_WS_URL",
-    "http_url": "https://YOUR_BASE_HTTP_URL",
-    "source_id": "rpc-base-mainnet"
-  }
-]'
 cargo run -p viz-api --bin viz-api
 ```
-
-Without these overrides, `viz-api` uses built-in public RPC endpoints for live mode.
 
 ### Chain-Aware API Filters
 
@@ -118,6 +126,8 @@ The following endpoints accept an optional `chain_id` query parameter:
 - `/transactions/all`
 - `/features/recent`
 - `/opps/recent`
+
+`/dashboard/snapshot` also returns `chain_ingest_status`, a per-chain worker status list (`state`, endpoint index/url, silent duration, and rotation count).
 
 Examples:
 

@@ -13,7 +13,10 @@ use axum::{middleware, response::Response};
 use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
-use live_rpc::{LiveRpcConfig, live_rpc_drop_metrics_snapshot, start_live_rpc_feed};
+use live_rpc::{
+    LiveRpcChainStatus, LiveRpcConfig, live_rpc_chain_status_snapshot,
+    live_rpc_drop_metrics_snapshot, start_live_rpc_feed,
+};
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
@@ -156,6 +159,7 @@ pub struct DashboardSnapshot {
     pub feature_summary: Vec<FeatureSummary>,
     pub feature_details: Vec<FeatureDetail>,
     pub transactions: Vec<TransactionSummary>,
+    pub chain_ingest_status: Vec<LiveRpcChainStatus>,
     pub market_stats: MarketStats,
     pub latest_seq_id: u64,
 }
@@ -1155,6 +1159,7 @@ async fn dashboard_snapshot(
             chain_id,
             tx_limit,
         ),
+        chain_ingest_status: live_rpc_chain_status_snapshot(),
         market_stats: state.provider.market_stats(),
         latest_seq_id,
     })
@@ -2236,6 +2241,7 @@ mod tests {
         assert_eq!(payload.latest_seq_id, 3);
         assert_eq!(payload.market_stats.total_signal_volume, 9_536);
         assert_eq!(payload.market_stats.success_rate_bps, 9_949);
+        let _ = payload.chain_ingest_status;
     }
 
     #[tokio::test]
