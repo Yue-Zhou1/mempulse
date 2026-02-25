@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const HIGH_THROUGHPUT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct StorageWal {
@@ -27,6 +28,14 @@ impl StorageWal {
             path,
             segment_max_bytes: segment_max_bytes.max(1),
         })
+    }
+
+    pub fn high_throughput(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::with_segment_size(path, HIGH_THROUGHPUT_SEGMENT_MAX_BYTES)
+    }
+
+    pub fn segment_max_bytes(&self) -> u64 {
+        self.segment_max_bytes
     }
 
     pub fn append_event(&self, event: &EventEnvelope) -> Result<()> {
