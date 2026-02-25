@@ -1161,7 +1161,10 @@ fn build_opportunity_records(
     chain_id: Option<u64>,
 ) -> Vec<OpportunityRecord> {
     rank_opportunities(
-        &[SearcherInputTx::borrowed(decoded.clone(), calldata)],
+        &[SearcherInputTx {
+            decoded: decoded.clone(),
+            calldata: calldata.to_vec().into(),
+        }],
         SearcherConfig {
             min_score: SEARCHER_MIN_SCORE,
             max_candidates: SEARCHER_MAX_CANDIDATES,

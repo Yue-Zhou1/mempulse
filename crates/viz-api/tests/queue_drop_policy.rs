@@ -9,10 +9,10 @@ use tokio::sync::mpsc;
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{
-    LiveRpcDropReason, classify_storage_enqueue_drop_reason, observe_live_rpc_drop_reason,
-    reset_live_rpc_drop_metrics,
+    classify_storage_enqueue_drop_reason, observe_live_rpc_drop_reason,
+    reset_live_rpc_drop_metrics, LiveRpcDropReason,
 };
-use viz_api::{AppState, InMemoryVizProvider, VizDataProvider, build_router};
+use viz_api::{build_router, AppState, InMemoryVizProvider, VizDataProvider};
 
 fn sample_peer_stats() -> PeerStatsRecord {
     PeerStatsRecord {
@@ -61,11 +61,8 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
     observe_live_rpc_drop_reason(LiveRpcDropReason::StorageQueueClosed);
 
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
-    let provider: Arc<dyn VizDataProvider> = Arc::new(InMemoryVizProvider::new(
-        storage,
-        Arc::new(Vec::new()),
-        1,
-    ));
+    let provider: Arc<dyn VizDataProvider> =
+        Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
     let state = AppState {
         provider,
         downsample_limit: 100,

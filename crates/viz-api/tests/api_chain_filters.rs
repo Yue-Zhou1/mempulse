@@ -9,8 +9,8 @@ use storage::{
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::{
-    AppState, DashboardSnapshot, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
-    TransactionDetail, TransactionSummary, VizDataProvider, build_router,
+    build_router, AppState, DashboardSnapshot, FeatureDetail, InMemoryVizProvider,
+    OpportunityDetail, TransactionDetail, TransactionSummary, VizDataProvider,
 };
 
 fn hash(seed: u8) -> [u8; 32] {
@@ -115,11 +115,8 @@ fn seed_storage() -> Arc<RwLock<InMemoryStorage>> {
 
 fn build_test_app() -> axum::Router {
     let storage = seed_storage();
-    let provider: Arc<dyn VizDataProvider> = Arc::new(InMemoryVizProvider::new(
-        storage,
-        Arc::new(Vec::new()),
-        1,
-    ));
+    let provider: Arc<dyn VizDataProvider> =
+        Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
     let state = AppState {
         provider,
         downsample_limit: 100,
@@ -226,7 +223,13 @@ async fn api_chain_filters_apply_to_dashboard_snapshot() {
         .await
         .expect("dashboard body");
     let payload: DashboardSnapshot = serde_json::from_slice(&body).expect("dashboard payload");
-    assert!(payload.feature_details.iter().all(|row| row.chain_id == Some(1)));
-    assert!(payload.opportunities.iter().all(|row| row.chain_id == Some(1)));
+    assert!(payload
+        .feature_details
+        .iter()
+        .all(|row| row.chain_id == Some(1)));
+    assert!(payload
+        .opportunities
+        .iter()
+        .all(|row| row.chain_id == Some(1)));
     assert_eq!(payload.transactions.len(), 1);
 }

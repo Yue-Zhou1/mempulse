@@ -5,8 +5,8 @@ use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
-    ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal, StorageWriteOp,
-    StorageWriterConfig, spawn_single_writer,
+    spawn_single_writer, ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal,
+    StorageWriteOp, StorageWriterConfig,
 };
 
 fn hash(seed: u8) -> [u8; 32] {
@@ -67,7 +67,8 @@ fn wal_flush_throughput_exposes_high_volume_tuning_presets() {
     assert!(writer.flush_batch_size > StorageWriterConfig::default().flush_batch_size);
     assert!(writer.flush_interval_ms < StorageWriterConfig::default().flush_interval_ms);
 
-    let wal = StorageWal::high_throughput(temp_wal_path("preset")).expect("create high throughput wal");
+    let wal =
+        StorageWal::high_throughput(temp_wal_path("preset")).expect("create high throughput wal");
     assert!(wal.segment_max_bytes() > 64 * 1024 * 1024);
 }
 
@@ -90,7 +91,10 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
 
     for seq in 1..=256_u64 {
         handle
-            .enqueue(StorageWriteOp::AppendEvent(decoded_event(seq, (seq % 255) as u8)))
+            .enqueue(StorageWriteOp::AppendEvent(decoded_event(
+                seq,
+                (seq % 255) as u8,
+            )))
             .await
             .expect("enqueue append event");
     }
@@ -107,7 +111,10 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
     assert!(sizes.iter().copied().max().unwrap_or(0) >= 64);
 
     let recovered = wal.recover_events().expect("recover wal after flush");
-    assert!(recovered.is_empty(), "wal should be cleared after successful flush");
+    assert!(
+        recovered.is_empty(),
+        "wal should be cleared after successful flush"
+    );
 
     let events = storage.read().expect("lock storage").list_events();
     assert_eq!(events.len(), 256);

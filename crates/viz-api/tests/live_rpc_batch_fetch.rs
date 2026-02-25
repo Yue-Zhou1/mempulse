@@ -3,7 +3,9 @@ use viz_api::live_rpc::{
 };
 
 fn sample_hashes(n: usize) -> Vec<String> {
-    (0..n).map(|index| format!("0x{:064x}", index + 1)).collect()
+    (0..n)
+        .map(|index| format!("0x{:064x}", index + 1))
+        .collect()
 }
 
 #[test]

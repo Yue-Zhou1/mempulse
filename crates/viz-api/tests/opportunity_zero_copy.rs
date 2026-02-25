@@ -26,10 +26,10 @@ fn decoded_with_calldata_len(calldata_len: usize) -> TxDecoded {
 fn opportunity_zero_copy_accepts_borrowed_calldata_without_clone() {
     let calldata = vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4];
     let expected_ptr = calldata.as_ptr() as usize;
-    let batch = vec![SearcherInputTx::borrowed(
-        decoded_with_calldata_len(calldata.len()),
-        &calldata,
-    )];
+    let batch = vec![SearcherInputTx {
+        decoded: decoded_with_calldata_len(calldata.len()),
+        calldata: calldata.into(),
+    }];
 
     let ranked = rank_opportunities(
         &batch,
@@ -39,7 +39,7 @@ fn opportunity_zero_copy_accepts_borrowed_calldata_without_clone() {
         },
     );
 
-    let borrowed_ptr = batch[0].calldata.as_ref().as_ptr() as usize;
+    let borrowed_ptr = batch[0].calldata.as_ptr() as usize;
     assert_eq!(borrowed_ptr, expected_ptr);
     assert!(!ranked.is_empty());
 }
