@@ -1250,7 +1250,7 @@ export default function App() {
           </div>
           <div className="relative mb-4 flex items-center justify-center border-b border-zinc-900 pb-3">
             <h1 className="news-headline text-center text-4xl font-extrabold uppercase leading-none tracking-tight md:text-6xl">
-              Mempulse Ledger
+              Mempulse
             </h1>
             <div className="news-mono absolute right-0 top-1/2 hidden -translate-y-1/2 border border-zinc-900 bg-[#f7f1e6] px-2 py-1 text-[10px] uppercase tracking-[0.12em] lg:block">
               Live Wire
