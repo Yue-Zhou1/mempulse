@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
-    EventStore, InMemoryStorage, OpportunityRecord, StorageWriteHandle, StorageWriteOp,
-    StorageTryEnqueueError, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
+    EventStore, InMemoryStorage, OpportunityRecord, StorageTryEnqueueError, StorageWriteHandle,
+    StorageWriteOp, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
 use tokio::sync::Semaphore;
 use tokio_tungstenite::connect_async;
@@ -123,9 +123,7 @@ pub fn observe_live_rpc_drop_reason(reason: LiveRpcDropReason) {
     live_rpc_drop_metrics().observe(reason);
 }
 
-pub fn classify_storage_enqueue_drop_reason(
-    error: StorageTryEnqueueError,
-) -> LiveRpcDropReason {
+pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> LiveRpcDropReason {
     match error {
         StorageTryEnqueueError::QueueFull => LiveRpcDropReason::StorageQueueFull,
         StorageTryEnqueueError::QueueClosed => LiveRpcDropReason::StorageQueueClosed,
@@ -370,7 +368,7 @@ pub fn dispatchable_batch_count(
     if queue_len == 0 {
         return 0;
     }
-    let batches = (queue_len + batch_size.max(1) - 1) / batch_size.max(1);
+    let batches = queue_len.div_ceil(batch_size.max(1));
     batches.min(max_in_flight.max(1))
 }
 
@@ -524,13 +522,15 @@ async fn run_chain_worker(
             "starting chain-scoped live rpc websocket session"
         );
         let session_result = run_ws_session(
-            &writer,
-            &chain,
-            endpoint,
-            max_seen_hashes,
-            batch_fetch,
-            &client,
-            &next_seq_id,
+            LiveRpcSessionContext {
+                writer: &writer,
+                chain: &chain,
+                endpoint,
+                max_seen_hashes,
+                batch_fetch,
+                client: &client,
+                next_seq_id: &next_seq_id,
+            },
             &mut seen_hashes,
             &mut seen_order,
         )
@@ -553,20 +553,24 @@ async fn run_chain_worker(
     }
 }
 
-async fn run_ws_session(
-    writer: &StorageWriteHandle,
-    chain: &ChainRpcConfig,
-    endpoint: &RpcEndpoint,
+struct LiveRpcSessionContext<'a> {
+    writer: &'a StorageWriteHandle,
+    chain: &'a ChainRpcConfig,
+    endpoint: &'a RpcEndpoint,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
-    client: &reqwest::Client,
-    next_seq_id: &Arc<AtomicU64>,
+    client: &'a reqwest::Client,
+    next_seq_id: &'a Arc<AtomicU64>,
+}
+
+async fn run_ws_session(
+    session: LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
-    let (ws_stream, _) = connect_async(endpoint.ws_url.as_str())
+    let (ws_stream, _) = connect_async(session.endpoint.ws_url.as_str())
         .await
-        .with_context(|| format!("connect {}", endpoint.ws_url))?;
+        .with_context(|| format!("connect {}", session.endpoint.ws_url))?;
     let (mut write, mut read) = ws_stream.split();
 
     let subscribe = json!({
@@ -580,16 +584,16 @@ async fn run_ws_session(
         .await
         .context("send eth_subscribe request")?;
     tracing::info!(
-        chain_key = %chain.chain_key,
-        chain_id = ?chain.chain_id,
-        ws_url = endpoint.ws_url,
+        chain_key = %session.chain.chain_key,
+        chain_id = ?session.chain.chain_id,
+        ws_url = session.endpoint.ws_url,
         "subscribed to eth_subscribe:newPendingTransactions"
     );
 
     let mut subscription_id: Option<String> = None;
-    let flush_interval = Duration::from_millis(batch_fetch.flush_interval_ms);
+    let flush_interval = Duration::from_millis(session.batch_fetch.flush_interval_ms);
     let mut pending_hashes = VecDeque::new();
-    let in_flight = Arc::new(Semaphore::new(batch_fetch.max_in_flight));
+    let in_flight = Arc::new(Semaphore::new(session.batch_fetch.max_in_flight));
     loop {
         match tokio::time::timeout(flush_interval, read.next()).await {
             Ok(Some(frame)) => {
@@ -609,51 +613,33 @@ async fn run_ws_session(
                     _ => {}
                 }
                 flush_pending_hash_batches(
-                    writer,
-                    chain,
-                    endpoint,
-                    max_seen_hashes,
-                    client,
-                    next_seq_id,
+                    &session,
                     seen_hashes,
                     seen_order,
                     &mut pending_hashes,
                     &in_flight,
-                    batch_fetch,
                 )
                 .await?;
             }
             Ok(None) => break,
             Err(_) => {
                 flush_pending_hash_batches(
-                    writer,
-                    chain,
-                    endpoint,
-                    max_seen_hashes,
-                    client,
-                    next_seq_id,
+                    &session,
                     seen_hashes,
                     seen_order,
                     &mut pending_hashes,
                     &in_flight,
-                    batch_fetch,
                 )
                 .await?;
             }
         }
     }
     flush_pending_hash_batches(
-        writer,
-        chain,
-        endpoint,
-        max_seen_hashes,
-        client,
-        next_seq_id,
+        &session,
         seen_hashes,
         seen_order,
         &mut pending_hashes,
         &in_flight,
-        batch_fetch,
     )
     .await?;
 
@@ -732,57 +718,32 @@ pub fn parse_pending_hash<'a>(
 }
 
 async fn flush_pending_hash_batches(
-    writer: &StorageWriteHandle,
-    chain: &ChainRpcConfig,
-    endpoint: &RpcEndpoint,
-    max_seen_hashes: usize,
-    client: &reqwest::Client,
-    next_seq_id: &Arc<AtomicU64>,
+    session: &LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
     pending_hashes: &mut VecDeque<String>,
     in_flight: &Arc<Semaphore>,
-    batch_fetch: BatchFetchConfig,
 ) -> Result<()> {
     let dispatch_count = dispatchable_batch_count(
         pending_hashes.len(),
-        batch_fetch.batch_size,
-        batch_fetch.max_in_flight,
+        session.batch_fetch.batch_size,
+        session.batch_fetch.max_in_flight,
     );
     for _ in 0..dispatch_count {
         let batch = pending_hashes
-            .drain(..batch_fetch.batch_size.min(pending_hashes.len()))
+            .drain(..session.batch_fetch.batch_size.min(pending_hashes.len()))
             .collect::<Vec<_>>();
-        process_pending_hash_batch(
-            writer,
-            chain,
-            endpoint,
-            max_seen_hashes,
-            client,
-            next_seq_id,
-            seen_hashes,
-            seen_order,
-            batch,
-            in_flight,
-            batch_fetch,
-        )
-        .await?;
+        process_pending_hash_batch(session, seen_hashes, seen_order, batch, in_flight).await?;
     }
     Ok(())
 }
 
 async fn process_pending_hash_batch(
-    writer: &StorageWriteHandle,
-    chain: &ChainRpcConfig,
-    endpoint: &RpcEndpoint,
-    max_seen_hashes: usize,
-    client: &reqwest::Client,
-    next_seq_id: &Arc<AtomicU64>,
+    session: &LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
     hash_batch: Vec<String>,
     in_flight: &Arc<Semaphore>,
-    batch_fetch: BatchFetchConfig,
 ) -> Result<()> {
     let mut deduped_hashes = Vec::new();
     let mut deduped_raw = Vec::new();
@@ -792,8 +753,8 @@ async fn process_pending_hash_batch(
             None => {
                 observe_live_rpc_drop_reason(LiveRpcDropReason::InvalidPendingHash);
                 tracing::warn!(
-                    chain_key = %chain.chain_key,
-                    source_id = %chain.source_id,
+                    chain_key = %session.chain.chain_key,
+                    source_id = %session.chain.source_id,
                     hash = %hash_hex,
                     reason = LiveRpcDropReason::InvalidPendingHash.as_label(),
                     "dropping pending hash: invalid hex payload"
@@ -801,7 +762,7 @@ async fn process_pending_hash_batch(
                 continue;
             }
         };
-        if remember_hash(hash, seen_hashes, seen_order, max_seen_hashes) {
+        if remember_hash(hash, seen_hashes, seen_order, session.max_seen_hashes) {
             deduped_hashes.push(hash_hex);
             deduped_raw.push(hash);
         }
@@ -816,10 +777,10 @@ async fn process_pending_hash_batch(
         .map_err(|_| anyhow!("rpc in-flight semaphore closed"))?;
     let rpc_started = Instant::now();
     let fetched = fetch_transactions_by_hash_batch_with_retry(
-        client,
-        endpoint.http_url.as_str(),
+        session.client,
+        session.endpoint.http_url.as_str(),
         &deduped_hashes,
-        batch_fetch,
+        session.batch_fetch,
     )
     .await?;
     let rpc_latency_ms = rpc_started.elapsed().as_secs_f64() * 1_000.0;
@@ -827,8 +788,8 @@ async fn process_pending_hash_batch(
     let error_count = deduped_hashes.len().saturating_sub(fetched_count);
     let error_rate = error_count as f64 / deduped_hashes.len() as f64;
     tracing::info!(
-        chain_key = %chain.chain_key,
-        chain_id = ?chain.chain_id,
+        chain_key = %session.chain.chain_key,
+        chain_id = ?session.chain.chain_id,
         batch_size = deduped_hashes.len(),
         fetched_count,
         error_count,
@@ -842,7 +803,14 @@ async fn process_pending_hash_batch(
         .zip(deduped_raw.into_iter())
         .zip(fetched.into_iter())
     {
-        process_pending_hash_with_fetched_tx(writer, chain, hash_hex, hash, fetched_tx, next_seq_id)?;
+        process_pending_hash_with_fetched_tx(
+            session.writer,
+            session.chain,
+            hash_hex,
+            hash,
+            fetched_tx,
+            session.next_seq_id,
+        )?;
     }
 
     Ok(())
@@ -950,8 +918,7 @@ fn process_pending_hash_with_fetched_tx(
             hash,
             fetched_at_unix_ms: now_unix_ms,
         }),
-    )
-    ? {
+    )? {
         return Ok(());
     }
 
@@ -979,8 +946,7 @@ fn process_pending_hash_with_fetched_tx(
             next_seq_id,
             now_unix_ms,
             EventPayload::TxDecoded(decoded.clone()),
-        )
-        ? {
+        )? {
             return Ok(());
         }
         if !try_enqueue_storage_write(
@@ -1037,7 +1003,11 @@ fn process_pending_hash_with_fetched_tx(
                     return Ok(());
                 }
             }
-            if !try_enqueue_storage_write(writer, chain, StorageWriteOp::UpsertOpportunity(opportunity))? {
+            if !try_enqueue_storage_write(
+                writer,
+                chain,
+                StorageWriteOp::UpsertOpportunity(opportunity),
+            )? {
                 return Ok(());
             }
         }
@@ -1434,7 +1404,7 @@ struct RpcBatchFetchResponseEnvelope {
 #[serde(untagged)]
 enum RpcBatchFetchResponseBody {
     Batch(Vec<RpcBatchFetchResponseEnvelope>),
-    Single(RpcBatchFetchResponseEnvelope),
+    Single(Box<RpcBatchFetchResponseEnvelope>),
 }
 
 fn decode_transaction_fetch_response_to_live_tx(
@@ -1467,7 +1437,7 @@ fn decode_transaction_fetch_batch_response_to_live_txs(
     let mut fetched = vec![None; hashes.len()];
     let envelopes = match response {
         RpcBatchFetchResponseBody::Batch(rows) => rows,
-        RpcBatchFetchResponseBody::Single(row) => vec![row],
+        RpcBatchFetchResponseBody::Single(row) => vec![*row],
     };
 
     for envelope in envelopes {

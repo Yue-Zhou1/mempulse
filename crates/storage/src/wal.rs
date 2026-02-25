@@ -103,7 +103,7 @@ impl StorageWal {
             if len < self.segment_max_bytes {
                 return Ok(path.clone());
             }
-            return Ok(self.segment_path(id.saturating_add(1))?);
+            return self.segment_path(id.saturating_add(1));
         }
 
         self.segment_path(0)

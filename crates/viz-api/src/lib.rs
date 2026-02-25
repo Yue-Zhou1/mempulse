@@ -1465,8 +1465,7 @@ fn render_prometheus_metrics(state: &AppState) -> String {
 
     out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
     out.push_str(&format!(
-        "mempulse_relay_success_rate {:.6}\n",
-        relay_success_rate
+        "mempulse_relay_success_rate {relay_success_rate:.6}\n"
     ));
     out.push_str("# TYPE mempulse_relay_bundle_included_total counter\n");
     out.push_str(&format!(
