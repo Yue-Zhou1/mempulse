@@ -916,7 +916,7 @@ fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
     if trimmed.is_empty() {
         return Some(Vec::new());
     }
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return None;
     }
     (0..trimmed.len())
@@ -1581,10 +1581,10 @@ async fn handle_socket(
     batch_limit: usize,
     interval_ms: u64,
 ) {
-    if let Ok(payload) = serde_json::to_string(&hello) {
-        if socket.send(Message::Text(payload.into())).await.is_err() {
-            return;
-        }
+    if let Ok(payload) = serde_json::to_string(&hello)
+        && socket.send(Message::Text(payload.into())).await.is_err()
+    {
+        return;
     }
 
     let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));

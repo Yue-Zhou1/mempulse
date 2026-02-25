@@ -343,13 +343,13 @@ impl InMemoryStorage {
         self.recent_tx_lookup.insert(hash, record);
 
         while self.recent_tx_order.len() > self.config.recent_tx_capacity {
-            if let Some(old_hash) = self.recent_tx_order.pop_front() {
-                if let Some(count) = self.recent_tx_counts.get_mut(&old_hash) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.recent_tx_counts.remove(&old_hash);
-                        self.recent_tx_lookup.remove(&old_hash);
-                    }
+            if let Some(old_hash) = self.recent_tx_order.pop_front()
+                && let Some(count) = self.recent_tx_counts.get_mut(&old_hash)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.recent_tx_counts.remove(&old_hash);
+                    self.recent_tx_lookup.remove(&old_hash);
                 }
             }
         }
@@ -640,11 +640,11 @@ pub fn spawn_single_writer(
     if let Some(wal) = wal.as_ref() {
         match wal.recover_events() {
             Ok(events) => {
-                if !events.is_empty() {
-                    if let Ok(mut guard) = storage.write() {
-                        for event in events {
-                            guard.append_event(event);
-                        }
+                if !events.is_empty()
+                    && let Ok(mut guard) = storage.write()
+                {
+                    for event in events {
+                        guard.append_event(event);
                     }
                 }
             }
@@ -717,10 +717,10 @@ fn apply_write_op(
     match op {
         StorageWriteOp::AppendEvent(event) => {
             let event = sequencer.assign(event);
-            if let Some(wal) = wal {
-                if let Err(err) = wal.append_event(&event) {
-                    tracing::warn!(error = %err, "failed to append event to storage WAL");
-                }
+            if let Some(wal) = wal
+                && let Err(err) = wal.append_event(&event)
+            {
+                tracing::warn!(error = %err, "failed to append event to storage WAL");
             }
             storage.append_event(event.clone());
             batch.push(event);
@@ -745,10 +745,10 @@ async fn flush_batch(
     let pending = std::mem::take(batch);
     if let Err(err) = sink.flush_event_batch(pending).await {
         tracing::warn!(error = %err, "clickhouse batch flush failed");
-    } else if let Some(wal) = wal {
-        if let Err(err) = wal.clear() {
-            tracing::warn!(error = %err, "failed to clear storage WAL after flush");
-        }
+    } else if let Some(wal) = wal
+        && let Err(err) = wal.clear()
+    {
+        tracing::warn!(error = %err, "failed to clear storage WAL after flush");
     }
 }
 

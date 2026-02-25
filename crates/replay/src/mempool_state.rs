@@ -164,16 +164,15 @@ impl MempoolState {
         if let Some(old_hash) = self
             .sender_nonce_index
             .insert((decoded.sender, decoded.nonce), decoded.hash)
+            && old_hash != decoded.hash
         {
-            if old_hash != decoded.hash {
-                if let Some(old_entry) = self.txs.get_mut(&old_hash) {
-                    old_entry.status = TxLifecycleStatus::Replaced { by: decoded.hash };
-                }
-                transitions.push(StateTransition::Replaced {
-                    old_hash,
-                    new_hash: decoded.hash,
-                });
+            if let Some(old_entry) = self.txs.get_mut(&old_hash) {
+                old_entry.status = TxLifecycleStatus::Replaced { by: decoded.hash };
             }
+            transitions.push(StateTransition::Replaced {
+                old_hash,
+                new_hash: decoded.hash,
+            });
         }
 
         let entry = self.txs.entry(decoded.hash).or_insert(TxEntry {
@@ -192,14 +191,13 @@ impl MempoolState {
     fn apply_dropped(&mut self, dropped: &TxDropped) -> Vec<StateTransition> {
         let mut transitions = Vec::new();
         if let Some(entry) = self.txs.get_mut(&dropped.hash) {
-            if let (Some(sender), Some(nonce)) = (entry.sender, entry.nonce) {
-                if self
+            if let (Some(sender), Some(nonce)) = (entry.sender, entry.nonce)
+                && self
                     .sender_nonce_index
                     .get(&(sender, nonce))
                     .is_some_and(|hash| *hash == dropped.hash)
-                {
-                    self.sender_nonce_index.remove(&(sender, nonce));
-                }
+            {
+                self.sender_nonce_index.remove(&(sender, nonce));
             }
 
             entry.status = TxLifecycleStatus::Dropped {

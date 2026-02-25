@@ -78,10 +78,10 @@ pub fn rank_opportunities(
     for input in batch {
         let featured = analyze_decoded_transaction(&input.decoded, input.calldata.as_ref());
         for strategy in &strategies {
-            if let Some(candidate) = strategy.evaluate(&featured) {
-                if candidate.score >= config.min_score {
-                    candidates.push(candidate);
-                }
+            if let Some(candidate) = strategy.evaluate(&featured)
+                && candidate.score >= config.min_score
+            {
+                candidates.push(candidate);
             }
         }
     }

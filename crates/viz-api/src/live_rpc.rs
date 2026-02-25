@@ -445,18 +445,17 @@ impl LiveRpcConfig {
                             .unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned()),
                     }];
                 }
-            } else if let Some(http_url) = http_override {
-                if let Some(primary_chain) = config.chains.first_mut() {
-                    if let Some(primary_endpoint) = primary_chain.endpoints.first_mut() {
-                        primary_endpoint.http_url = http_url;
-                    }
-                }
+            } else if let Some(http_url) = http_override
+                && let Some(primary_chain) = config.chains.first_mut()
+                && let Some(primary_endpoint) = primary_chain.endpoints.first_mut()
+            {
+                primary_endpoint.http_url = http_url;
             }
 
-            if let Some(source_id_override) = source_id_override {
-                if let Some(primary_chain) = config.chains.first_mut() {
-                    primary_chain.source_id = SourceId::new(source_id_override);
-                }
+            if let Some(source_id_override) = source_id_override
+                && let Some(primary_chain) = config.chains.first_mut()
+            {
+                primary_chain.source_id = SourceId::new(source_id_override);
             }
         }
         config.max_seen_hashes = max_seen_hashes;
@@ -1064,10 +1063,10 @@ pub fn parse_pending_hash<'a>(
     }
 
     let params = message.params?;
-    if let Some(expected) = subscription_id.as_ref() {
-        if expected != params.subscription {
-            return None;
-        }
+    if let Some(expected) = subscription_id.as_ref()
+        && expected != params.subscription
+    {
+        return None;
     }
 
     params.result.as_hash()
@@ -1934,7 +1933,7 @@ fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
     if trimmed.is_empty() {
         return Some(Vec::new());
     }
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return None;
     }
     (0..trimmed.len())

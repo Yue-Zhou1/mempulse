@@ -236,7 +236,7 @@ fn replay_snapshot(events: &[EventEnvelope], stride: usize) -> Vec<ReplayFrame> 
             _ => {}
         }
 
-        if count % stride == 0 || count == sorted.len() {
+        if count.is_multiple_of(stride) || count == sorted.len() {
             frames.push(ReplayFrame {
                 seq_hi: event.seq_id,
                 timestamp_unix_ms: event.ingest_ts_unix_ms,

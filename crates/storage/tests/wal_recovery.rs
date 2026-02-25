@@ -139,10 +139,10 @@ fn wal_segments_roll_over_and_scan_across_segments() {
 
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&segment_prefix) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(&segment_prefix)
+            {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
     }
