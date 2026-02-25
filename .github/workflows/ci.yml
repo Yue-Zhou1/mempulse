@@ -30,6 +30,22 @@ jobs:
       - name: Run phase verification checks
         run: bash scripts/verify_phase_checks.sh
 
+  perf-regression:
+    name: Perf Regression Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run perf regression checks
+        run: bash scripts/perf_regression_check.sh
+
   web-ui:
     name: Web UI Check
     runs-on: ubuntu-latest
