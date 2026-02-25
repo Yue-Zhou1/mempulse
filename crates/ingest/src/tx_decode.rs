@@ -191,7 +191,7 @@ fn parse_variable_hex(value: &str, field: &'static str) -> Result<Vec<u8>, Decod
         return Ok(Vec::new());
     }
 
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err(DecodeError::InvalidHex { field });
     }
 

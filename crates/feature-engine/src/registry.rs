@@ -61,15 +61,15 @@ impl ProtocolRegistry {
     }
 
     pub fn classify(&self, to: Option<Address>, selector: Option<[u8; 4]>) -> &'static str {
-        if let Some(address) = to {
-            if let Some(protocol) = self.by_address.get(&address) {
-                return protocol;
-            }
+        if let Some(address) = to
+            && let Some(protocol) = self.by_address.get(&address)
+        {
+            return protocol;
         }
-        if let Some(selector) = selector {
-            if let Some(protocol) = self.by_selector.get(&selector) {
-                return protocol;
-            }
+        if let Some(selector) = selector
+            && let Some(protocol) = self.by_selector.get(&selector)
+        {
+            return protocol;
         }
         "unknown"
     }
@@ -117,7 +117,7 @@ fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, RegistryError> {
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err(RegistryError(format!("odd-length hex string: {value}")));
     }
 
