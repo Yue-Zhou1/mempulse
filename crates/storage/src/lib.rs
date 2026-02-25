@@ -124,6 +124,15 @@ pub struct RecentTransactionRecord {
     pub source_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MarketStatsSnapshot {
+    pub total_signal_volume: u64,
+    pub total_tx_count: u64,
+    pub low_risk_count: u64,
+    pub medium_risk_count: u64,
+    pub high_risk_count: u64,
+}
+
 fn default_feature_engine_version() -> String {
     feature_engine::version().to_owned()
 }
@@ -149,6 +158,7 @@ pub struct InMemoryStorage {
     recent_tx_order: VecDeque<TxHash>,
     recent_tx_counts: FastMap<TxHash, usize>,
     recent_tx_lookup: FastMap<TxHash, RecentTransactionRecord>,
+    market_stats: MarketStatsSnapshot,
 }
 
 impl Default for InMemoryStorage {
@@ -179,12 +189,14 @@ impl InMemoryStorage {
             recent_tx_order: VecDeque::new(),
             recent_tx_counts: FastMap::default(),
             recent_tx_lookup: FastMap::default(),
+            market_stats: MarketStatsSnapshot::default(),
         }
     }
 
     pub fn upsert_tx_seen(&mut self, record: TxSeenRecord) {
         let start = Instant::now();
         push_bounded(&mut self.tx_seen, record, self.config.table_capacity);
+        self.market_stats.total_tx_count = self.market_stats.total_tx_count.saturating_add(1);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
@@ -196,7 +208,18 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
         let start = Instant::now();
+        let mev_score = record.mev_score;
         push_bounded(&mut self.tx_features, record, self.config.table_capacity);
+        self.market_stats.total_signal_volume =
+            self.market_stats.total_signal_volume.saturating_add(1);
+        if mev_score >= 80 {
+            self.market_stats.high_risk_count = self.market_stats.high_risk_count.saturating_add(1);
+        } else if mev_score >= 45 {
+            self.market_stats.medium_risk_count =
+                self.market_stats.medium_risk_count.saturating_add(1);
+        } else {
+            self.market_stats.low_risk_count = self.market_stats.low_risk_count.saturating_add(1);
+        }
         self.record_write_latency(start.elapsed().as_nanos() as u64);
     }
 
@@ -284,6 +307,10 @@ impl InMemoryStorage {
                 .sum::<u64>()
                 .saturating_div(self.write_latency_ns.len() as u64),
         )
+    }
+
+    pub fn market_stats_snapshot(&self) -> MarketStatsSnapshot {
+        self.market_stats
     }
 
     fn track_recent_transaction(&mut self, record: RecentTransactionRecord) {
@@ -1183,6 +1210,51 @@ mod tests {
         assert_eq!(store.tx_features().len(), 2);
         assert_eq!(store.tx_lifecycle().len(), 2);
         assert_eq!(store.peer_stats().len(), 2);
+        let market_stats = store.market_stats_snapshot();
+        assert_eq!(market_stats.total_tx_count, 4);
+        assert_eq!(market_stats.total_signal_volume, 4);
+        assert_eq!(market_stats.low_risk_count, 0);
+        assert_eq!(market_stats.medium_risk_count, 0);
+        assert_eq!(market_stats.high_risk_count, 4);
+    }
+
+    #[test]
+    fn market_stats_counters_are_cumulative_even_when_tables_are_bounded() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 100,
+            table_capacity: 1,
+            write_latency_capacity: 100,
+        });
+
+        for (idx, mev_score) in [10_u16, 45, 80].into_iter().enumerate() {
+            let hash = hash((idx + 1) as u8);
+            store.upsert_tx_seen(TxSeenRecord {
+                hash,
+                peer: "peer-a".to_owned(),
+                first_seen_unix_ms: 1_700_000_000_000 + idx as i64,
+                first_seen_mono_ns: idx as u64,
+                seen_count: 1,
+            });
+            store.upsert_tx_features(TxFeaturesRecord {
+                hash,
+                protocol: "erc20".to_owned(),
+                category: "transfer".to_owned(),
+                mev_score,
+                urgency_score: 1,
+                method_selector: None,
+                feature_engine_version: "feature-engine.v1".to_owned(),
+            });
+        }
+
+        assert_eq!(store.tx_seen().len(), 1);
+        assert_eq!(store.tx_features().len(), 1);
+        let market_stats = store.market_stats_snapshot();
+        assert_eq!(market_stats.total_tx_count, 3);
+        assert_eq!(market_stats.total_signal_volume, 3);
+        assert_eq!(market_stats.low_risk_count, 1);
+        assert_eq!(market_stats.medium_risk_count, 1);
+        assert_eq!(market_stats.high_risk_count, 1);
     }
 
     #[test]

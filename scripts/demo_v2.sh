@@ -35,6 +35,11 @@ if [[ "$UI_LOCAL_HOST" == "0.0.0.0" ]]; then
 fi
 UI_LOCAL_BASE="http://${UI_LOCAL_HOST}:${UI_PORT}"
 
+WSL_EXTERNAL_HOST=""
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  WSL_EXTERNAL_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+
 API_LOG="$LOG_DIR/viz-api.log"
 UI_LOG="$LOG_DIR/web-ui.log"
 
@@ -150,6 +155,7 @@ cat <<EOF2
 demo-v2 run: PASS
 API: ${API_BASE}
 UI : http://${UI_PUBLIC_HOST}:${UI_PORT}/?apiBase=%2Fapi
+$(if [[ -n "${WSL_EXTERNAL_HOST}" ]]; then echo "UI (WSL): http://${WSL_EXTERNAL_HOST}:${UI_PORT}/?apiBase=%2Fapi"; fi)
 
 Press Ctrl+C to stop.
 EOF2

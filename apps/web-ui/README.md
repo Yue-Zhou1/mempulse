@@ -55,7 +55,7 @@ Edit `apps/web-ui/public/runtime-config.js` (or replace the deployed `/runtime-c
 window.__MEMPULSE_UI_CONFIG__ = {
   txSnapshotLimit: 160,
   txHistoryLimit: 600,
-  txRenderLimit: 120,
+  txRenderLimit: 80,
   txRetentionMs: 240000,
   detailCacheLimit: 128,
 };
@@ -72,7 +72,7 @@ Create `apps/web-ui/.env.local` (or set env vars in CI/CD):
 ```bash
 VITE_UI_TX_SNAPSHOT_LIMIT=120
 VITE_UI_TX_HISTORY_LIMIT=300
-VITE_UI_TX_RENDER_LIMIT=150
+VITE_UI_TX_RENDER_LIMIT=80
 VITE_UI_TX_RETENTION_MS=300000
 VITE_UI_DETAIL_CACHE_LIMIT=96
 ```

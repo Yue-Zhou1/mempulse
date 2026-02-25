@@ -23,8 +23,8 @@ use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use storage::{
-    ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, NoopClickHouseSink,
-    StorageWriterConfig, spawn_single_writer,
+    ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
+    NoopClickHouseSink, StorageWriterConfig, spawn_single_writer,
 };
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
@@ -154,7 +154,18 @@ pub struct DashboardSnapshot {
     pub feature_summary: Vec<FeatureSummary>,
     pub feature_details: Vec<FeatureDetail>,
     pub transactions: Vec<TransactionSummary>,
+    pub market_stats: MarketStats,
     pub latest_seq_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MarketStats {
+    pub total_signal_volume: u64,
+    pub total_tx_count: u64,
+    pub low_risk_count: u64,
+    pub medium_risk_count: u64,
+    pub high_risk_count: u64,
+    pub success_rate_bps: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +237,31 @@ fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
     }
 }
 
+fn market_success_rate_bps(total_tx_count: u64, high_risk_count: u64) -> u16 {
+    if total_tx_count == 0 {
+        return 10_000;
+    }
+    let successful = total_tx_count.saturating_sub(high_risk_count);
+    let bps = successful
+        .saturating_mul(10_000)
+        .saturating_div(total_tx_count);
+    bps.min(10_000) as u16
+}
+
+fn map_market_stats(snapshot: MarketStatsSnapshot) -> MarketStats {
+    MarketStats {
+        total_signal_volume: snapshot.total_signal_volume,
+        total_tx_count: snapshot.total_tx_count,
+        low_risk_count: snapshot.low_risk_count,
+        medium_risk_count: snapshot.medium_risk_count,
+        high_risk_count: snapshot.high_risk_count,
+        success_rate_bps: market_success_rate_bps(
+            snapshot.total_tx_count,
+            snapshot.high_risk_count,
+        ),
+    }
+}
+
 pub trait VizDataProvider: Send + Sync {
     fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
     -> Vec<EventEnvelope>;
@@ -237,6 +273,7 @@ pub trait VizDataProvider: Send + Sync {
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary>;
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail>;
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
+    fn market_stats(&self) -> MarketStats;
     fn metric_snapshot(&self) -> MetricSnapshot;
 }
 
@@ -431,6 +468,14 @@ impl VizDataProvider for InMemoryVizProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn market_stats(&self) -> MarketStats {
+        self.storage
+            .read()
+            .ok()
+            .map(|storage| map_market_stats(storage.market_stats_snapshot()))
+            .unwrap_or_else(|| map_market_stats(MarketStatsSnapshot::default()))
     }
 
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
@@ -1045,6 +1090,7 @@ async fn dashboard_snapshot(
         feature_summary: downsample(&state.provider.feature_summary(), state.downsample_limit),
         feature_details: state.provider.feature_details(feature_limit),
         transactions: state.provider.recent_transactions(tx_limit),
+        market_stats: state.provider.market_stats(),
         latest_seq_id,
     })
 }
@@ -1672,6 +1718,17 @@ mod tests {
                 .find(|row| row.hash == hash)
         }
 
+        fn market_stats(&self) -> MarketStats {
+            MarketStats {
+                total_signal_volume: 9_536,
+                total_tx_count: 9_536,
+                low_risk_count: 9_201,
+                medium_risk_count: 286,
+                high_risk_count: 49,
+                success_rate_bps: 9_949,
+            }
+        }
+
         fn metric_snapshot(&self) -> MetricSnapshot {
             MetricSnapshot {
                 peer_disconnects_total: 0,
@@ -1991,7 +2048,9 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/dashboard/snapshot?tx_limit=1&feature_limit=1&opp_limit=1&replay_limit=2")
+                    .uri(
+                        "/dashboard/snapshot?tx_limit=1&feature_limit=1&opp_limit=1&replay_limit=2",
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2006,6 +2065,8 @@ mod tests {
         assert_eq!(payload.opportunities.len(), 1);
         assert!(!payload.replay.is_empty());
         assert_eq!(payload.latest_seq_id, 3);
+        assert_eq!(payload.market_stats.total_signal_volume, 9_536);
+        assert_eq!(payload.market_stats.success_rate_bps, 9_949);
     }
 
     #[tokio::test]

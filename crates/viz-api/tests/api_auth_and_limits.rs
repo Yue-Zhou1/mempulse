@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
 use viz_api::{
-    AppState, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider, build_router,
+    AppState, MarketStats, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider,
+    build_router,
 };
 
 #[derive(Clone)]
@@ -52,6 +53,17 @@ impl VizDataProvider for EmptyProvider {
 
     fn transaction_detail_by_hash(&self, _hash: &str) -> Option<TransactionDetail> {
         None
+    }
+
+    fn market_stats(&self) -> MarketStats {
+        MarketStats {
+            total_signal_volume: 0,
+            total_tx_count: 0,
+            low_risk_count: 0,
+            medium_risk_count: 0,
+            high_risk_count: 0,
+            success_rate_bps: 10_000,
+        }
     }
 
     fn metric_snapshot(&self) -> MetricSnapshot {

@@ -2,7 +2,7 @@ const DEFAULT_CONFIG = Object.freeze({
   snapshotTxLimit: 120,
   detailCacheLimit: 96,
   maxTransactionHistory: 300,
-  maxRenderedTransactions: 150,
+  maxRenderedTransactions: 80,
   transactionRetentionMs: 5 * 60 * 1000,
 });
 

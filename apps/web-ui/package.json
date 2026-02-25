@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0 --port 5174",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 5174",
-    "test": "node --test src/api-base.test.mjs src/tx-history.test.mjs src/screen-mode.test.mjs src/ui-config.test.mjs"
+    "test": "node --test src/api-base.test.mjs src/tx-history.test.mjs src/screen-mode.test.mjs src/ui-config.test.mjs src/market-stats.test.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",
