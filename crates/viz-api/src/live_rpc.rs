@@ -12,15 +12,16 @@ use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
 use serde::{Deserialize, de::IgnoredAny};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, StorageWriteHandle, StorageWriteOp,
-    TxFeaturesRecord, TxFullRecord, TxSeenRecord,
+    StorageTryEnqueueError, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
+use tokio::sync::Semaphore;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -35,8 +36,101 @@ const ENV_ETH_HTTP_URL: &str = "VIZ_API_ETH_HTTP_URL";
 const ENV_SOURCE_ID: &str = "VIZ_API_SOURCE_ID";
 const ENV_CHAINS: &str = "VIZ_API_CHAINS";
 const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
+const ENV_RPC_BATCH_SIZE: &str = "VIZ_API_RPC_BATCH_SIZE";
+const ENV_RPC_MAX_IN_FLIGHT: &str = "VIZ_API_RPC_MAX_IN_FLIGHT";
+const ENV_RPC_RETRY_ATTEMPTS: &str = "VIZ_API_RPC_RETRY_ATTEMPTS";
+const ENV_RPC_RETRY_BACKOFF_MS: &str = "VIZ_API_RPC_RETRY_BACKOFF_MS";
+const ENV_RPC_BATCH_FLUSH_MS: &str = "VIZ_API_RPC_BATCH_FLUSH_MS";
 const SEARCHER_MIN_SCORE: u32 = 0;
 const SEARCHER_MAX_CANDIDATES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveRpcDropReason {
+    StorageQueueFull,
+    StorageQueueClosed,
+    InvalidPendingHash,
+}
+
+impl LiveRpcDropReason {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::StorageQueueFull => "storage_queue_full",
+            Self::StorageQueueClosed => "storage_queue_closed",
+            Self::InvalidPendingHash => "invalid_pending_hash",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveRpcDropMetricsSnapshot {
+    pub storage_queue_full: u64,
+    pub storage_queue_closed: u64,
+    pub invalid_pending_hash: u64,
+}
+
+#[derive(Debug, Default)]
+struct LiveRpcDropMetrics {
+    storage_queue_full: AtomicU64,
+    storage_queue_closed: AtomicU64,
+    invalid_pending_hash: AtomicU64,
+}
+
+impl LiveRpcDropMetrics {
+    fn observe(&self, reason: LiveRpcDropReason) {
+        match reason {
+            LiveRpcDropReason::StorageQueueFull => {
+                self.storage_queue_full.fetch_add(1, Ordering::Relaxed);
+            }
+            LiveRpcDropReason::StorageQueueClosed => {
+                self.storage_queue_closed.fetch_add(1, Ordering::Relaxed);
+            }
+            LiveRpcDropReason::InvalidPendingHash => {
+                self.invalid_pending_hash.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn reset(&self) {
+        self.storage_queue_full.store(0, Ordering::Relaxed);
+        self.storage_queue_closed.store(0, Ordering::Relaxed);
+        self.invalid_pending_hash.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LiveRpcDropMetricsSnapshot {
+        LiveRpcDropMetricsSnapshot {
+            storage_queue_full: self.storage_queue_full.load(Ordering::Relaxed),
+            storage_queue_closed: self.storage_queue_closed.load(Ordering::Relaxed),
+            invalid_pending_hash: self.invalid_pending_hash.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static LIVE_RPC_DROP_METRICS: OnceLock<Arc<LiveRpcDropMetrics>> = OnceLock::new();
+
+fn live_rpc_drop_metrics() -> &'static Arc<LiveRpcDropMetrics> {
+    LIVE_RPC_DROP_METRICS.get_or_init(|| Arc::new(LiveRpcDropMetrics::default()))
+}
+
+pub fn live_rpc_drop_metrics_snapshot() -> LiveRpcDropMetricsSnapshot {
+    live_rpc_drop_metrics().snapshot()
+}
+
+pub fn reset_live_rpc_drop_metrics() {
+    live_rpc_drop_metrics().reset();
+}
+
+pub fn observe_live_rpc_drop_reason(reason: LiveRpcDropReason) {
+    live_rpc_drop_metrics().observe(reason);
+}
+
+pub fn classify_storage_enqueue_drop_reason(
+    error: StorageTryEnqueueError,
+) -> LiveRpcDropReason {
+    match error {
+        StorageTryEnqueueError::QueueFull => LiveRpcDropReason::StorageQueueFull,
+        StorageTryEnqueueError::QueueClosed => LiveRpcDropReason::StorageQueueClosed,
+    }
+}
 
 #[derive(Clone, Debug)]
 struct RpcEndpoint {
@@ -93,6 +187,28 @@ impl ChainRpcConfig {
 pub struct LiveRpcConfig {
     chains: Vec<ChainRpcConfig>,
     max_seen_hashes: usize,
+    batch_fetch: BatchFetchConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchFetchConfig {
+    pub batch_size: usize,
+    pub max_in_flight: usize,
+    pub retry_attempts: usize,
+    pub retry_backoff_ms: u64,
+    pub flush_interval_ms: u64,
+}
+
+impl Default for BatchFetchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            max_in_flight: 4,
+            retry_attempts: 2,
+            retry_backoff_ms: 100,
+            flush_interval_ms: 40,
+        }
+    }
 }
 
 impl Default for LiveRpcConfig {
@@ -114,6 +230,7 @@ impl Default for LiveRpcConfig {
                 source_id: SourceId::new("rpc-live"),
             }],
             max_seen_hashes: 10_000,
+            batch_fetch: BatchFetchConfig::default(),
         }
     }
 }
@@ -146,6 +263,20 @@ impl LiveRpcConfig {
             .map_err(|err| anyhow!("invalid {ENV_MAX_SEEN_HASHES}: {err}"))?
             .unwrap_or(10_000)
             .max(1);
+        let batch_size = parse_env_usize(ENV_RPC_BATCH_SIZE)?
+            .unwrap_or(BatchFetchConfig::default().batch_size)
+            .max(1);
+        let max_in_flight = parse_env_usize(ENV_RPC_MAX_IN_FLIGHT)?
+            .unwrap_or(BatchFetchConfig::default().max_in_flight)
+            .max(1);
+        let retry_attempts = parse_env_usize(ENV_RPC_RETRY_ATTEMPTS)?
+            .unwrap_or(BatchFetchConfig::default().retry_attempts);
+        let retry_backoff_ms = parse_env_u64(ENV_RPC_RETRY_BACKOFF_MS)?
+            .unwrap_or(BatchFetchConfig::default().retry_backoff_ms)
+            .max(1);
+        let flush_interval_ms = parse_env_u64(ENV_RPC_BATCH_FLUSH_MS)?
+            .unwrap_or(BatchFetchConfig::default().flush_interval_ms)
+            .max(1);
 
         let mut config = Self::default();
         if let Some(chains_override) = chains_override {
@@ -172,6 +303,13 @@ impl LiveRpcConfig {
             }
         }
         config.max_seen_hashes = max_seen_hashes;
+        config.batch_fetch = BatchFetchConfig {
+            batch_size,
+            max_in_flight,
+            retry_attempts,
+            retry_backoff_ms,
+            flush_interval_ms,
+        };
         Ok(config)
     }
 
@@ -199,6 +337,10 @@ impl LiveRpcConfig {
     pub fn max_seen_hashes(&self) -> usize {
         self.max_seen_hashes
     }
+
+    pub fn batch_fetch(&self) -> BatchFetchConfig {
+        self.batch_fetch
+    }
 }
 
 pub fn worker_count_for_config(config: &LiveRpcConfig) -> usize {
@@ -210,6 +352,58 @@ pub fn resolve_record_chain_id(
     tx_chain_id: Option<u64>,
 ) -> Option<u64> {
     tx_chain_id.or(configured_chain_id)
+}
+
+pub fn coalesce_hash_batches(hashes: &[String], batch_size: usize) -> Vec<Vec<String>> {
+    let batch_size = batch_size.max(1);
+    hashes
+        .chunks(batch_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+pub fn dispatchable_batch_count(
+    queue_len: usize,
+    batch_size: usize,
+    max_in_flight: usize,
+) -> usize {
+    if queue_len == 0 {
+        return 0;
+    }
+    let batches = (queue_len + batch_size.max(1) - 1) / batch_size.max(1);
+    batches.min(max_in_flight.max(1))
+}
+
+pub fn retry_backoff_delay_ms(base_backoff_ms: u64, attempt: usize) -> u64 {
+    base_backoff_ms.saturating_mul(1_u64 << attempt.min(16))
+}
+
+pub fn rotate_endpoint_index(current: usize, endpoint_count: usize) -> usize {
+    if endpoint_count <= 1 {
+        0
+    } else {
+        (current + 1) % endpoint_count
+    }
+}
+
+fn parse_env_usize(key: &str) -> Result<Option<usize>> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|err| anyhow!("invalid {key}: {err}"))
+}
+
+fn parse_env_u64(key: &str) -> Result<Option<u64>> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|err| anyhow!("invalid {key}: {err}"))
 }
 
 fn parse_env_chain_configs(raw: &str) -> Result<Vec<ChainRpcConfig>> {
@@ -273,13 +467,15 @@ pub fn start_live_rpc_feed(
     let next_seq_id = Arc::new(AtomicU64::new(
         current_seq_hi(&storage).saturating_add(1).max(1),
     ));
+    reset_live_rpc_drop_metrics();
     let max_seen_hashes = config.max_seen_hashes;
+    let batch_fetch = config.batch_fetch;
 
     for chain in config.chains {
         let writer = writer.clone();
         let next_seq_id = next_seq_id.clone();
         handle.spawn(async move {
-            run_chain_worker(writer, chain, max_seen_hashes, next_seq_id).await;
+            run_chain_worker(writer, chain, max_seen_hashes, batch_fetch, next_seq_id).await;
         });
     }
 }
@@ -288,6 +484,7 @@ async fn run_chain_worker(
     writer: StorageWriteHandle,
     chain: ChainRpcConfig,
     max_seen_hashes: usize,
+    batch_fetch: BatchFetchConfig,
     next_seq_id: Arc<AtomicU64>,
 ) {
     let client = match reqwest::Client::builder()
@@ -331,6 +528,7 @@ async fn run_chain_worker(
             &chain,
             endpoint,
             max_seen_hashes,
+            batch_fetch,
             &client,
             &next_seq_id,
             &mut seen_hashes,
@@ -349,7 +547,7 @@ async fn run_chain_worker(
                 http_url = endpoint.http_url,
                 "live rpc websocket session ended for chain; rotating endpoint"
             );
-            endpoint_index = (endpoint_index + 1) % chain.endpoints.len();
+            endpoint_index = rotate_endpoint_index(endpoint_index, chain.endpoints.len());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -360,6 +558,7 @@ async fn run_ws_session(
     chain: &ChainRpcConfig,
     endpoint: &RpcEndpoint,
     max_seen_hashes: usize,
+    batch_fetch: BatchFetchConfig,
     client: &reqwest::Client,
     next_seq_id: &Arc<AtomicU64>,
     seen_hashes: &mut FastSet<TxHash>,
@@ -388,34 +587,75 @@ async fn run_ws_session(
     );
 
     let mut subscription_id: Option<String> = None;
-    while let Some(frame) = read.next().await {
-        let frame = frame.context("read websocket frame")?;
-        match frame {
-            Message::Text(text) => {
-                if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
-                    process_pending_hash(
-                        writer,
-                        chain,
-                        endpoint,
-                        max_seen_hashes,
-                        client,
-                        &hash_hex,
-                        next_seq_id,
-                        seen_hashes,
-                        seen_order,
-                    )
-                    .await?;
+    let flush_interval = Duration::from_millis(batch_fetch.flush_interval_ms);
+    let mut pending_hashes = VecDeque::new();
+    let in_flight = Arc::new(Semaphore::new(batch_fetch.max_in_flight));
+    loop {
+        match tokio::time::timeout(flush_interval, read.next()).await {
+            Ok(Some(frame)) => {
+                let frame = frame.context("read websocket frame")?;
+                match frame {
+                    Message::Text(text) => {
+                        if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
+                            pending_hashes.push_back(hash_hex.to_owned());
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if write.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
+                flush_pending_hash_batches(
+                    writer,
+                    chain,
+                    endpoint,
+                    max_seen_hashes,
+                    client,
+                    next_seq_id,
+                    seen_hashes,
+                    seen_order,
+                    &mut pending_hashes,
+                    &in_flight,
+                    batch_fetch,
+                )
+                .await?;
             }
-            Message::Ping(payload) => {
-                if write.send(Message::Pong(payload)).await.is_err() {
-                    break;
-                }
+            Ok(None) => break,
+            Err(_) => {
+                flush_pending_hash_batches(
+                    writer,
+                    chain,
+                    endpoint,
+                    max_seen_hashes,
+                    client,
+                    next_seq_id,
+                    seen_hashes,
+                    seen_order,
+                    &mut pending_hashes,
+                    &in_flight,
+                    batch_fetch,
+                )
+                .await?;
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
+    flush_pending_hash_batches(
+        writer,
+        chain,
+        endpoint,
+        max_seen_hashes,
+        client,
+        next_seq_id,
+        seen_hashes,
+        seen_order,
+        &mut pending_hashes,
+        &in_flight,
+        batch_fetch,
+    )
+    .await?;
 
     Ok(())
 }
@@ -491,42 +731,132 @@ pub fn parse_pending_hash<'a>(
     params.result.as_hash()
 }
 
-async fn process_pending_hash(
+async fn flush_pending_hash_batches(
     writer: &StorageWriteHandle,
     chain: &ChainRpcConfig,
     endpoint: &RpcEndpoint,
     max_seen_hashes: usize,
     client: &reqwest::Client,
-    hash_hex: &str,
     next_seq_id: &Arc<AtomicU64>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
+    pending_hashes: &mut VecDeque<String>,
+    in_flight: &Arc<Semaphore>,
+    batch_fetch: BatchFetchConfig,
 ) -> Result<()> {
-    let hash = match parse_fixed_hex::<32>(hash_hex) {
-        Some(hash) => hash,
-        None => return Ok(()),
-    };
-    if !remember_hash(hash, seen_hashes, seen_order, max_seen_hashes) {
+    let dispatch_count = dispatchable_batch_count(
+        pending_hashes.len(),
+        batch_fetch.batch_size,
+        batch_fetch.max_in_flight,
+    );
+    for _ in 0..dispatch_count {
+        let batch = pending_hashes
+            .drain(..batch_fetch.batch_size.min(pending_hashes.len()))
+            .collect::<Vec<_>>();
+        process_pending_hash_batch(
+            writer,
+            chain,
+            endpoint,
+            max_seen_hashes,
+            client,
+            next_seq_id,
+            seen_hashes,
+            seen_order,
+            batch,
+            in_flight,
+            batch_fetch,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn process_pending_hash_batch(
+    writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
+    endpoint: &RpcEndpoint,
+    max_seen_hashes: usize,
+    client: &reqwest::Client,
+    next_seq_id: &Arc<AtomicU64>,
+    seen_hashes: &mut FastSet<TxHash>,
+    seen_order: &mut VecDeque<TxHash>,
+    hash_batch: Vec<String>,
+    in_flight: &Arc<Semaphore>,
+    batch_fetch: BatchFetchConfig,
+) -> Result<()> {
+    let mut deduped_hashes = Vec::new();
+    let mut deduped_raw = Vec::new();
+    for hash_hex in hash_batch {
+        let hash = match parse_fixed_hex::<32>(&hash_hex) {
+            Some(hash) => hash,
+            None => {
+                observe_live_rpc_drop_reason(LiveRpcDropReason::InvalidPendingHash);
+                tracing::warn!(
+                    chain_key = %chain.chain_key,
+                    source_id = %chain.source_id,
+                    hash = %hash_hex,
+                    reason = LiveRpcDropReason::InvalidPendingHash.as_label(),
+                    "dropping pending hash: invalid hex payload"
+                );
+                continue;
+            }
+        };
+        if remember_hash(hash, seen_hashes, seen_order, max_seen_hashes) {
+            deduped_hashes.push(hash_hex);
+            deduped_raw.push(hash);
+        }
+    }
+    if deduped_hashes.is_empty() {
         return Ok(());
     }
 
-    let now_unix_ms = current_unix_ms();
-    let fetched_tx =
-        match fetch_transaction_by_hash(client, endpoint.http_url.as_str(), hash_hex).await {
-            Ok(tx) => tx,
-            Err(err) => {
-                let error_chain = format_error_chain(&err);
-                tracing::warn!(
-                    error = %err,
-                    error_chain = %error_chain,
-                    hash = hash_hex,
-                    http_url = endpoint.http_url,
-                    "fetch tx by hash failed"
-                );
-                None
-            }
-        };
+    let _permit = in_flight
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("rpc in-flight semaphore closed"))?;
+    let rpc_started = Instant::now();
+    let fetched = fetch_transactions_by_hash_batch_with_retry(
+        client,
+        endpoint.http_url.as_str(),
+        &deduped_hashes,
+        batch_fetch,
+    )
+    .await?;
+    let rpc_latency_ms = rpc_started.elapsed().as_secs_f64() * 1_000.0;
+    let fetched_count = fetched.iter().filter(|row| row.is_some()).count();
+    let error_count = deduped_hashes.len().saturating_sub(fetched_count);
+    let error_rate = error_count as f64 / deduped_hashes.len() as f64;
+    tracing::info!(
+        chain_key = %chain.chain_key,
+        chain_id = ?chain.chain_id,
+        batch_size = deduped_hashes.len(),
+        fetched_count,
+        error_count,
+        error_rate,
+        rpc_latency_ms,
+        "live rpc batch fetch metrics"
+    );
 
+    for ((hash_hex, hash), fetched_tx) in deduped_hashes
+        .iter()
+        .zip(deduped_raw.into_iter())
+        .zip(fetched.into_iter())
+    {
+        process_pending_hash_with_fetched_tx(writer, chain, hash_hex, hash, fetched_tx, next_seq_id)?;
+    }
+
+    Ok(())
+}
+
+fn process_pending_hash_with_fetched_tx(
+    writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
+    hash_hex: &str,
+    hash: TxHash,
+    fetched_tx: Option<LiveTx>,
+    next_seq_id: &Arc<AtomicU64>,
+) -> Result<()> {
+    let now_unix_ms = current_unix_ms();
     let feature_analysis = fetched_tx
         .as_ref()
         .map(|tx| analyze_transaction(feature_input(tx)));
@@ -579,8 +909,10 @@ async fn process_pending_hash(
     }
 
     let tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
-    writer
-        .enqueue(StorageWriteOp::AppendEvent(EventEnvelope {
+    if !try_enqueue_storage_write(
+        writer,
+        chain,
+        StorageWriteOp::AppendEvent(EventEnvelope {
             seq_id: tx_seen_seq_id,
             ingest_ts_unix_ms: now_unix_ms,
             ingest_ts_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
@@ -591,29 +923,37 @@ async fn process_pending_hash(
                 seen_at_unix_ms: now_unix_ms,
                 seen_at_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
             }),
-        }))
-        .await?;
-    writer
-        .enqueue(StorageWriteOp::UpsertTxSeen(TxSeenRecord {
+        }),
+    )? {
+        return Ok(());
+    }
+    if !try_enqueue_storage_write(
+        writer,
+        chain,
+        StorageWriteOp::UpsertTxSeen(TxSeenRecord {
             hash,
             peer: "rpc-ws".to_owned(),
             first_seen_unix_ms: now_unix_ms,
             first_seen_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
             seen_count: 1,
-        }))
-        .await?;
+        }),
+    )? {
+        return Ok(());
+    }
 
-    append_event(
+    if !append_event(
         writer,
+        chain,
         next_seq_id,
-        &chain.source_id,
         now_unix_ms,
         EventPayload::TxFetched(TxFetched {
             hash,
             fetched_at_unix_ms: now_unix_ms,
         }),
     )
-    .await?;
+    ? {
+        return Ok(());
+    }
 
     if let Some(tx) = fetched_tx {
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
@@ -633,16 +973,20 @@ async fn process_pending_hash(
             max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
             calldata_len: Some(raw_tx.len() as u32),
         };
-        append_event(
+        if !append_event(
             writer,
+            chain,
             next_seq_id,
-            &chain.source_id,
             now_unix_ms,
             EventPayload::TxDecoded(decoded.clone()),
         )
-        .await?;
-        writer
-            .enqueue(StorageWriteOp::UpsertTxFull(TxFullRecord {
+        ? {
+            return Ok(());
+        }
+        if !try_enqueue_storage_write(
+            writer,
+            chain,
+            StorageWriteOp::UpsertTxFull(TxFullRecord {
                 hash: tx.hash,
                 tx_type: tx.tx_type,
                 sender: tx.sender,
@@ -657,10 +1001,14 @@ async fn process_pending_hash(
                 max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
                 calldata_len: Some(raw_tx.len() as u32),
                 raw_tx: raw_tx.clone(),
-            }))
-            .await?;
-        writer
-            .enqueue(StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
+            }),
+        )? {
+            return Ok(());
+        }
+        if !try_enqueue_storage_write(
+            writer,
+            chain,
+            StorageWriteOp::UpsertTxFeatures(TxFeaturesRecord {
                 hash: tx.hash,
                 protocol: analysis.protocol.to_owned(),
                 category: analysis.category.to_owned(),
@@ -669,8 +1017,10 @@ async fn process_pending_hash(
                 urgency_score: analysis.urgency_score,
                 method_selector: analysis.method_selector,
                 feature_engine_version: feature_engine_version().to_owned(),
-            }))
-            .await?;
+            }),
+        )? {
+            return Ok(());
+        }
         for opportunity in
             build_opportunity_records(&decoded, &raw_tx, now_unix_ms, resolved_chain_id)
         {
@@ -683,35 +1033,64 @@ async fn process_pending_hash(
                 &opportunity,
             );
             for event in events {
-                writer.enqueue(StorageWriteOp::AppendEvent(event)).await?;
+                if !try_enqueue_storage_write(writer, chain, StorageWriteOp::AppendEvent(event))? {
+                    return Ok(());
+                }
             }
-            writer
-                .enqueue(StorageWriteOp::UpsertOpportunity(opportunity))
-                .await?;
+            if !try_enqueue_storage_write(writer, chain, StorageWriteOp::UpsertOpportunity(opportunity))? {
+                return Ok(());
+            }
         }
     }
 
     Ok(())
 }
 
-async fn append_event(
+fn append_event(
     writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
     next_seq_id: &Arc<AtomicU64>,
-    source_id: &SourceId,
     now_unix_ms: i64,
     payload: EventPayload,
-) -> Result<u64> {
+) -> Result<bool> {
     let seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
-    writer
-        .enqueue(StorageWriteOp::AppendEvent(EventEnvelope {
+    try_enqueue_storage_write(
+        writer,
+        chain,
+        StorageWriteOp::AppendEvent(EventEnvelope {
             seq_id,
             ingest_ts_unix_ms: now_unix_ms,
             ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
-            source_id: source_id.clone(),
+            source_id: chain.source_id.clone(),
             payload,
-        }))
-        .await?;
-    Ok(seq_id)
+        }),
+    )
+}
+
+fn try_enqueue_storage_write(
+    writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
+    op: StorageWriteOp,
+) -> Result<bool> {
+    match writer.try_enqueue(op) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let reason = classify_storage_enqueue_drop_reason(error);
+            observe_live_rpc_drop_reason(reason);
+            tracing::warn!(
+                chain_key = %chain.chain_key,
+                source_id = %chain.source_id,
+                reason = reason.as_label(),
+                "storage writer backpressure/drop observed for live rpc ingest"
+            );
+            match error {
+                StorageTryEnqueueError::QueueFull => Ok(false),
+                StorageTryEnqueueError::QueueClosed => {
+                    Err(anyhow!("storage writer queue is closed"))
+                }
+            }
+        }
+    }
 }
 
 fn remember_hash(
@@ -812,10 +1191,7 @@ fn build_opportunity_records(
     chain_id: Option<u64>,
 ) -> Vec<OpportunityRecord> {
     rank_opportunities(
-        &[SearcherInputTx {
-            decoded: decoded.clone(),
-            calldata: calldata.to_vec(),
-        }],
+        &[SearcherInputTx::borrowed(decoded.clone(), calldata)],
         SearcherConfig {
             min_score: SEARCHER_MIN_SCORE,
             max_candidates: SEARCHER_MAX_CANDIDATES,
@@ -915,7 +1291,7 @@ async fn fetch_transaction_by_hash(
         "params": [hash_hex],
     });
 
-    let response: Value = client
+    let response_bytes = client
         .post(http_url)
         .json(&request_body)
         .send()
@@ -923,19 +1299,242 @@ async fn fetch_transaction_by_hash(
         .with_context(|| format!("POST {http_url}"))?
         .error_for_status()
         .context("rpc http status error")?
-        .json()
+        .bytes()
         .await
-        .context("decode rpc json response")?;
+        .context("read rpc response bytes")?;
 
-    if let Some(error_value) = response.get("error") {
-        return Err(anyhow!("rpc returned error: {error_value}"));
+    decode_transaction_fetch_response_to_live_tx(response_bytes.as_ref(), hash_hex)
+}
+
+async fn fetch_transactions_by_hash_batch_with_retry(
+    client: &reqwest::Client,
+    http_url: &str,
+    hashes: &[String],
+    batch_fetch: BatchFetchConfig,
+) -> Result<Vec<Option<LiveTx>>> {
+    let mut attempt = 0usize;
+    loop {
+        match fetch_transactions_by_hash_batch(client, http_url, hashes).await {
+            Ok(fetched) => return Ok(fetched),
+            Err(err) => {
+                if attempt >= batch_fetch.retry_attempts {
+                    return Err(err.context(format!(
+                        "fetch batched tx details failed after {} attempt(s)",
+                        attempt + 1
+                    )));
+                }
+                let delay_ms = retry_backoff_delay_ms(batch_fetch.retry_backoff_ms, attempt);
+                tracing::warn!(
+                    error = %err,
+                    attempt = attempt + 1,
+                    retry_in_ms = delay_ms,
+                    batch_size = hashes.len(),
+                    http_url,
+                    "live rpc batched fetch failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+        }
     }
-    let result = match response.get("result") {
-        Some(value) if !value.is_null() => value.clone(),
-        _ => return Ok(None),
+}
+
+async fn fetch_transactions_by_hash_batch(
+    client: &reqwest::Client,
+    http_url: &str,
+    hashes: &[String],
+) -> Result<Vec<Option<LiveTx>>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if hashes.len() == 1 {
+        return Ok(vec![
+            fetch_transaction_by_hash(client, http_url, hashes[0].as_str()).await?,
+        ]);
+    }
+
+    let request_body = hashes
+        .iter()
+        .enumerate()
+        .map(|(index, hash_hex)| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": index as u64,
+                "method": "eth_getTransactionByHash",
+                "params": [hash_hex],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let response_bytes = client
+        .post(http_url)
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("POST {http_url}"))?
+        .error_for_status()
+        .context("rpc http status error")?
+        .bytes()
+        .await
+        .context("read rpc batch response bytes")?;
+
+    decode_transaction_fetch_batch_response_to_live_txs(response_bytes.as_ref(), hashes)
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcFetchErrorEnvelope {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcFetchResponseEnvelope {
+    #[serde(default)]
+    error: Option<RpcFetchErrorEnvelope>,
+    #[serde(default)]
+    result: Option<RpcTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RpcBatchResponseId {
+    Number(u64),
+    String(String),
+}
+
+impl RpcBatchResponseId {
+    fn to_index(&self) -> Option<usize> {
+        let raw = match self {
+            Self::Number(value) => Some(*value),
+            Self::String(value) => {
+                let trimmed = value.trim();
+                if trimmed.starts_with("0x") {
+                    parse_hex_u64(trimmed)
+                } else {
+                    trimmed.parse::<u64>().ok()
+                }
+            }
+        }?;
+        usize::try_from(raw).ok()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBatchFetchResponseEnvelope {
+    id: RpcBatchResponseId,
+    #[serde(default)]
+    error: Option<RpcFetchErrorEnvelope>,
+    #[serde(default)]
+    result: Option<RpcTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RpcBatchFetchResponseBody {
+    Batch(Vec<RpcBatchFetchResponseEnvelope>),
+    Single(RpcBatchFetchResponseEnvelope),
+}
+
+fn decode_transaction_fetch_response_to_live_tx(
+    payload: &[u8],
+    hash_hex: &str,
+) -> Result<Option<LiveTx>> {
+    let response: RpcFetchResponseEnvelope =
+        serde_json::from_slice(payload).context("decode rpc json response")?;
+    if let Some(error) = response.error {
+        let code = error
+            .code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let message = error.message.unwrap_or_else(|| "unknown".to_owned());
+        return Err(anyhow!("rpc returned error: code={code} message={message}"));
+    }
+    let tx = match response.result {
+        Some(tx) => tx,
+        None => return Ok(None),
     };
-    let tx: RpcTransaction = serde_json::from_value(result).context("decode rpc transaction")?;
     Ok(Some(rpc_tx_to_live_tx(tx, hash_hex)?))
+}
+
+fn decode_transaction_fetch_batch_response_to_live_txs(
+    payload: &[u8],
+    hashes: &[String],
+) -> Result<Vec<Option<LiveTx>>> {
+    let response: RpcBatchFetchResponseBody =
+        serde_json::from_slice(payload).context("decode rpc batch json response")?;
+    let mut fetched = vec![None; hashes.len()];
+    let envelopes = match response {
+        RpcBatchFetchResponseBody::Batch(rows) => rows,
+        RpcBatchFetchResponseBody::Single(row) => vec![row],
+    };
+
+    for envelope in envelopes {
+        let Some(index) = envelope.id.to_index() else {
+            continue;
+        };
+        if index >= hashes.len() {
+            continue;
+        }
+
+        if let Some(error) = envelope.error {
+            let code = error
+                .code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let message = error.message.unwrap_or_else(|| "unknown".to_owned());
+            tracing::warn!(
+                hash = hashes[index],
+                code,
+                message,
+                "rpc batch transaction fetch returned item-level error"
+            );
+            continue;
+        }
+
+        let Some(tx) = envelope.result else {
+            continue;
+        };
+
+        match rpc_tx_to_live_tx(tx, hashes[index].as_str()) {
+            Ok(tx) => fetched[index] = Some(tx),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    hash = hashes[index],
+                    "failed decoding transaction from rpc batch response"
+                );
+            }
+        }
+    }
+
+    Ok(fetched)
+}
+
+pub fn decode_transaction_fetch_response(
+    payload: &[u8],
+    hash_hex: &str,
+) -> Result<Option<TxDecoded>> {
+    let live = match decode_transaction_fetch_response_to_live_tx(payload, hash_hex)? {
+        Some(tx) => tx,
+        None => return Ok(None),
+    };
+    Ok(Some(TxDecoded {
+        hash: live.hash,
+        tx_type: live.tx_type,
+        sender: live.sender,
+        nonce: live.nonce,
+        chain_id: live.chain_id,
+        to: live.to,
+        value_wei: live.value_wei,
+        gas_limit: live.gas_limit,
+        gas_price_wei: live.gas_price_wei,
+        max_fee_per_gas_wei: live.max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei: live.max_priority_fee_per_gas_wei,
+        max_fee_per_blob_gas_wei: live.max_fee_per_blob_gas_wei,
+        calldata_len: Some(live.input.len() as u32),
+    }))
 }
 
 fn rpc_tx_to_live_tx(tx: RpcTransaction, hash_hex: &str) -> Result<LiveTx> {

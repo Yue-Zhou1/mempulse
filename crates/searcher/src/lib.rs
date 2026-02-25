@@ -8,6 +8,7 @@ use event_log::TxDecoded;
 use feature_engine::analyze_decoded_transaction;
 use scoring::ScoreBreakdown;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use strategies::default_strategies;
 
 pub use scoring::ScoreBreakdown as OpportunityScoreBreakdown;
@@ -15,9 +16,27 @@ pub use scoring::scorer_version;
 pub use strategies::{StrategyKind, strategy_version};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SearcherInputTx {
+pub struct SearcherInputTx<'a> {
     pub decoded: TxDecoded,
-    pub calldata: Vec<u8>,
+    pub calldata: Cow<'a, [u8]>,
+}
+
+pub type OwnedSearcherInputTx = SearcherInputTx<'static>;
+
+impl<'a> SearcherInputTx<'a> {
+    pub fn borrowed(decoded: TxDecoded, calldata: &'a [u8]) -> Self {
+        Self {
+            decoded,
+            calldata: Cow::Borrowed(calldata),
+        }
+    }
+
+    pub fn owned(decoded: TxDecoded, calldata: Vec<u8>) -> OwnedSearcherInputTx {
+        OwnedSearcherInputTx {
+            decoded,
+            calldata: Cow::Owned(calldata),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,14 +69,14 @@ pub struct OpportunityCandidate {
 }
 
 pub fn rank_opportunities(
-    batch: &[SearcherInputTx],
+    batch: &[SearcherInputTx<'_>],
     config: SearcherConfig,
 ) -> Vec<OpportunityCandidate> {
     let strategies = default_strategies();
     let mut candidates = Vec::new();
 
     for input in batch {
-        let featured = analyze_decoded_transaction(&input.decoded, &input.calldata);
+        let featured = analyze_decoded_transaction(&input.decoded, input.calldata.as_ref());
         for strategy in &strategies {
             if let Some(candidate) = strategy.evaluate(&featured) {
                 if candidate.score >= config.min_score {

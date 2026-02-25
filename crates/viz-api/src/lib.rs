@@ -13,7 +13,7 @@ use axum::{middleware, response::Response};
 use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
-use live_rpc::{LiveRpcConfig, start_live_rpc_feed};
+use live_rpc::{LiveRpcConfig, live_rpc_drop_metrics_snapshot, start_live_rpc_feed};
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
@@ -284,6 +284,17 @@ pub struct InMemoryVizProvider {
     storage: Arc<RwLock<InMemoryStorage>>,
     propagation: Arc<Vec<PropagationEdge>>,
     replay_stride: usize,
+    dashboard_cache: Arc<RwLock<DashboardReadCache>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DashboardReadCache {
+    revision: Option<u64>,
+    refreshes: u64,
+    replay_points: Vec<ReplayPoint>,
+    feature_summary: Vec<FeatureSummary>,
+    feature_details: Vec<FeatureDetail>,
+    opportunities: Vec<OpportunityDetail>,
 }
 
 impl InMemoryVizProvider {
@@ -296,8 +307,123 @@ impl InMemoryVizProvider {
             storage,
             propagation,
             replay_stride: replay_stride.max(1),
+            dashboard_cache: Arc::new(RwLock::new(DashboardReadCache::default())),
         }
     }
+
+    pub fn dashboard_cache_refreshes(&self) -> u64 {
+        self.dashboard_cache
+            .read()
+            .map(|cache| cache.refreshes)
+            .unwrap_or(0)
+    }
+
+    fn dashboard_cache_snapshot(&self) -> DashboardReadCache {
+        let storage = match self.storage.read() {
+            Ok(storage) => storage,
+            Err(_) => return DashboardReadCache::default(),
+        };
+        let revision = storage.read_model_revision();
+
+        let mut cache = match self.dashboard_cache.write() {
+            Ok(cache) => cache,
+            Err(_) => return DashboardReadCache::default(),
+        };
+        if cache.revision != Some(revision) {
+            cache.revision = Some(revision);
+            cache.replay_points = build_replay_points(&storage, self.replay_stride);
+            cache.feature_summary = build_feature_summary(&storage);
+            cache.feature_details = build_feature_details(&storage);
+            cache.opportunities = build_opportunities(&storage);
+            cache.refreshes = cache.refreshes.saturating_add(1);
+        }
+        cache.clone()
+    }
+}
+
+fn build_replay_points(storage: &InMemoryStorage, replay_stride: usize) -> Vec<ReplayPoint> {
+    replay_frames(
+        &storage.list_events(),
+        ReplayMode::DeterministicEventReplay,
+        replay_stride,
+    )
+    .into_iter()
+    .map(|frame| ReplayPoint {
+        seq_hi: frame.seq_hi,
+        timestamp_unix_ms: frame.timestamp_unix_ms,
+        pending_count: frame.pending.len() as u32,
+    })
+    .collect()
+}
+
+fn build_feature_summary(storage: &InMemoryStorage) -> Vec<FeatureSummary> {
+    let mut counts = std::collections::BTreeMap::<(String, String), u64>::new();
+    for feature in storage.tx_features() {
+        *counts
+            .entry((feature.protocol.clone(), feature.category.clone()))
+            .or_insert(0) += 1;
+    }
+
+    let mut out = counts
+        .into_iter()
+        .map(|((protocol, category), count)| FeatureSummary {
+            protocol,
+            category,
+            count,
+        })
+        .collect::<Vec<_>>();
+    out.sort_unstable_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.protocol.cmp(&right.protocol))
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    out
+}
+
+fn build_feature_details(storage: &InMemoryStorage) -> Vec<FeatureDetail> {
+    let mut emitted = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for feature in storage.tx_features().iter().rev() {
+        if !emitted.insert(feature.hash) {
+            continue;
+        }
+        out.push(FeatureDetail {
+            hash: format_bytes(&feature.hash),
+            protocol: feature.protocol.clone(),
+            category: feature.category.clone(),
+            chain_id: feature.chain_id,
+            mev_score: feature.mev_score,
+            urgency_score: feature.urgency_score,
+            method_selector: format_method_selector(feature.method_selector),
+            feature_engine_version: feature.feature_engine_version.clone(),
+        });
+    }
+
+    out
+}
+
+fn build_opportunities(storage: &InMemoryStorage) -> Vec<OpportunityDetail> {
+    storage
+        .opportunities()
+        .into_iter()
+        .map(|row| OpportunityDetail {
+            tx_hash: format_bytes(&row.tx_hash),
+            status: "detected".to_owned(),
+            strategy: row.strategy,
+            score: row.score,
+            protocol: row.protocol,
+            category: row.category,
+            chain_id: row.chain_id,
+            feature_engine_version: row.feature_engine_version,
+            scorer_version: row.scorer_version,
+            strategy_version: row.strategy_version,
+            reasons: row.reasons,
+            detected_unix_ms: row.detected_unix_ms,
+        })
+        .collect()
 }
 
 impl VizDataProvider for InMemoryVizProvider {
@@ -327,25 +453,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn replay_points(&self) -> Vec<ReplayPoint> {
-        let events = self
-            .storage
-            .read()
-            .ok()
-            .map(|storage| storage.list_events())
-            .unwrap_or_default();
-
-        replay_frames(
-            &events,
-            ReplayMode::DeterministicEventReplay,
-            self.replay_stride,
-        )
-        .into_iter()
-        .map(|frame| ReplayPoint {
-            seq_hi: frame.seq_hi,
-            timestamp_unix_ms: frame.timestamp_unix_ms,
-            pending_count: frame.pending.len() as u32,
-        })
-        .collect()
+        self.dashboard_cache_snapshot().replay_points
     }
 
     fn propagation_edges(&self) -> Vec<PropagationEdge> {
@@ -361,96 +469,24 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn feature_summary(&self) -> Vec<FeatureSummary> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let mut counts = std::collections::BTreeMap::<(String, String), u64>::new();
-                for feature in storage.tx_features() {
-                    *counts
-                        .entry((feature.protocol.clone(), feature.category.clone()))
-                        .or_insert(0) += 1;
-                }
-
-                let mut out = counts
-                    .into_iter()
-                    .map(|((protocol, category), count)| FeatureSummary {
-                        protocol,
-                        category,
-                        count,
-                    })
-                    .collect::<Vec<_>>();
-                out.sort_unstable_by(|left, right| {
-                    right
-                        .count
-                        .cmp(&left.count)
-                        .then_with(|| left.protocol.cmp(&right.protocol))
-                        .then_with(|| left.category.cmp(&right.category))
-                });
-                out
-            })
-            .unwrap_or_default()
+        self.dashboard_cache_snapshot().feature_summary
     }
 
     fn feature_details(&self, limit: usize) -> Vec<FeatureDetail> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let mut emitted = std::collections::HashSet::new();
-                let mut out = Vec::new();
-
-                for feature in storage.tx_features().iter().rev() {
-                    if !emitted.insert(feature.hash) {
-                        continue;
-                    }
-                    out.push(FeatureDetail {
-                        hash: format_bytes(&feature.hash),
-                        protocol: feature.protocol.clone(),
-                        category: feature.category.clone(),
-                        chain_id: feature.chain_id,
-                        mev_score: feature.mev_score,
-                        urgency_score: feature.urgency_score,
-                        method_selector: format_method_selector(feature.method_selector),
-                        feature_engine_version: feature.feature_engine_version.clone(),
-                    });
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
-
-                out
-            })
-            .unwrap_or_default()
+        self.dashboard_cache_snapshot()
+            .feature_details
+            .into_iter()
+            .take(limit.max(1))
+            .collect()
     }
 
     fn opportunities(&self, limit: usize, min_score: u32) -> Vec<OpportunityDetail> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                storage
-                    .opportunities()
-                    .into_iter()
-                    .filter(|row| row.score >= min_score)
-                    .take(limit)
-                    .map(|row| OpportunityDetail {
-                        tx_hash: format_bytes(&row.tx_hash),
-                        status: "detected".to_owned(),
-                        strategy: row.strategy,
-                        score: row.score,
-                        protocol: row.protocol,
-                        category: row.category,
-                        chain_id: row.chain_id,
-                        feature_engine_version: row.feature_engine_version,
-                        scorer_version: row.scorer_version,
-                        strategy_version: row.strategy_version,
-                        reasons: row.reasons,
-                        detected_unix_ms: row.detected_unix_ms,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.dashboard_cache_snapshot()
+            .opportunities
+            .into_iter()
+            .filter(|row| row.score >= min_score)
+            .take(limit)
+            .collect()
     }
 
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary> {
@@ -1052,7 +1088,13 @@ async fn features_recent(
     Query(query): Query<TransactionsQuery>,
 ) -> Json<Vec<FeatureDetail>> {
     let limit = query.limit.unwrap_or(100).clamp(1, 5_000);
-    Json(state.provider.feature_details(limit))
+    let chain_id = query.chain_id;
+    let scan_limit = chain_filter_scan_limit(limit, chain_id);
+    Json(filter_feature_details_by_chain(
+        state.provider.feature_details(scan_limit),
+        chain_id,
+        limit,
+    ))
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1060,6 +1102,7 @@ struct TransactionsQuery {
     limit: Option<usize>,
     min_score: Option<u32>,
     status: Option<String>,
+    chain_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1069,6 +1112,7 @@ struct DashboardSnapshotQuery {
     opp_limit: Option<usize>,
     min_score: Option<u32>,
     replay_limit: Option<usize>,
+    chain_id: Option<u64>,
 }
 
 async fn dashboard_snapshot(
@@ -1079,6 +1123,7 @@ async fn dashboard_snapshot(
     let feature_limit = query.feature_limit.unwrap_or(600).clamp(1, 2_000);
     let opp_limit = query.opp_limit.unwrap_or(600).clamp(1, 2_000);
     let min_score = query.min_score.unwrap_or(0);
+    let chain_id = query.chain_id;
     let replay_limit = query
         .replay_limit
         .unwrap_or(state.downsample_limit)
@@ -1086,14 +1131,30 @@ async fn dashboard_snapshot(
 
     let replay_points = state.provider.replay_points();
     let latest_seq_id = replay_points.last().map(|point| point.seq_hi).unwrap_or(0);
+    let feature_scan_limit = chain_filter_scan_limit(feature_limit, chain_id);
+    let opp_scan_limit = chain_filter_scan_limit(opp_limit, chain_id);
+    let tx_scan_limit = chain_filter_scan_limit(tx_limit, chain_id);
 
     Json(DashboardSnapshot {
         replay: downsample(&replay_points, replay_limit),
         propagation: downsample(&state.provider.propagation_edges(), state.downsample_limit),
-        opportunities: state.provider.opportunities(opp_limit, min_score),
+        opportunities: filter_opportunities_by_chain(
+            state.provider.opportunities(opp_scan_limit, min_score),
+            chain_id,
+            opp_limit,
+        ),
         feature_summary: downsample(&state.provider.feature_summary(), state.downsample_limit),
-        feature_details: state.provider.feature_details(feature_limit),
-        transactions: state.provider.recent_transactions(tx_limit),
+        feature_details: filter_feature_details_by_chain(
+            state.provider.feature_details(feature_scan_limit),
+            chain_id,
+            feature_limit,
+        ),
+        transactions: filter_transaction_summaries_by_chain(
+            state.provider.as_ref(),
+            state.provider.recent_transactions(tx_scan_limit),
+            chain_id,
+            tx_limit,
+        ),
         market_stats: state.provider.market_stats(),
         latest_seq_id,
     })
@@ -1104,7 +1165,14 @@ async fn transactions(
     Query(query): Query<TransactionsQuery>,
 ) -> Json<Vec<TransactionSummary>> {
     let limit = query.limit.unwrap_or(25).clamp(1, 200);
-    Json(state.provider.recent_transactions(limit))
+    let chain_id = query.chain_id;
+    let scan_limit = chain_filter_scan_limit(limit, chain_id);
+    Json(filter_transaction_summaries_by_chain(
+        state.provider.as_ref(),
+        state.provider.recent_transactions(scan_limit),
+        chain_id,
+        limit,
+    ))
 }
 
 async fn opportunities_recent(
@@ -1124,20 +1192,95 @@ async fn opportunities(
 fn filtered_opportunities(state: &AppState, query: &TransactionsQuery) -> Vec<OpportunityDetail> {
     let limit = query.limit.unwrap_or(100).clamp(1, 5_000);
     let min_score = query.min_score.unwrap_or(0);
-    let values = state.provider.opportunities(limit, min_score);
+    let chain_id = query.chain_id;
+    let scan_limit = chain_filter_scan_limit(limit, chain_id);
+    let values = state.provider.opportunities(scan_limit, min_score);
     let status_filter = query
         .status
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    match status_filter {
+    let filtered = match status_filter {
         Some(status) => values
             .into_iter()
             .filter(|row| row.status.eq_ignore_ascii_case(status))
-            .collect(),
+            .collect::<Vec<_>>(),
         None => values,
+    };
+    filter_opportunities_by_chain(filtered, chain_id, limit)
+}
+
+fn chain_filter_scan_limit(limit: usize, chain_id: Option<u64>) -> usize {
+    if chain_id.is_some() {
+        limit.saturating_mul(4).clamp(limit, 20_000)
+    } else {
+        limit
     }
+}
+
+fn chain_matches_filter(record_chain_id: Option<u64>, chain_id_filter: Option<u64>) -> bool {
+    match chain_id_filter {
+        Some(chain_id) => record_chain_id == Some(chain_id),
+        None => true,
+    }
+}
+
+fn filter_feature_details_by_chain(
+    values: Vec<FeatureDetail>,
+    chain_id: Option<u64>,
+    limit: usize,
+) -> Vec<FeatureDetail> {
+    values
+        .into_iter()
+        .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+        .take(limit)
+        .collect()
+}
+
+fn filter_opportunities_by_chain(
+    values: Vec<OpportunityDetail>,
+    chain_id: Option<u64>,
+    limit: usize,
+) -> Vec<OpportunityDetail> {
+    values
+        .into_iter()
+        .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+        .take(limit)
+        .collect()
+}
+
+fn filter_transaction_details_by_chain(
+    values: Vec<TransactionDetail>,
+    chain_id: Option<u64>,
+    limit: usize,
+) -> Vec<TransactionDetail> {
+    values
+        .into_iter()
+        .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+        .take(limit)
+        .collect()
+}
+
+fn filter_transaction_summaries_by_chain(
+    provider: &dyn VizDataProvider,
+    values: Vec<TransactionSummary>,
+    chain_id: Option<u64>,
+    limit: usize,
+) -> Vec<TransactionSummary> {
+    values
+        .into_iter()
+        .filter(|row| {
+            if chain_id.is_none() {
+                return true;
+            }
+            provider
+                .transaction_detail_by_hash(&row.hash)
+                .map(|detail| chain_matches_filter(detail.chain_id, chain_id))
+                .unwrap_or(false)
+        })
+        .take(limit)
+        .collect()
 }
 
 async fn transactions_all(
@@ -1145,7 +1288,13 @@ async fn transactions_all(
     Query(query): Query<TransactionsQuery>,
 ) -> Json<Vec<TransactionDetail>> {
     let limit = query.limit.unwrap_or(1_000).clamp(1, 5_000);
-    Json(state.provider.transaction_details(limit))
+    let chain_id = query.chain_id;
+    let scan_limit = chain_filter_scan_limit(limit, chain_id);
+    Json(filter_transaction_details_by_chain(
+        state.provider.transaction_details(scan_limit),
+        chain_id,
+        limit,
+    ))
 }
 
 async fn transaction_by_hash(
@@ -1285,6 +1434,19 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {}\n",
         snapshot.tx_decode_fail_total
+    ));
+    let drop_metrics = live_rpc_drop_metrics_snapshot();
+    out.push_str(&format!(
+        "mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {}\n",
+        drop_metrics.storage_queue_full
+    ));
+    out.push_str(&format!(
+        "mempulse_ingest_drops_total{{reason=\"storage_queue_closed\"}} {}\n",
+        drop_metrics.storage_queue_closed
+    ));
+    out.push_str(&format!(
+        "mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {}\n",
+        drop_metrics.invalid_pending_hash
     ));
 
     // Stub values until replay runtime exports these counters directly.
