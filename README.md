@@ -67,6 +67,7 @@ Set environment variables before starting `viz-api`:
 - `VIZ_API_ETH_WS_URL` (optional override): WebSocket endpoint for `eth_subscribe newPendingTransactions`
 - `VIZ_API_ETH_HTTP_URL` (optional override): HTTP endpoint for `eth_getTransactionByHash`
 - `VIZ_API_SOURCE_ID` (optional): source label (default: `rpc-live`)
+- `VIZ_API_CHAINS` (optional): JSON array for chain-scoped ingest workers (overrides single-chain vars)
 - `VIZ_API_MAX_SEEN_HASHES` (optional): dedup cache size for live feed (default: `10000`)
 
 Example:
@@ -74,6 +75,28 @@ Example:
 ```bash
 export VIZ_API_ETH_WS_URL="wss://YOUR_PROVIDER_WS_URL"
 export VIZ_API_ETH_HTTP_URL="https://YOUR_PROVIDER_HTTP_URL"
+cargo run -p viz-api --bin viz-api
+```
+
+Multi-chain example:
+
+```bash
+export VIZ_API_CHAINS='[
+  {
+    "chain_key": "eth-mainnet",
+    "chain_id": 1,
+    "ws_url": "wss://YOUR_ETH_WS_URL",
+    "http_url": "https://YOUR_ETH_HTTP_URL",
+    "source_id": "rpc-eth-mainnet"
+  },
+  {
+    "chain_key": "base-mainnet",
+    "chain_id": 8453,
+    "ws_url": "wss://YOUR_BASE_WS_URL",
+    "http_url": "https://YOUR_BASE_HTTP_URL",
+    "source_id": "rpc-base-mainnet"
+  }
+]'
 cargo run -p viz-api --bin viz-api
 ```
 
@@ -93,6 +116,25 @@ Artifacts are written to:
 - `target/perf/runtime_allocator_matrix.tsv`
 - `target/perf/pipeline_latency_snapshot.log`
 - `docs/perf/v2_baseline.md`
+
+## Transaction Pipeline Baseline Harness
+
+Run the deterministic transaction ingest/read-path baseline harness:
+
+```bash
+bash scripts/perf_tx_pipeline_baseline.sh
+```
+
+Optional environment variables:
+
+- `VIZ_API_TX_PERF_TX_COUNT` to override seeded transaction volume (default: `2000`)
+- `VIZ_API_TX_PERF_ARTIFACT` to write to a specific artifact path
+- `TX_PIPELINE_PERF_ARTIFACT_DIR` to override artifact directory (default: `artifacts/perf`)
+
+Artifacts are written to:
+
+- `artifacts/perf/tx_pipeline_perf_baseline_<timestamp>.json`
+- `artifacts/perf/tx_pipeline_perf_baseline_latest.json`
 
 ## V2 Demo Workflow
 

@@ -27,3 +27,4 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"
+serde_json = { workspace = true }

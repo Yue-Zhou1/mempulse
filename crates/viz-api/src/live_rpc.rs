@@ -11,9 +11,10 @@ use feature_engine::{
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
@@ -32,6 +33,7 @@ const FALLBACK_PUBLIC_HTTP_URL: &str = "https://ethereum-rpc.publicnode.com";
 const ENV_ETH_WS_URL: &str = "VIZ_API_ETH_WS_URL";
 const ENV_ETH_HTTP_URL: &str = "VIZ_API_ETH_HTTP_URL";
 const ENV_SOURCE_ID: &str = "VIZ_API_SOURCE_ID";
+const ENV_CHAINS: &str = "VIZ_API_CHAINS";
 const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
 const SEARCHER_MIN_SCORE: u32 = 0;
 const SEARCHER_MAX_CANDIDATES: usize = 8;
@@ -42,27 +44,75 @@ struct RpcEndpoint {
     http_url: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct EnvChainConfig {
+    chain_key: String,
+    #[serde(default)]
+    chain_id: Option<u64>,
+    ws_url: String,
+    http_url: String,
+    #[serde(default)]
+    source_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
-pub struct LiveRpcConfig {
+pub struct ChainRpcConfig {
+    chain_key: String,
+    chain_id: Option<u64>,
     endpoints: Vec<RpcEndpoint>,
     source_id: SourceId,
+}
+
+impl ChainRpcConfig {
+    pub fn chain_key(&self) -> &str {
+        &self.chain_key
+    }
+
+    pub fn chain_id(&self) -> Option<u64> {
+        self.chain_id
+    }
+
+    pub fn source_id(&self) -> &SourceId {
+        &self.source_id
+    }
+
+    pub fn primary_ws_url(&self) -> Option<&str> {
+        self.endpoints
+            .first()
+            .map(|endpoint| endpoint.ws_url.as_str())
+    }
+
+    pub fn primary_http_url(&self) -> Option<&str> {
+        self.endpoints
+            .first()
+            .map(|endpoint| endpoint.http_url.as_str())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveRpcConfig {
+    chains: Vec<ChainRpcConfig>,
     max_seen_hashes: usize,
 }
 
 impl Default for LiveRpcConfig {
     fn default() -> Self {
         Self {
-            endpoints: vec![
-                RpcEndpoint {
-                    ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
-                    http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
-                },
-                RpcEndpoint {
-                    ws_url: FALLBACK_PUBLIC_WS_URL.to_owned(),
-                    http_url: FALLBACK_PUBLIC_HTTP_URL.to_owned(),
-                },
-            ],
-            source_id: SourceId::new("rpc-live"),
+            chains: vec![ChainRpcConfig {
+                chain_key: "eth-mainnet".to_owned(),
+                chain_id: Some(1),
+                endpoints: vec![
+                    RpcEndpoint {
+                        ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
+                        http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
+                    },
+                    RpcEndpoint {
+                        ws_url: FALLBACK_PUBLIC_WS_URL.to_owned(),
+                        http_url: FALLBACK_PUBLIC_HTTP_URL.to_owned(),
+                    },
+                ],
+                source_id: SourceId::new("rpc-live"),
+            }],
             max_seen_hashes: 10_000,
         }
     }
@@ -70,6 +120,10 @@ impl Default for LiveRpcConfig {
 
 impl LiveRpcConfig {
     pub fn from_env() -> Result<Self> {
+        let chains_override = std::env::var(ENV_CHAINS)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         let ws_override = std::env::var(ENV_ETH_WS_URL)
             .ok()
             .map(|value| value.trim().to_owned())
@@ -94,41 +148,111 @@ impl LiveRpcConfig {
             .max(1);
 
         let mut config = Self::default();
-        if let Some(ws_url) = ws_override {
-            config.endpoints = vec![RpcEndpoint {
-                ws_url,
-                http_url: http_override.unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned()),
-            }];
-        } else if let Some(http_url) = http_override {
-            if let Some(primary) = config.endpoints.first_mut() {
-                primary.http_url = http_url;
+        if let Some(chains_override) = chains_override {
+            config.chains = parse_env_chain_configs(&chains_override)?;
+        } else {
+            if let Some(ws_url) = ws_override {
+                if let Some(primary_chain) = config.chains.first_mut() {
+                    primary_chain.endpoints = vec![RpcEndpoint {
+                        ws_url,
+                        http_url: http_override
+                            .unwrap_or_else(|| PRIMARY_PUBLIC_HTTP_URL.to_owned()),
+                    }];
+                }
+            } else if let Some(http_url) = http_override {
+                if let Some(primary_chain) = config.chains.first_mut() {
+                    if let Some(primary_endpoint) = primary_chain.endpoints.first_mut() {
+                        primary_endpoint.http_url = http_url;
+                    }
+                }
+            }
+
+            if let Some(primary_chain) = config.chains.first_mut() {
+                primary_chain.source_id = SourceId::new(source_id);
             }
         }
-
-        config.source_id = SourceId::new(source_id);
         config.max_seen_hashes = max_seen_hashes;
         Ok(config)
     }
 
+    pub fn chain_configs(&self) -> &[ChainRpcConfig] {
+        &self.chains
+    }
+
     pub fn primary_ws_url(&self) -> Option<&str> {
-        self.endpoints
-            .first()
-            .map(|endpoint| endpoint.ws_url.as_str())
+        self.chains.first().and_then(|chain| chain.primary_ws_url())
     }
 
     pub fn primary_http_url(&self) -> Option<&str> {
-        self.endpoints
+        self.chains
             .first()
-            .map(|endpoint| endpoint.http_url.as_str())
+            .and_then(|chain| chain.primary_http_url())
     }
 
     pub fn source_id(&self) -> &SourceId {
-        &self.source_id
+        self.chains
+            .first()
+            .map(|chain| &chain.source_id)
+            .unwrap_or_else(|| panic!("live rpc config has no chains"))
     }
 
     pub fn max_seen_hashes(&self) -> usize {
         self.max_seen_hashes
     }
+}
+
+pub fn worker_count_for_config(config: &LiveRpcConfig) -> usize {
+    config.chains.len()
+}
+
+pub fn resolve_record_chain_id(
+    configured_chain_id: Option<u64>,
+    tx_chain_id: Option<u64>,
+) -> Option<u64> {
+    tx_chain_id.or(configured_chain_id)
+}
+
+fn parse_env_chain_configs(raw: &str) -> Result<Vec<ChainRpcConfig>> {
+    let env_chains: Vec<EnvChainConfig> =
+        serde_json::from_str(raw).context("decode VIZ_API_CHAINS json")?;
+    if env_chains.is_empty() {
+        return Err(anyhow!("{ENV_CHAINS} must contain at least one chain"));
+    }
+    env_chains
+        .into_iter()
+        .map(parse_env_chain_config)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn parse_env_chain_config(chain: EnvChainConfig) -> Result<ChainRpcConfig> {
+    let chain_key = chain.chain_key.trim();
+    if chain_key.is_empty() {
+        return Err(anyhow!("chain_key in {ENV_CHAINS} cannot be empty"));
+    }
+    let ws_url = chain.ws_url.trim();
+    if ws_url.is_empty() {
+        return Err(anyhow!("ws_url for chain '{chain_key}' cannot be empty"));
+    }
+    let http_url = chain.http_url.trim();
+    if http_url.is_empty() {
+        return Err(anyhow!("http_url for chain '{chain_key}' cannot be empty"));
+    }
+
+    let source_id = chain
+        .source_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("rpc-{chain_key}"));
+
+    Ok(ChainRpcConfig {
+        chain_key: chain_key.to_owned(),
+        chain_id: chain.chain_id,
+        endpoints: vec![RpcEndpoint {
+            ws_url: ws_url.to_owned(),
+            http_url: http_url.to_owned(),
+        }],
+        source_id: SourceId::new(source_id),
+    })
 }
 
 pub fn start_live_rpc_feed(
@@ -141,64 +265,103 @@ pub fn start_live_rpc_feed(
         Err(_) => return,
     };
 
-    handle.spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(6))
-            .build()
-            .expect("reqwest client");
-        if config.endpoints.is_empty() {
-            tracing::error!("live rpc config has no endpoints");
+    if config.chains.is_empty() {
+        tracing::error!("live rpc config has no chains configured");
+        return;
+    }
+
+    let next_seq_id = Arc::new(AtomicU64::new(
+        current_seq_hi(&storage).saturating_add(1).max(1),
+    ));
+    let max_seen_hashes = config.max_seen_hashes;
+
+    for chain in config.chains {
+        let writer = writer.clone();
+        let next_seq_id = next_seq_id.clone();
+        handle.spawn(async move {
+            run_chain_worker(writer, chain, max_seen_hashes, next_seq_id).await;
+        });
+    }
+}
+
+async fn run_chain_worker(
+    writer: StorageWriteHandle,
+    chain: ChainRpcConfig,
+    max_seen_hashes: usize,
+    next_seq_id: Arc<AtomicU64>,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                chain_key = %chain.chain_key,
+                "failed to build reqwest client for chain ingest worker"
+            );
             return;
         }
+    };
+    if chain.endpoints.is_empty() {
+        tracing::error!(
+            chain_key = %chain.chain_key,
+            "live rpc chain config has no endpoints"
+        );
+        return;
+    }
 
-        let mut seen_hashes = FastSet::default();
-        let mut seen_order = VecDeque::new();
-        let mut next_seq_id = current_seq_hi(&storage).saturating_add(1).max(1);
-        let mut endpoint_index = 0usize;
+    let mut seen_hashes = FastSet::default();
+    let mut seen_order = VecDeque::new();
+    let mut endpoint_index = 0usize;
 
-        loop {
-            let endpoint = &config.endpoints[endpoint_index];
-            tracing::info!(
+    loop {
+        let endpoint = &chain.endpoints[endpoint_index];
+        tracing::info!(
+            chain_key = %chain.chain_key,
+            chain_id = ?chain.chain_id,
+            ws_url = endpoint.ws_url,
+            http_url = endpoint.http_url,
+            endpoint_index,
+            "starting chain-scoped live rpc websocket session"
+        );
+        let session_result = run_ws_session(
+            &writer,
+            &chain,
+            endpoint,
+            max_seen_hashes,
+            &client,
+            &next_seq_id,
+            &mut seen_hashes,
+            &mut seen_order,
+        )
+        .await;
+
+        if let Err(err) = session_result {
+            let error_chain = format_error_chain(&err);
+            tracing::warn!(
+                error = %err,
+                error_chain = %error_chain,
+                chain_key = %chain.chain_key,
+                chain_id = ?chain.chain_id,
                 ws_url = endpoint.ws_url,
                 http_url = endpoint.http_url,
-                endpoint_index,
-                "starting live rpc websocket session"
+                "live rpc websocket session ended for chain; rotating endpoint"
             );
-            let session_result = run_ws_session(
-                &writer,
-                endpoint,
-                &config.source_id,
-                config.max_seen_hashes,
-                &client,
-                &mut next_seq_id,
-                &mut seen_hashes,
-                &mut seen_order,
-            )
-            .await;
-
-            if let Err(err) = session_result {
-                let error_chain = format_error_chain(&err);
-                tracing::warn!(
-                    error = %err,
-                    error_chain = %error_chain,
-                    ws_url = endpoint.ws_url,
-                    http_url = endpoint.http_url,
-                    "live rpc websocket session ended; rotating endpoint"
-                );
-                endpoint_index = (endpoint_index + 1) % config.endpoints.len();
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            endpoint_index = (endpoint_index + 1) % chain.endpoints.len();
         }
-    });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 async fn run_ws_session(
     writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
     endpoint: &RpcEndpoint,
-    source_id: &SourceId,
     max_seen_hashes: usize,
     client: &reqwest::Client,
-    next_seq_id: &mut u64,
+    next_seq_id: &Arc<AtomicU64>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
@@ -218,6 +381,8 @@ async fn run_ws_session(
         .await
         .context("send eth_subscribe request")?;
     tracing::info!(
+        chain_key = %chain.chain_key,
+        chain_id = ?chain.chain_id,
         ws_url = endpoint.ws_url,
         "subscribed to eth_subscribe:newPendingTransactions"
     );
@@ -230,8 +395,8 @@ async fn run_ws_session(
                 if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
                     process_pending_hash(
                         writer,
+                        chain,
                         endpoint,
-                        source_id,
                         max_seen_hashes,
                         client,
                         &hash_hex,
@@ -255,43 +420,85 @@ async fn run_ws_session(
     Ok(())
 }
 
-fn parse_pending_hash(payload: &str, subscription_id: &mut Option<String>) -> Option<String> {
-    let value: Value = serde_json::from_str(payload).ok()?;
-    if value.get("id").is_some() {
-        if let Some(result) = value.get("result").and_then(Value::as_str) {
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WsPendingHashValue<'a> {
+    Str(&'a str),
+    Obj(WsPendingHashObject<'a>),
+}
+
+impl<'a> WsPendingHashValue<'a> {
+    fn as_hash(&self) -> Option<&'a str> {
+        match self {
+            Self::Str(hash) => Some(*hash),
+            Self::Obj(obj) => obj.hash,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WsPendingHashObject<'a> {
+    #[serde(default, borrow)]
+    hash: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsSubscriptionParams<'a> {
+    #[serde(borrow)]
+    subscription: &'a str,
+    #[serde(borrow)]
+    result: WsPendingHashValue<'a>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsRpcMessage<'a> {
+    #[serde(default)]
+    id: Option<IgnoredAny>,
+    #[serde(default, borrow)]
+    method: Option<&'a str>,
+    #[serde(default, borrow)]
+    result: Option<WsPendingHashValue<'a>>,
+    #[serde(default, borrow)]
+    params: Option<WsSubscriptionParams<'a>>,
+}
+
+pub fn parse_pending_hash<'a>(
+    payload: &'a str,
+    subscription_id: &mut Option<String>,
+) -> Option<&'a str> {
+    let message: WsRpcMessage<'a> = serde_json::from_str(payload).ok()?;
+    if message.id.is_some() {
+        if let Some(result) = message
+            .result
+            .as_ref()
+            .and_then(WsPendingHashValue::as_hash)
+        {
             *subscription_id = Some(result.to_owned());
         }
         return None;
     }
-    if value.get("method").and_then(Value::as_str) != Some("eth_subscription") {
+    if message.method != Some("eth_subscription") {
         return None;
     }
 
-    let params = value.get("params")?;
-    let incoming_sub = params.get("subscription").and_then(Value::as_str)?;
+    let params = message.params?;
     if let Some(expected) = subscription_id.as_ref() {
-        if expected != incoming_sub {
+        if expected != params.subscription {
             return None;
         }
     }
-    let result = params.get("result")?;
-    if let Some(hash) = result.as_str() {
-        return Some(hash.to_owned());
-    }
-    result
-        .get("hash")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+
+    params.result.as_hash()
 }
 
 async fn process_pending_hash(
     writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
     endpoint: &RpcEndpoint,
-    source_id: &SourceId,
     max_seen_hashes: usize,
     client: &reqwest::Client,
     hash_hex: &str,
-    next_seq_id: &mut u64,
+    next_seq_id: &Arc<AtomicU64>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
 ) -> Result<()> {
@@ -323,10 +530,14 @@ async fn process_pending_hash(
     let feature_analysis = fetched_tx
         .as_ref()
         .map(|tx| analyze_transaction(feature_input(tx)));
+    let resolved_chain_id = fetched_tx
+        .as_ref()
+        .map(|tx| resolve_record_chain_id(chain.chain_id, tx.chain_id))
+        .unwrap_or(chain.chain_id);
 
     if let Some(tx) = fetched_tx.as_ref() {
         let to = format_optional_fixed_hex(tx.to.as_ref().map(|value| value.as_slice()));
-        let chain_id = format_optional_u64(tx.chain_id);
+        let chain_id = format_optional_u64(resolved_chain_id);
         let gas_limit = format_optional_u64(tx.gas_limit);
         let value_wei = format_optional_u128(tx.value_wei);
         let gas_price_wei = format_optional_u128(tx.gas_price_wei);
@@ -337,6 +548,8 @@ async fn process_pending_hash(
         let method_selector = format_method_selector_hex(analysis.method_selector);
         tracing::info!(
             hash = hash_hex,
+            chain_key = %chain.chain_key,
+            source_id = %chain.source_id,
             sender = %format_fixed_hex(&tx.sender),
             to = %to,
             nonce = tx.nonce,
@@ -359,29 +572,33 @@ async fn process_pending_hash(
     } else {
         tracing::info!(
             hash = hash_hex,
+            chain_key = %chain.chain_key,
+            source_id = %chain.source_id,
             "mempool transaction (details unavailable from rpc)"
         );
     }
 
-    append_event(
-        writer,
-        next_seq_id,
-        source_id,
-        now_unix_ms,
-        EventPayload::TxSeen(TxSeen {
-            hash,
-            peer_id: "rpc-ws".to_owned(),
-            seen_at_unix_ms: now_unix_ms,
-            seen_at_mono_ns: next_seq_id.saturating_mul(1_000_000),
-        }),
-    )
-    .await?;
+    let tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
+    writer
+        .enqueue(StorageWriteOp::AppendEvent(EventEnvelope {
+            seq_id: tx_seen_seq_id,
+            ingest_ts_unix_ms: now_unix_ms,
+            ingest_ts_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
+            source_id: chain.source_id.clone(),
+            payload: EventPayload::TxSeen(TxSeen {
+                hash,
+                peer_id: "rpc-ws".to_owned(),
+                seen_at_unix_ms: now_unix_ms,
+                seen_at_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
+            }),
+        }))
+        .await?;
     writer
         .enqueue(StorageWriteOp::UpsertTxSeen(TxSeenRecord {
             hash,
             peer: "rpc-ws".to_owned(),
             first_seen_unix_ms: now_unix_ms,
-            first_seen_mono_ns: next_seq_id.saturating_mul(1_000_000),
+            first_seen_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
             seen_count: 1,
         }))
         .await?;
@@ -389,7 +606,7 @@ async fn process_pending_hash(
     append_event(
         writer,
         next_seq_id,
-        source_id,
+        &chain.source_id,
         now_unix_ms,
         EventPayload::TxFetched(TxFetched {
             hash,
@@ -406,7 +623,7 @@ async fn process_pending_hash(
             tx_type: tx.tx_type,
             sender: tx.sender,
             nonce: tx.nonce,
-            chain_id: tx.chain_id,
+            chain_id: resolved_chain_id,
             to: tx.to,
             value_wei: tx.value_wei,
             gas_limit: tx.gas_limit,
@@ -419,7 +636,7 @@ async fn process_pending_hash(
         append_event(
             writer,
             next_seq_id,
-            source_id,
+            &chain.source_id,
             now_unix_ms,
             EventPayload::TxDecoded(decoded.clone()),
         )
@@ -431,7 +648,7 @@ async fn process_pending_hash(
                 sender: tx.sender,
                 nonce: tx.nonce,
                 to: tx.to,
-                chain_id: tx.chain_id,
+                chain_id: resolved_chain_id,
                 value_wei: tx.value_wei,
                 gas_limit: tx.gas_limit,
                 gas_price_wei: tx.gas_price_wei,
@@ -447,16 +664,24 @@ async fn process_pending_hash(
                 hash: tx.hash,
                 protocol: analysis.protocol.to_owned(),
                 category: analysis.category.to_owned(),
+                chain_id: resolved_chain_id,
                 mev_score: analysis.mev_score,
                 urgency_score: analysis.urgency_score,
                 method_selector: analysis.method_selector,
                 feature_engine_version: feature_engine_version().to_owned(),
             }))
             .await?;
-        for opportunity in build_opportunity_records(&decoded, &raw_tx, now_unix_ms) {
-            let events =
-                build_rule_versioned_events(*next_seq_id, now_unix_ms, source_id, &opportunity);
-            *next_seq_id = next_seq_id.saturating_add(events.len() as u64);
+        for opportunity in
+            build_opportunity_records(&decoded, &raw_tx, now_unix_ms, resolved_chain_id)
+        {
+            let start_seq_id =
+                next_seq_id.fetch_add(rule_versioned_event_count() as u64, Ordering::Relaxed);
+            let events = build_rule_versioned_events(
+                start_seq_id,
+                now_unix_ms,
+                &chain.source_id,
+                &opportunity,
+            );
             for event in events {
                 writer.enqueue(StorageWriteOp::AppendEvent(event)).await?;
             }
@@ -471,13 +696,12 @@ async fn process_pending_hash(
 
 async fn append_event(
     writer: &StorageWriteHandle,
-    next_seq_id: &mut u64,
+    next_seq_id: &Arc<AtomicU64>,
     source_id: &SourceId,
     now_unix_ms: i64,
     payload: EventPayload,
-) -> Result<()> {
-    let seq_id = *next_seq_id;
-    *next_seq_id = next_seq_id.saturating_add(1);
+) -> Result<u64> {
+    let seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
     writer
         .enqueue(StorageWriteOp::AppendEvent(EventEnvelope {
             seq_id,
@@ -487,7 +711,7 @@ async fn append_event(
             payload,
         }))
         .await?;
-    Ok(())
+    Ok(seq_id)
 }
 
 fn remember_hash(
@@ -585,6 +809,7 @@ fn build_opportunity_records(
     decoded: &TxDecoded,
     calldata: &[u8],
     detected_unix_ms: i64,
+    chain_id: Option<u64>,
 ) -> Vec<OpportunityRecord> {
     rank_opportunities(
         &[SearcherInputTx {
@@ -608,8 +833,13 @@ fn build_opportunity_records(
         strategy_version: candidate.strategy_version,
         reasons: candidate.reasons,
         detected_unix_ms,
+        chain_id,
     })
     .collect()
+}
+
+fn rule_versioned_event_count() -> usize {
+    3
 }
 
 fn build_rule_versioned_events(
@@ -873,12 +1103,16 @@ mod tests {
     #[test]
     fn default_live_rpc_config_has_primary_and_fallback_public_endpoints() {
         let config = LiveRpcConfig::default();
-        assert_eq!(config.endpoints.len(), 2);
-        assert_eq!(config.endpoints[0].ws_url, PRIMARY_PUBLIC_WS_URL);
-        assert_eq!(config.endpoints[0].http_url, PRIMARY_PUBLIC_HTTP_URL);
-        assert_eq!(config.endpoints[1].ws_url, FALLBACK_PUBLIC_WS_URL);
-        assert_eq!(config.endpoints[1].http_url, FALLBACK_PUBLIC_HTTP_URL);
-        assert_eq!(config.source_id, SourceId::new("rpc-live"));
+        assert_eq!(config.chains.len(), 1);
+        let chain = &config.chains[0];
+        assert_eq!(chain.chain_key, "eth-mainnet");
+        assert_eq!(chain.chain_id, Some(1));
+        assert_eq!(chain.endpoints.len(), 2);
+        assert_eq!(chain.endpoints[0].ws_url, PRIMARY_PUBLIC_WS_URL);
+        assert_eq!(chain.endpoints[0].http_url, PRIMARY_PUBLIC_HTTP_URL);
+        assert_eq!(chain.endpoints[1].ws_url, FALLBACK_PUBLIC_WS_URL);
+        assert_eq!(chain.endpoints[1].http_url, FALLBACK_PUBLIC_HTTP_URL);
+        assert_eq!(chain.source_id, SourceId::new("rpc-live"));
         assert!(config.max_seen_hashes >= 100);
     }
 
@@ -954,7 +1188,7 @@ mod tests {
         };
 
         let detected_unix_ms = 1_700_000_001_234;
-        let records = build_opportunity_records(&decoded, &calldata, detected_unix_ms);
+        let records = build_opportunity_records(&decoded, &calldata, detected_unix_ms, Some(1));
 
         assert!(!records.is_empty());
         assert!(
@@ -978,6 +1212,7 @@ mod tests {
         let tx_hash = [0x11; 32];
         let opportunity = OpportunityRecord {
             tx_hash,
+            chain_id: Some(1),
             strategy: "SandwichCandidate".to_owned(),
             score: 12_345,
             protocol: "uniswap-v2".to_owned(),

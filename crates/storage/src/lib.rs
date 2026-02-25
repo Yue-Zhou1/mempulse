@@ -75,6 +75,8 @@ pub struct TxFullRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxFeaturesRecord {
     pub hash: TxHash,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
     pub protocol: String,
     pub category: String,
     pub mev_score: u16,
@@ -87,6 +89,8 @@ pub struct TxFeaturesRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OpportunityRecord {
     pub tx_hash: TxHash,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
     pub strategy: String,
     pub score: u32,
     pub protocol: String,
@@ -830,6 +834,7 @@ mod tests {
     fn opportunity_record(seq: u8) -> OpportunityRecord {
         OpportunityRecord {
             tx_hash: hash(seq),
+            chain_id: Some(1),
             strategy: "SandwichCandidate".to_owned(),
             score: 10_000 + seq as u32,
             protocol: "uniswap-v2".to_owned(),
@@ -871,6 +876,7 @@ mod tests {
         });
         store.upsert_tx_features(TxFeaturesRecord {
             hash: hash(1),
+            chain_id: Some(1),
             protocol: "uniswap-v2".to_owned(),
             category: "swap".to_owned(),
             mev_score: 80,
@@ -1184,6 +1190,7 @@ mod tests {
             });
             store.upsert_tx_features(TxFeaturesRecord {
                 hash,
+                chain_id: Some(1),
                 protocol: "uniswap-v2".to_owned(),
                 category: "swap".to_owned(),
                 mev_score: 80,
@@ -1238,6 +1245,7 @@ mod tests {
             });
             store.upsert_tx_features(TxFeaturesRecord {
                 hash,
+                chain_id: Some(1),
                 protocol: "erc20".to_owned(),
                 category: "transfer".to_owned(),
                 mev_score,
