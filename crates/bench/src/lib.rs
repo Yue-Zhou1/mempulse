@@ -16,7 +16,7 @@ pub struct PipelineLatencyReport {
     pub avg_us: u64,
 }
 
-pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx> {
+pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx<'static>> {
     let routers = [
         uniswap_v2_router(),
         uniswap_v3_router(),
@@ -35,8 +35,8 @@ pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx> {
             let router = routers[idx % routers.len()];
             let selector = selectors[idx % selectors.len()];
             let calldata_len = 32 + ((idx % 6) * 32);
-            SearcherInputTx {
-                decoded: TxDecoded {
+            SearcherInputTx::owned(
+                TxDecoded {
                     hash: tx_hash(idx as u64 + 1),
                     tx_type: 2,
                     sender: address((idx % 251) as u8),
@@ -46,20 +46,22 @@ pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx> {
                     value_wei: Some(1_000_000_000_000_000),
                     gas_limit: Some(180_000 + ((idx % 5) as u64) * 30_000),
                     gas_price_wei: None,
-                    max_fee_per_gas_wei: Some(45_000_000_000 + ((idx % 7) as u128) * 1_000_000_000),
+                    max_fee_per_gas_wei: Some(
+                        45_000_000_000 + ((idx % 7) as u128) * 1_000_000_000,
+                    ),
                     max_priority_fee_per_gas_wei: Some(
                         1_000_000_000 + ((idx % 5) as u128) * 1_000_000_000,
                     ),
                     max_fee_per_blob_gas_wei: None,
                     calldata_len: Some(calldata_len as u32),
                 },
-                calldata: build_calldata(selector, calldata_len),
-            }
+                build_calldata(selector, calldata_len),
+            )
         })
         .collect()
 }
 
-pub fn run_pipeline_once(batch: &[SearcherInputTx]) -> usize {
+pub fn run_pipeline_once(batch: &[SearcherInputTx<'_>]) -> usize {
     let config = SearcherConfig {
         min_score: 7_500,
         max_candidates: 128,

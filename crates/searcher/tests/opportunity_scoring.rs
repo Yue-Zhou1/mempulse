@@ -44,22 +44,22 @@ fn opportunity_scoring_is_deterministic_and_prunes() {
     let erc20 = address(0xee);
 
     let batch = vec![
-        SearcherInputTx {
-            decoded: tx(0x10, uniswap_v2, 320_000, 7_000_000_000, 256),
-            calldata: vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4, 5],
-        },
-        SearcherInputTx {
-            decoded: tx(0x11, uniswap_v2, 290_000, 6_000_000_000, 192),
-            calldata: vec![0x04, 0xe4, 0x5a, 0xaf, 9, 8, 7, 6, 5],
-        },
-        SearcherInputTx {
-            decoded: tx(0x20, unknown_dex, 240_000, 3_000_000_000, 160),
-            calldata: vec![0x50, 0x23, 0xb4, 0xdf, 1, 1, 1, 1],
-        },
-        SearcherInputTx {
-            decoded: tx(0x30, erc20, 65_000, 1_000_000_000, 68),
-            calldata: vec![0xa9, 0x05, 0x9c, 0xbb, 0, 0, 0, 0],
-        },
+        SearcherInputTx::owned(
+            tx(0x10, uniswap_v2, 320_000, 7_000_000_000, 256),
+            vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4, 5],
+        ),
+        SearcherInputTx::owned(
+            tx(0x11, uniswap_v2, 290_000, 6_000_000_000, 192),
+            vec![0x04, 0xe4, 0x5a, 0xaf, 9, 8, 7, 6, 5],
+        ),
+        SearcherInputTx::owned(
+            tx(0x20, unknown_dex, 240_000, 3_000_000_000, 160),
+            vec![0x50, 0x23, 0xb4, 0xdf, 1, 1, 1, 1],
+        ),
+        SearcherInputTx::owned(
+            tx(0x30, erc20, 65_000, 1_000_000_000, 68),
+            vec![0xa9, 0x05, 0x9c, 0xbb, 0, 0, 0, 0],
+        ),
     ];
 
     let config = SearcherConfig {

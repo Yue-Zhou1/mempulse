@@ -6,7 +6,7 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::{Address, PeerId, TxHash};
-use event_log::{EventEnvelope, EventPayload, GlobalSequencer, sort_deterministic};
+use event_log::{EventEnvelope, EventPayload, GlobalSequencer, cmp_deterministic};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::MissedTickBehavior;
 
 pub use backfill::{BackfillConfig, BackfillSummary, BackfillWriter};
@@ -148,10 +149,15 @@ pub trait EventStore {
     fn latest_seq_id(&self) -> Option<u64>;
 }
 
+pub fn scan_events_cursor_start(events: &[EventEnvelope], from_seq_id: u64) -> usize {
+    events.partition_point(|event| event.seq_id <= from_seq_id)
+}
+
 #[derive(Clone, Debug)]
 pub struct InMemoryStorage {
     config: StorageConfig,
     events: VecDeque<EventEnvelope>,
+    event_index: Vec<EventEnvelope>,
     tx_seen: VecDeque<TxSeenRecord>,
     tx_full: VecDeque<TxFullRecord>,
     tx_features: VecDeque<TxFeaturesRecord>,
@@ -163,6 +169,7 @@ pub struct InMemoryStorage {
     recent_tx_counts: FastMap<TxHash, usize>,
     recent_tx_lookup: FastMap<TxHash, RecentTransactionRecord>,
     market_stats: MarketStatsSnapshot,
+    read_model_revision: u64,
 }
 
 impl Default for InMemoryStorage {
@@ -183,6 +190,7 @@ impl InMemoryStorage {
         Self {
             config,
             events: VecDeque::new(),
+            event_index: Vec::new(),
             tx_seen: VecDeque::new(),
             tx_full: VecDeque::new(),
             tx_features: VecDeque::new(),
@@ -194,6 +202,7 @@ impl InMemoryStorage {
             recent_tx_counts: FastMap::default(),
             recent_tx_lookup: FastMap::default(),
             market_stats: MarketStatsSnapshot::default(),
+            read_model_revision: 0,
         }
     }
 
@@ -202,12 +211,14 @@ impl InMemoryStorage {
         push_bounded(&mut self.tx_seen, record, self.config.table_capacity);
         self.market_stats.total_tx_count = self.market_stats.total_tx_count.saturating_add(1);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn upsert_tx_full(&mut self, record: TxFullRecord) {
         let start = Instant::now();
         push_bounded(&mut self.tx_full, record, self.config.table_capacity);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
@@ -225,24 +236,28 @@ impl InMemoryStorage {
             self.market_stats.low_risk_count = self.market_stats.low_risk_count.saturating_add(1);
         }
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn upsert_opportunity(&mut self, record: OpportunityRecord) {
         let start = Instant::now();
         push_bounded(&mut self.opportunities, record, self.config.table_capacity);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
         push_bounded(&mut self.tx_lifecycle, record, self.config.table_capacity);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn upsert_peer_stats(&mut self, record: PeerStatsRecord) {
         let start = Instant::now();
         push_bounded(&mut self.peer_stats, record, self.config.table_capacity);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     pub fn tx_seen(&self) -> &VecDeque<TxSeenRecord> {
@@ -317,6 +332,10 @@ impl InMemoryStorage {
         self.market_stats
     }
 
+    pub fn read_model_revision(&self) -> u64 {
+        self.read_model_revision
+    }
+
     fn track_recent_transaction(&mut self, record: RecentTransactionRecord) {
         let hash = record.hash;
         self.recent_tx_order.push_back(hash);
@@ -342,6 +361,10 @@ impl InMemoryStorage {
             latency_ns,
             self.config.write_latency_capacity,
         );
+    }
+
+    fn bump_read_model_revision(&mut self) {
+        self.read_model_revision = self.read_model_revision.saturating_add(1);
     }
 }
 
@@ -415,31 +438,37 @@ impl EventStore for InMemoryStorage {
             self.upsert_tx_lifecycle(record);
         }
 
+        let insert_at = self
+            .event_index
+            .partition_point(|existing| cmp_deterministic(existing, &event).is_lt());
+        self.event_index.insert(insert_at, event.clone());
         self.events.push_back(event);
         while self.events.len() > self.config.event_capacity {
-            let _ = self.events.pop_front();
+            if let Some(old_event) = self.events.pop_front() {
+                remove_event_from_sorted_index(&mut self.event_index, &old_event);
+            }
         }
 
         self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
     }
 
     fn list_events(&self) -> Vec<EventEnvelope> {
-        let mut out = self.events.iter().cloned().collect::<Vec<_>>();
-        sort_deterministic(&mut out);
-        out
+        self.event_index.clone()
     }
 
     fn scan_events(&self, from_seq_id: u64, limit: usize) -> Vec<EventEnvelope> {
         let limit = limit.max(1);
-        self.list_events()
-            .into_iter()
-            .filter(|event| event.seq_id > from_seq_id)
+        let start = scan_events_cursor_start(&self.event_index, from_seq_id);
+        self.event_index[start..]
+            .iter()
             .take(limit)
+            .cloned()
             .collect()
     }
 
     fn latest_seq_id(&self) -> Option<u64> {
-        self.events.back().map(|event| event.seq_id)
+        self.event_index.last().map(|event| event.seq_id)
     }
 }
 
@@ -478,7 +507,17 @@ pub struct StorageWriteHandle {
     tx: mpsc::Sender<StorageWriteOp>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageTryEnqueueError {
+    QueueFull,
+    QueueClosed,
+}
+
 impl StorageWriteHandle {
+    pub fn from_sender(tx: mpsc::Sender<StorageWriteOp>) -> Self {
+        Self { tx }
+    }
+
     pub async fn enqueue(&self, op: StorageWriteOp) -> Result<()> {
         self.tx
             .send(op)
@@ -486,10 +525,11 @@ impl StorageWriteHandle {
             .map_err(|_| anyhow!("storage writer task is not running"))
     }
 
-    pub fn try_enqueue(&self, op: StorageWriteOp) -> Result<()> {
-        self.tx
-            .try_send(op)
-            .map_err(|err| anyhow!("storage writer queue full or closed: {err}"))
+    pub fn try_enqueue(&self, op: StorageWriteOp) -> std::result::Result<(), StorageTryEnqueueError> {
+        self.tx.try_send(op).map_err(|err| match err {
+            TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
+            TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,
+        })
     }
 }
 
@@ -702,6 +742,25 @@ fn push_bounded<T>(deque: &mut VecDeque<T>, value: T, capacity: usize) {
     deque.push_back(value);
     while deque.len() > capacity {
         let _ = deque.pop_front();
+    }
+}
+
+fn remove_event_from_sorted_index(events: &mut Vec<EventEnvelope>, target: &EventEnvelope) {
+    let mut index = match events.binary_search_by(|existing| cmp_deterministic(existing, target)) {
+        Ok(index) => index,
+        Err(_) => return,
+    };
+
+    while index > 0 && cmp_deterministic(&events[index - 1], target).is_eq() {
+        index -= 1;
+    }
+
+    while index < events.len() && cmp_deterministic(&events[index], target).is_eq() {
+        if events[index] == *target {
+            events.remove(index);
+            return;
+        }
+        index += 1;
     }
 }
 

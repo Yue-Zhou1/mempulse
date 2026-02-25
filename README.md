@@ -69,12 +69,19 @@ Set environment variables before starting `viz-api`:
 - `VIZ_API_SOURCE_ID` (optional): source label (default: `rpc-live`)
 - `VIZ_API_CHAINS` (optional): JSON array for chain-scoped ingest workers (overrides single-chain vars)
 - `VIZ_API_MAX_SEEN_HASHES` (optional): dedup cache size for live feed (default: `10000`)
+- `VIZ_API_RPC_BATCH_SIZE` (optional): hashes per `eth_getTransactionByHash` batch request (default: `32`)
+- `VIZ_API_RPC_MAX_IN_FLIGHT` (optional): per-chain in-flight RPC batch cap (default: `4`)
+- `VIZ_API_RPC_RETRY_ATTEMPTS` (optional): retry count after initial batch request failure (default: `2`)
+- `VIZ_API_RPC_RETRY_BACKOFF_MS` (optional): base retry backoff in milliseconds (default: `100`)
+- `VIZ_API_RPC_BATCH_FLUSH_MS` (optional): max wait before flushing queued hashes into batch fetch (default: `40`)
 
 Example:
 
 ```bash
 export VIZ_API_ETH_WS_URL="wss://YOUR_PROVIDER_WS_URL"
 export VIZ_API_ETH_HTTP_URL="https://YOUR_PROVIDER_HTTP_URL"
+export VIZ_API_RPC_BATCH_SIZE="32"
+export VIZ_API_RPC_MAX_IN_FLIGHT="4"
 cargo run -p viz-api --bin viz-api
 ```
 
@@ -101,6 +108,23 @@ cargo run -p viz-api --bin viz-api
 ```
 
 Without these overrides, `viz-api` uses built-in public RPC endpoints for live mode.
+
+### Chain-Aware API Filters
+
+The following endpoints accept an optional `chain_id` query parameter:
+
+- `/dashboard/snapshot`
+- `/transactions`
+- `/transactions/all`
+- `/features/recent`
+- `/opps/recent`
+
+Examples:
+
+```bash
+curl "http://127.0.0.1:3000/transactions?chain_id=1&limit=50"
+curl "http://127.0.0.1:3000/dashboard/snapshot?chain_id=8453&tx_limit=100"
+```
 
 ## Performance Budget Check
 

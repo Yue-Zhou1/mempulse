@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 struct LabelledTx {
-    input: SearcherInputTx,
+    input: SearcherInputTx<'static>,
     is_mev_positive: bool,
     edge_bps: i32,
 }
@@ -330,10 +330,7 @@ fn labelled(
     edge_bps: i32,
 ) -> LabelledTx {
     LabelledTx {
-        input: SearcherInputTx {
-            decoded: tx(hash_v, to, gas_limit, priority_fee_wei, calldata_len),
-            calldata,
-        },
+        input: SearcherInputTx::owned(tx(hash_v, to, gas_limit, priority_fee_wei, calldata_len), calldata),
         is_mev_positive,
         edge_bps,
     }
