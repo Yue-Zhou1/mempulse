@@ -203,8 +203,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             7_000_000_000,
             256,
             vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4],
-            true,
-            110,
+            (true, 110),
         ),
         labelled(
             0x11,
@@ -213,8 +212,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             6_000_000_000,
             212,
             vec![0x04, 0xe4, 0x5a, 0xaf, 9, 8, 7, 6],
-            true,
-            90,
+            (true, 90),
         ),
         labelled(
             0x12,
@@ -223,8 +221,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             8_000_000_000,
             244,
             vec![0x50, 0x23, 0xb4, 0xdf, 2, 2, 2, 2],
-            true,
-            95,
+            (true, 95),
         ),
         labelled(
             0x13,
@@ -233,8 +230,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             4_000_000_000,
             180,
             vec![0x18, 0xcb, 0xaf, 0xe5, 1, 1, 1, 1],
-            true,
-            85,
+            (true, 85),
         ),
         labelled(
             0x14,
@@ -243,8 +239,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             5_000_000_000,
             192,
             vec![0xb8, 0x58, 0x18, 0x3f, 1, 3, 5, 7],
-            true,
-            80,
+            (true, 80),
         ),
         labelled(
             0x15,
@@ -253,8 +248,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             2_000_000_000,
             96,
             vec![0x38, 0xed, 0x17, 0x39, 0, 0, 0, 0],
-            true,
-            40,
+            (true, 40),
         ),
         labelled(
             0x30,
@@ -263,8 +257,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             1_000_000_000,
             68,
             vec![0xa9, 0x05, 0x9c, 0xbb, 0, 0, 0, 0],
-            false,
-            0,
+            (false, 0),
         ),
         labelled(
             0x31,
@@ -273,8 +266,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             1_500_000_000,
             72,
             vec![0x23, 0xb8, 0x72, 0xdd, 0, 0, 0, 0],
-            false,
-            0,
+            (false, 0),
         ),
         labelled(
             0x32,
@@ -283,8 +275,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             1_000_000_000,
             64,
             vec![0x09, 0x5e, 0xa7, 0xb3, 0, 0, 0, 0],
-            false,
-            0,
+            (false, 0),
         ),
         labelled(
             0x33,
@@ -293,8 +284,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             1_000_000_000,
             44,
             vec![0xde, 0xad, 0xbe, 0xef, 0, 1, 2, 3],
-            false,
-            0,
+            (false, 0),
         ),
         labelled(
             0x34,
@@ -303,8 +293,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             800_000_000,
             68,
             vec![0xa9, 0x05, 0x9c, 0xbb, 4, 5, 6, 7],
-            false,
-            0,
+            (false, 0),
         ),
         labelled(
             0x35,
@@ -313,8 +302,7 @@ fn synthetic_dataset() -> Vec<LabelledTx> {
             500_000_000,
             52,
             vec![0, 0, 0, 0],
-            false,
-            0,
+            (false, 0),
         ),
     ]
 }
@@ -326,11 +314,14 @@ fn labelled(
     priority_fee_wei: u128,
     calldata_len: u32,
     calldata: Vec<u8>,
-    is_mev_positive: bool,
-    edge_bps: i32,
+    label: (bool, i32),
 ) -> LabelledTx {
+    let (is_mev_positive, edge_bps) = label;
     LabelledTx {
-        input: SearcherInputTx::owned(tx(hash_v, to, gas_limit, priority_fee_wei, calldata_len), calldata),
+        input: SearcherInputTx::owned(
+            tx(hash_v, to, gas_limit, priority_fee_wei, calldata_len),
+            calldata,
+        ),
         is_mev_positive,
         edge_bps,
     }

@@ -9,8 +9,8 @@ use storage::{
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::{
-    build_router, AppState, DashboardSnapshot, FeatureDetail, InMemoryVizProvider,
-    OpportunityDetail, TransactionDetail, TransactionSummary, VizDataProvider,
+    AppState, DashboardSnapshot, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
+    TransactionDetail, TransactionSummary, VizDataProvider, build_router,
 };
 
 fn hash(seed: u8) -> [u8; 32] {
@@ -223,13 +223,17 @@ async fn api_chain_filters_apply_to_dashboard_snapshot() {
         .await
         .expect("dashboard body");
     let payload: DashboardSnapshot = serde_json::from_slice(&body).expect("dashboard payload");
-    assert!(payload
-        .feature_details
-        .iter()
-        .all(|row| row.chain_id == Some(1)));
-    assert!(payload
-        .opportunities
-        .iter()
-        .all(|row| row.chain_id == Some(1)));
+    assert!(
+        payload
+            .feature_details
+            .iter()
+            .all(|row| row.chain_id == Some(1))
+    );
+    assert!(
+        payload
+            .opportunities
+            .iter()
+            .all(|row| row.chain_id == Some(1))
+    );
     assert_eq!(payload.transactions.len(), 1);
 }

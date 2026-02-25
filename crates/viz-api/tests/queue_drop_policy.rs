@@ -9,10 +9,10 @@ use tokio::sync::mpsc;
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{
-    classify_storage_enqueue_drop_reason, observe_live_rpc_drop_reason,
-    reset_live_rpc_drop_metrics, LiveRpcDropReason,
+    LiveRpcDropReason, classify_storage_enqueue_drop_reason, observe_live_rpc_drop_reason,
+    reset_live_rpc_drop_metrics,
 };
-use viz_api::{build_router, AppState, InMemoryVizProvider, VizDataProvider};
+use viz_api::{AppState, InMemoryVizProvider, VizDataProvider, build_router};
 
 fn sample_peer_stats() -> PeerStatsRecord {
     PeerStatsRecord {

@@ -42,7 +42,19 @@ fn live_rpc_batch_fetch_retry_and_fallback_endpoint_behavior() {
 #[test]
 fn live_rpc_silent_chain_timeout_triggers_rotation_after_threshold() {
     let start_unix_ms = 1_000_000_i64;
-    assert!(!should_rotate_silent_chain(start_unix_ms, start_unix_ms + 19_000, 20));
-    assert!(should_rotate_silent_chain(start_unix_ms, start_unix_ms + 20_000, 20));
-    assert!(should_rotate_silent_chain(start_unix_ms, start_unix_ms + 45_000, 20));
+    assert!(!should_rotate_silent_chain(
+        start_unix_ms,
+        start_unix_ms + 19_000,
+        20
+    ));
+    assert!(should_rotate_silent_chain(
+        start_unix_ms,
+        start_unix_ms + 20_000,
+        20
+    ));
+    assert!(should_rotate_silent_chain(
+        start_unix_ms,
+        start_unix_ms + 45_000,
+        20
+    ));
 }

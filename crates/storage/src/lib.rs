@@ -536,7 +536,10 @@ impl StorageWriteHandle {
             .map_err(|_| anyhow!("storage writer task is not running"))
     }
 
-    pub fn try_enqueue(&self, op: StorageWriteOp) -> std::result::Result<(), StorageTryEnqueueError> {
+    pub fn try_enqueue(
+        &self,
+        op: StorageWriteOp,
+    ) -> std::result::Result<(), StorageTryEnqueueError> {
         self.tx.try_send(op).map_err(|err| match err {
             TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
             TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,

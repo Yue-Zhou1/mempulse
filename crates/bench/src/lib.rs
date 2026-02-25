@@ -46,9 +46,7 @@ pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx<'static>> {
                     value_wei: Some(1_000_000_000_000_000),
                     gas_limit: Some(180_000 + ((idx % 5) as u64) * 30_000),
                     gas_price_wei: None,
-                    max_fee_per_gas_wei: Some(
-                        45_000_000_000 + ((idx % 7) as u128) * 1_000_000_000,
-                    ),
+                    max_fee_per_gas_wei: Some(45_000_000_000 + ((idx % 7) as u128) * 1_000_000_000),
                     max_priority_fee_per_gas_wei: Some(
                         1_000_000_000 + ((idx % 5) as u128) * 1_000_000_000,
                     ),

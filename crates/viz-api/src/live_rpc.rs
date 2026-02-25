@@ -173,8 +173,8 @@ struct LiveRpcChainStatusRecord {
 static LIVE_RPC_CHAIN_STATUS: OnceLock<Arc<RwLock<BTreeMap<String, LiveRpcChainStatusRecord>>>> =
     OnceLock::new();
 
-fn live_rpc_chain_status_store()
--> &'static Arc<RwLock<BTreeMap<String, LiveRpcChainStatusRecord>>> {
+fn live_rpc_chain_status_store() -> &'static Arc<RwLock<BTreeMap<String, LiveRpcChainStatusRecord>>>
+{
     LIVE_RPC_CHAIN_STATUS.get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
 }
 

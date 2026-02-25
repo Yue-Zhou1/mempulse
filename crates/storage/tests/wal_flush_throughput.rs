@@ -5,8 +5,8 @@ use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
-    spawn_single_writer, ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal,
-    StorageWriteOp, StorageWriterConfig,
+    ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal, StorageWriteOp,
+    StorageWriterConfig, spawn_single_writer,
 };
 
 fn hash(seed: u8) -> [u8; 32] {
