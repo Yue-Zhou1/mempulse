@@ -473,6 +473,17 @@ impl Default for StorageWriterConfig {
     }
 }
 
+impl StorageWriterConfig {
+    pub fn high_throughput_defaults() -> Self {
+        Self {
+            queue_capacity: 32_768,
+            flush_batch_size: 2_048,
+            flush_interval_ms: 100,
+            wal_path: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageWriteHandle {
     tx: mpsc::Sender<StorageWriteOp>,
