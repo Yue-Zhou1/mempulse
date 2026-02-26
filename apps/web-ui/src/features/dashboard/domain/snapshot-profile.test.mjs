@@ -15,7 +15,6 @@ test('resolveDashboardSnapshotLimits returns radar-focused limits', () => {
     txLimit: 120,
     featureLimit: 280,
     oppLimit: 220,
-    replayLimit: 160,
   });
 });
 
@@ -29,34 +28,31 @@ test('resolveDashboardSnapshotLimits returns opps-focused limits', () => {
     txLimit: 80,
     featureLimit: 160,
     oppLimit: 600,
-    replayLimit: 80,
   });
 });
 
-test('resolveDashboardSnapshotLimits returns replay-focused limits', () => {
+test('resolveDashboardSnapshotLimits falls back to radar limits for removed replay screen', () => {
   const limits = resolveDashboardSnapshotLimits({
     activeScreen: 'replay',
-    snapshotTxLimit: 200,
+    snapshotTxLimit: 140,
   });
 
   assert.deepEqual(limits, {
-    txLimit: 40,
-    featureLimit: 80,
-    oppLimit: 120,
-    replayLimit: 60,
+    txLimit: 140,
+    featureLimit: 280,
+    oppLimit: 220,
   });
 });
 
-test('buildDashboardSnapshotPath encodes all snapshot limit params', () => {
+test('buildDashboardSnapshotPath encodes snapshot limit params without replay controls', () => {
   const path = buildDashboardSnapshotPath({
     txLimit: 80,
     featureLimit: 160,
     oppLimit: 600,
-    replayLimit: 80,
   });
 
   assert.equal(
     path,
-    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600&replay_limit=80',
+    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600',
   );
 });

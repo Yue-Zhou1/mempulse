@@ -438,10 +438,18 @@ impl EventStore for InMemoryStorage {
             self.upsert_tx_lifecycle(record);
         }
 
-        let insert_at = self
-            .event_index
-            .partition_point(|existing| cmp_deterministic(existing, &event).is_lt());
-        self.event_index.insert(insert_at, event.clone());
+        let append_to_tail = match self.event_index.last() {
+            None => true,
+            Some(last) => !cmp_deterministic(last, &event).is_gt(),
+        };
+        if append_to_tail {
+            self.event_index.push(event.clone());
+        } else {
+            let insert_at = self
+                .event_index
+                .partition_point(|existing| cmp_deterministic(existing, &event).is_lt());
+            self.event_index.insert(insert_at, event.clone());
+        }
         self.events.push_back(event);
         while self.events.len() > self.config.event_capacity {
             if let Some(old_event) = self.events.pop_front() {

@@ -1,6 +1,6 @@
 const defaultScreenId = 'radar';
 
-export const screenIds = Object.freeze([defaultScreenId, 'opps', 'replay']);
+export const screenIds = Object.freeze([defaultScreenId, 'opps']);
 
 const SCREEN_ID_SET = new Set(screenIds);
 

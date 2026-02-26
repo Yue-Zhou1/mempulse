@@ -10,14 +10,35 @@ import {
   normalizeChainStatusRows,
   opportunityRowKey,
 } from '../lib/dashboard-helpers.js';
+import {
+  clearTransactionDetailCache,
+  setTransactionDetailByHash,
+} from '../domain/dashboard-stream-store.js';
+import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
+import { createSystemHealthMonitor } from '../lib/system-health.js';
+import { useDashboardStreamWorker } from './use-dashboard-stream-worker.js';
 
 const snapshotThrottleMs = 1200;
-const transactionCommitBatchMs = 200;
-const streamBatchLimit = 512;
-const streamIntervalMs = 200;
+const streamBatchLimit = 20;
+const streamIntervalMs = 1000;
 const streamInitialReconnectMs = 1000;
 const streamMaxReconnectMs = 30000;
-const archiveRefreshMs = 15000;
+const steadySnapshotRefreshMs = 15000;
+
+function resolvePerfNow() {
+  if (typeof globalThis?.performance?.now === 'function') {
+    return globalThis.performance.now();
+  }
+  return Date.now();
+}
+
+function resolveUsedHeapSize() {
+  const heapBytes = globalThis?.performance?.memory?.usedJSHeapSize;
+  if (!Number.isFinite(heapBytes)) {
+    return null;
+  }
+  return heapBytes;
+}
 
 function rowsReferenceEqual(left, right) {
   if (left.length !== right.length) {
@@ -53,23 +74,6 @@ function stabilizeRows(currentRows, nextRows, keyOf, isEquivalent) {
   });
 
   return rowsReferenceEqual(currentRows, stabilized) ? currentRows : stabilized;
-}
-
-function replayPointEquivalent(left, right) {
-  return (
-    left.seq_hi === right.seq_hi
-    && left.timestamp_unix_ms === right.timestamp_unix_ms
-    && left.pending_count === right.pending_count
-  );
-}
-
-function propagationEdgeEquivalent(left, right) {
-  return (
-    left.source === right.source
-    && left.destination === right.destination
-    && left.p50_delay_ms === right.p50_delay_ms
-    && left.p99_delay_ms === right.p99_delay_ms
-  );
 }
 
 function featureSummaryEquivalent(left, right) {
@@ -159,32 +163,23 @@ function opportunityEquivalent(left, right) {
   );
 }
 
-function resolveStreamUrl(apiBase, afterSeqId) {
-  const url = new URL(apiBase, window.location.href);
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/stream`;
-  const params = new URLSearchParams({
-    limit: String(streamBatchLimit),
-    interval_ms: String(streamIntervalMs),
-  });
-  if (Number.isFinite(afterSeqId) && afterSeqId > 0) {
-    params.set('after', String(afterSeqId));
-  }
-  url.search = params.toString();
-  return url.toString();
-}
-
 export function useDashboardLifecycleEffects({
   apiBase,
   snapshotTxLimit,
   maxTransactionHistory,
+  maxFeatureHistory,
+  maxOpportunityHistory,
+  streamBatchMs,
+  samplingLagThresholdMs,
+  samplingStride,
+  samplingFlushIdleMs,
+  heapEmergencyPurgeMb,
+  workerEnabled,
   transactionRetentionMs,
   transactionRetentionMinutes,
   detailCacheLimit,
   activeScreen,
-  refreshArchives,
   dialogHash,
-  transactionDetailsByHash,
   closeDialog,
   followLatest,
   recentTxRows,
@@ -199,29 +194,27 @@ export function useDashboardLifecycleEffects({
   reconnectAttemptsRef,
   reconnectTimerRef,
   snapshotTimerRef,
-  streamSocketRef,
   snapshotInFlightRef,
   nextSnapshotAtRef,
   setTransactionPage,
   setActiveScreen,
-  setReplayFrames,
-  setPropagationEdges,
   setOpportunityRows,
   setFeatureSummaryRows,
   setFeatureDetailRows,
   setChainStatusRows,
   setMarketStats,
-  setRecentTxRows,
-  setTransactionRows,
-  setTransactionDetailsByHash,
-  setTimelineIndex,
-  setSelectedHash,
+  enqueueTickerCommit,
+  flushTickerCommit,
+  cancelTickerCommit,
+  resolveTransactionDetail,
   setSelectedOpportunityKey,
   setStatusMessage,
   setHasError,
   setDialogLoading,
   setDialogError,
 }) {
+  const { connectWorker, disconnectWorker } = useDashboardStreamWorker();
+
   useEffect(() => {
     recentTxRowsRef.current = recentTxRows;
   }, [recentTxRows, recentTxRowsRef]);
@@ -262,47 +255,24 @@ export function useDashboardLifecycleEffects({
   }, [activeScreen]);
 
   useEffect(() => {
-    if (activeScreen !== 'replay') {
-      return undefined;
-    }
-    refreshArchives();
-    const refreshTimer = window.setInterval(() => {
-      refreshArchives();
-    }, archiveRefreshMs);
-    return () => {
-      window.clearInterval(refreshTimer);
-    };
-  }, [activeScreen, refreshArchives]);
-
-  useEffect(() => {
     let cancelled = false;
     const snapshotPath = buildDashboardSnapshotPath(
       resolveDashboardSnapshotLimits({ activeScreen, snapshotTxLimit }),
     );
-    let pendingTransactionCommit = null;
-    let transactionCommitTimer = null;
+    const perfMonitor = createDashboardPerfMonitor(globalThis?.window);
+    const resolvedStreamBatchMs = Number.isFinite(streamBatchMs)
+      ? Math.max(100, Math.floor(streamBatchMs))
+      : 500;
+    let heapSampleTimer = null;
+    let fallbackSnapshotPollTimer = null;
+    let steadySnapshotTimer = null;
+    let sampledCommit = null;
+    let streamBatchIndex = 0;
+    let frameProbeRafId = null;
+    let lastAnimationFrameTs = null;
 
-    const cleanupSocket = () => {
-      if (streamSocketRef.current) {
-        const socket = streamSocketRef.current;
-        streamSocketRef.current = null;
-        socket.onmessage = null;
-        socket.onclose = null;
-        socket.onerror = null;
-
-        if (socket.readyState === WebSocket.CONNECTING) {
-          socket.onopen = () => {
-            socket.onopen = null;
-            socket.close();
-          };
-          return;
-        }
-
-        socket.onopen = null;
-        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-          socket.close();
-        }
-      }
+    const cleanupStreamWorker = () => {
+      disconnectWorker();
     };
 
     const clearReconnectTimer = () => {
@@ -319,66 +289,221 @@ export function useDashboardLifecycleEffects({
       }
     };
 
-    const clearTransactionCommitTimer = () => {
-      if (transactionCommitTimer) {
-        window.clearTimeout(transactionCommitTimer);
-        transactionCommitTimer = null;
+    const clearHeapSampleTimer = () => {
+      if (heapSampleTimer) {
+        window.clearInterval(heapSampleTimer);
+        heapSampleTimer = null;
+      }
+    };
+
+    const clearFallbackSnapshotPollTimer = () => {
+      if (fallbackSnapshotPollTimer) {
+        window.clearInterval(fallbackSnapshotPollTimer);
+        fallbackSnapshotPollTimer = null;
+      }
+    };
+
+    const clearSteadySnapshotTimer = () => {
+      if (steadySnapshotTimer) {
+        window.clearInterval(steadySnapshotTimer);
+        steadySnapshotTimer = null;
+      }
+    };
+
+    const clearFrameProbe = () => {
+      if (
+        frameProbeRafId != null
+        && typeof window.cancelAnimationFrame === 'function'
+      ) {
+        window.cancelAnimationFrame(frameProbeRafId);
+      }
+      frameProbeRafId = null;
+      lastAnimationFrameTs = null;
+    };
+
+    const flushSampledCommit = () => {
+      if (!sampledCommit) {
+        return false;
+      }
+      const queuedAtMs = resolvePerfNow();
+      enqueueTickerCommit(sampledCommit, {
+        requestFrame: typeof window.requestAnimationFrame === 'function'
+          ? (onFrame) => window.requestAnimationFrame((rafTimestampMs) => {
+            const frameTimestampMs = Number.isFinite(rafTimestampMs)
+              ? rafTimestampMs
+              : resolvePerfNow();
+            perfMonitor.recordTransactionCommit(frameTimestampMs - queuedAtMs);
+            onFrame(frameTimestampMs);
+          })
+          : null,
+        cancelFrame: typeof window.cancelAnimationFrame === 'function'
+          ? window.cancelAnimationFrame.bind(window)
+          : null,
+      });
+      sampledCommit = null;
+      return true;
+    };
+
+    const emergencyPurge = (usedHeapBytes) => {
+      if (cancelled) {
+        return;
+      }
+
+      sampledCommit = null;
+      streamBatchIndex = 0;
+      cancelTickerCommit();
+      transactionStoreRef.current.reset();
+      clearTransactionDetailCache();
+      recentTxRowsRef.current = [];
+      transactionRowsRef.current = [];
+      enqueueTickerCommit({
+        recentTxRows: [],
+        transactionRows: [],
+      });
+      flushTickerCommit();
+      setOpportunityRows([]);
+      setFeatureSummaryRows([]);
+      setFeatureDetailRows([]);
+      setChainStatusRows([]);
+      setSelectedOpportunityKey(null);
+      latestSeqIdRef.current = 0;
+
+      const heapMb = Math.round(usedHeapBytes / (1024 * 1024));
+      setStatusMessage(
+        `Memory pressure detected (${heapMb}MB). Purging buffers and forcing snapshot sync...`,
+      );
+      setHasError(true);
+    };
+
+    const systemHealth = createSystemHealthMonitor({
+      samplingLagThresholdMs,
+      samplingStride,
+      samplingFlushIdleMs,
+      heapEmergencyPurgeMb,
+      onEmergencyPurge: emergencyPurge,
+    });
+
+    const startFrameProbe = () => {
+      if (typeof window.requestAnimationFrame !== 'function') {
+        return;
+      }
+      const onAnimationFrame = (frameTs) => {
+        if (cancelled) {
+          return;
+        }
+        if (lastAnimationFrameTs != null) {
+          const frameDeltaMs = frameTs - lastAnimationFrameTs;
+          if (Number.isFinite(frameDeltaMs) && frameDeltaMs >= 0) {
+            perfMonitor.recordFrameDuration(frameDeltaMs, frameTs);
+            systemHealth.recordFrameDelta(frameDeltaMs);
+          }
+        }
+        lastAnimationFrameTs = frameTs;
+        frameProbeRafId = window.requestAnimationFrame(onAnimationFrame);
+      };
+      frameProbeRafId = window.requestAnimationFrame(onAnimationFrame);
+    };
+
+    const captureHeapSample = () => {
+      const heapBytes = resolveUsedHeapSize();
+      if (heapBytes != null) {
+        perfMonitor.recordHeapSample(heapBytes);
+        if (systemHealth.recordHeapBytes(heapBytes)) {
+          scheduleSnapshot('heap-emergency-purge', true);
+        }
       }
     };
 
     const flushTransactionCommit = () => {
-      transactionCommitTimer = null;
-      if (cancelled || !pendingTransactionCommit) {
+      if (cancelled) {
         return;
       }
-      const commit = pendingTransactionCommit;
-      pendingTransactionCommit = null;
-
-      setRecentTxRows(commit.recentTxRows);
-      setTransactionRows(commit.transactionRows);
-      setTransactionDetailsByHash((current) => {
-        const liveHashes = new Set(commit.transactionRows.map((row) => row.hash));
-        let changed = false;
-        const next = {};
-        for (const [hash, detail] of Object.entries(current)) {
-          if (liveHashes.has(hash)) {
-            next[hash] = detail;
-          } else {
-            changed = true;
-          }
-        }
-        if (!changed && Object.keys(next).length === Object.keys(current).length) {
-          return current;
-        }
-        return next;
-      });
-      setSelectedHash((current) => {
-        if (current && commit.transactionRows.some((row) => row.hash === current)) {
-          return current;
-        }
-        return commit.transactionRows[0]?.hash ?? null;
-      });
+      if (flushSampledCommit()) {
+        return;
+      }
+      const commitStartedAtMs = resolvePerfNow();
+      flushTickerCommit();
+      const commitEndedAtMs = resolvePerfNow();
+      perfMonitor.recordTransactionCommit(commitEndedAtMs - commitStartedAtMs);
     };
 
     const queueTransactionCommit = (commit) => {
-      pendingTransactionCommit = commit;
-      if (transactionCommitTimer) {
+      sampledCommit = commit;
+      streamBatchIndex += 1;
+      if (systemHealth.shouldRenderBatch(streamBatchIndex)) {
+        systemHealth.clearTrailingFlush();
+        flushSampledCommit();
         return;
       }
-      transactionCommitTimer = window.setTimeout(() => {
+      systemHealth.scheduleTrailingFlush(() => {
+        if (cancelled) {
+          return;
+        }
         flushTransactionCommit();
-      }, transactionCommitBatchMs);
+      });
+    };
+
+    const applyDeltaTransactions = (transactions, sourceLabel, latestSeqId) => {
+      const incoming = Array.isArray(transactions) ? transactions : [];
+      if (!incoming.length) {
+        if (Number.isFinite(latestSeqId)) {
+          latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
+        }
+        setStatusMessage(
+          `Streaming(${sourceLabel}) · tx=${transactionRowsRef.current.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m`,
+        );
+        return;
+      }
+
+      const orderedIncoming = [...incoming].sort(
+        (left, right) => Number(right?.seen_unix_ms ?? 0) - Number(left?.seen_unix_ms ?? 0),
+      );
+      const txSnapshot = transactionStoreRef.current.snapshot(orderedIncoming, {
+        maxItems: maxTransactionHistory,
+        nowUnixMs: Date.now(),
+        maxAgeMs: transactionRetentionMs,
+      });
+      const nextTransactions = txSnapshot.rows;
+      const stabilizedTransactions = rowsReferenceEqual(
+        transactionRowsRef.current,
+        nextTransactions,
+      )
+        ? transactionRowsRef.current
+        : nextTransactions;
+      transactionRowsRef.current = stabilizedTransactions;
+
+      const nextRecent = stabilizedTransactions.slice(
+        0,
+        Math.min(snapshotTxLimit, stabilizedTransactions.length),
+      );
+      const stabilizedRecent = rowsReferenceEqual(recentTxRowsRef.current, nextRecent)
+        ? recentTxRowsRef.current
+        : nextRecent;
+      recentTxRowsRef.current = stabilizedRecent;
+
+      queueTransactionCommit({
+        recentTxRows: stabilizedRecent,
+        transactionRows: stabilizedTransactions,
+      });
+
+      if (Number.isFinite(latestSeqId)) {
+        latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
+      }
+      setStatusMessage(
+        `Streaming(${sourceLabel}) · tx=${stabilizedTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m`,
+      );
     };
 
     const applySnapshot = (snapshot, sourceLabel) => {
-      const replay = Array.isArray(snapshot?.replay) ? snapshot.replay : [];
-      const propagation = Array.isArray(snapshot?.propagation) ? snapshot.propagation : [];
-      const opportunities = Array.isArray(snapshot?.opportunities) ? snapshot.opportunities : [];
+      const applyStartedAt = resolvePerfNow();
+      const opportunities = Array.isArray(snapshot?.opportunities)
+        ? snapshot.opportunities.slice(0, maxOpportunityHistory)
+        : [];
       const featureSummary = Array.isArray(snapshot?.feature_summary)
         ? snapshot.feature_summary
         : [];
       const featureDetails = Array.isArray(snapshot?.feature_details)
-        ? snapshot.feature_details
+        ? snapshot.feature_details.slice(0, maxFeatureHistory)
         : [];
       const txRecent = Array.isArray(snapshot?.transactions) ? snapshot.transactions : [];
       const chainStatus = normalizeChainStatusRows(snapshot?.chain_ingest_status);
@@ -409,17 +534,6 @@ export function useDashboardLifecycleEffects({
         recentTxRows: stabilizedRecentTxRows,
         transactionRows: stabilizedTransactions,
       });
-      setReplayFrames((current) =>
-        stabilizeRows(current, replay, (row) => row.seq_hi, replayPointEquivalent),
-      );
-      setPropagationEdges((current) =>
-        stabilizeRows(
-          current,
-          propagation,
-          (row) => `${row.source}->${row.destination}`,
-          propagationEdgeEquivalent,
-        ),
-      );
       setOpportunityRows((current) =>
         stabilizeRows(current, opportunities, opportunityRowKey, opportunityEquivalent),
       );
@@ -452,16 +566,6 @@ export function useDashboardLifecycleEffects({
         return next;
       });
 
-      setTimelineIndex((current) => {
-        if (!replay.length) {
-          return 0;
-        }
-        if (followLatestRef.current) {
-          return replay.length - 1;
-        }
-        return Math.min(current, replay.length - 1);
-      });
-
       setSelectedOpportunityKey((current) => {
         if (current && opportunities.some((row) => opportunityRowKey(row) === current)) {
           return current;
@@ -471,13 +575,15 @@ export function useDashboardLifecycleEffects({
 
       const latestSeqId = Number.isFinite(snapshot?.latest_seq_id)
         ? snapshot.latest_seq_id
-        : replay[replay.length - 1]?.seq_hi ?? 0;
+        : 0;
       latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
 
       const lastUpdated = new Date().toLocaleTimeString();
       setStatusMessage(
-        `Connected(${sourceLabel}) · replay=${replay.length} · opps=${opportunities.length} · propagation=${propagation.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
+        `Connected(${sourceLabel}) · opps=${opportunities.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
       );
+      perfMonitor.recordSnapshotApply(resolvePerfNow() - applyStartedAt);
+      captureHeapSample();
     };
 
     const syncSnapshot = async (sourceLabel) => {
@@ -538,79 +644,118 @@ export function useDashboardLifecycleEffects({
       if (cancelled) {
         return;
       }
-      cleanupSocket();
-      const streamUrl = resolveStreamUrl(apiBase, latestSeqIdRef.current);
-      const socket = new WebSocket(streamUrl);
-      streamSocketRef.current = socket;
-
-      socket.onopen = () => {
+      cleanupStreamWorker();
+      clearFallbackSnapshotPollTimer();
+      if (!workerEnabled) {
         reconnectAttemptsRef.current = 0;
-        setHasError(false);
-        scheduleSnapshot('ws-open', true);
-      };
+        setStatusMessage(
+          `Worker pipeline disabled · polling snapshots every ${snapshotThrottleMs}ms`,
+        );
+        scheduleSnapshot('snapshot-poll-bootstrap', true);
+        fallbackSnapshotPollTimer = window.setInterval(() => {
+          scheduleSnapshot('snapshot-poll', true);
+        }, snapshotThrottleMs);
+        return;
+      }
+      connectWorker({
+        apiBase,
+        afterSeqId: latestSeqIdRef.current,
+        batchWindowMs: resolvedStreamBatchMs,
+        streamBatchLimit,
+        streamIntervalMs,
+        initialCredit: 1,
+        onOpen: () => {
+          if (cancelled) {
+            return;
+          }
+          reconnectAttemptsRef.current = 0;
+          setHasError(false);
+          scheduleSnapshot('ws-open', true);
+        },
+        onBatch: (batch) => {
+          if (cancelled) {
+            return;
+          }
 
-      socket.onmessage = (message) => {
-        if (cancelled) {
-          return;
-        }
-        let payload;
-        try {
-          payload = JSON.parse(message.data);
-        } catch {
-          return;
-        }
+          const seqId = batch.latestSeqId;
+          if (!Number.isFinite(seqId) || seqId <= latestSeqIdRef.current) {
+            return;
+          }
 
-        if (payload?.event === 'hello') {
-          scheduleSnapshot('ws-hello', true);
-          return;
-        }
-
-        if (typeof payload?.seq_id !== 'number') {
-          return;
-        }
-
-        const seqId = payload.seq_id;
-        if (seqId <= latestSeqIdRef.current) {
-          return;
-        }
-
-        const hasGap =
-          latestSeqIdRef.current > 0 && seqId > latestSeqIdRef.current + 1;
-        latestSeqIdRef.current = seqId;
-        scheduleSnapshot(hasGap ? 'ws-gap-resync' : 'ws-delta', hasGap);
-      };
-
-      socket.onerror = () => {
-        socket.close();
-      };
-
-      socket.onclose = () => {
-        if (cancelled) {
-          return;
-        }
-        scheduleReconnect();
-      };
+          const hasGap = batch.hasGap
+            || (
+              latestSeqIdRef.current > 0
+              && seqId > latestSeqIdRef.current + 1
+            );
+          applyDeltaTransactions(batch.transactions, 'ws-delta', seqId);
+          if (hasGap) {
+            scheduleSnapshot('ws-gap-resync', true);
+          }
+        },
+        onClose: () => {
+          if (cancelled) {
+            return;
+          }
+          scheduleReconnect();
+        },
+        onError: (error) => {
+          if (cancelled) {
+            return;
+          }
+          setHasError(true);
+          setStatusMessage(`Stream worker error: ${error.message}`);
+          scheduleReconnect();
+        },
+      });
     };
 
-    setStatusMessage(`Connecting stream to ${apiBase} ...`);
+    setStatusMessage(
+      `Connecting stream to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
+    );
     setHasError(false);
+    startFrameProbe();
+    captureHeapSample();
+    heapSampleTimer = window.setInterval(() => {
+      captureHeapSample();
+    }, 5000);
+    steadySnapshotTimer = window.setInterval(() => {
+      scheduleSnapshot('steady-refresh', true);
+    }, steadySnapshotRefreshMs);
     scheduleSnapshot('bootstrap', true);
     connectStream();
 
     return () => {
       flushTransactionCommit();
-      clearTransactionCommitTimer();
       cancelled = true;
+      cancelTickerCommit();
+      systemHealth.clearTrailingFlush();
       clearReconnectTimer();
       clearSnapshotTimer();
-      cleanupSocket();
+      clearHeapSampleTimer();
+      clearFallbackSnapshotPollTimer();
+      clearSteadySnapshotTimer();
+      clearFrameProbe();
+      cleanupStreamWorker();
     };
   }, [
     apiBase,
     activeScreen,
+    connectWorker,
+    enqueueTickerCommit,
+    flushTickerCommit,
+    cancelTickerCommit,
+    disconnectWorker,
     followLatestRef,
     latestSeqIdRef,
+    maxFeatureHistory,
+    maxOpportunityHistory,
     maxTransactionHistory,
+    streamBatchMs,
+    samplingLagThresholdMs,
+    samplingStride,
+    samplingFlushIdleMs,
+    heapEmergencyPurgeMb,
+    workerEnabled,
     nextSnapshotAtRef,
     reconnectAttemptsRef,
     reconnectTimerRef,
@@ -621,19 +766,12 @@ export function useDashboardLifecycleEffects({
     setHasError,
     setMarketStats,
     setOpportunityRows,
-    setPropagationEdges,
-    setRecentTxRows,
-    setReplayFrames,
-    setSelectedHash,
+    resolveTransactionDetail,
     setSelectedOpportunityKey,
     setStatusMessage,
-    setTimelineIndex,
-    setTransactionRows,
-    setTransactionDetailsByHash,
     snapshotInFlightRef,
     snapshotTimerRef,
     snapshotTxLimit,
-    streamSocketRef,
     transactionStoreRef,
     transactionRetentionMinutes,
     transactionRetentionMs,
@@ -644,7 +782,7 @@ export function useDashboardLifecycleEffects({
     if (!dialogHash) {
       return undefined;
     }
-    if (transactionDetailsByHash[dialogHash]) {
+    if (resolveTransactionDetail(dialogHash)) {
       return undefined;
     }
 
@@ -657,21 +795,7 @@ export function useDashboardLifecycleEffects({
         if (cancelled) {
           return;
         }
-        setTransactionDetailsByHash((current) => {
-          const next = {
-            ...current,
-            [dialogHash]: detail,
-          };
-          const hashes = Object.keys(next);
-          if (hashes.length <= detailCacheLimit) {
-            return next;
-          }
-          const evictCount = hashes.length - detailCacheLimit;
-          for (let index = 0; index < evictCount; index += 1) {
-            delete next[hashes[index]];
-          }
-          return next;
-        });
+        setTransactionDetailByHash(dialogHash, detail, detailCacheLimit);
         setDialogLoading(false);
       })
       .catch((error) => {
@@ -689,10 +813,9 @@ export function useDashboardLifecycleEffects({
     apiBase,
     detailCacheLimit,
     dialogHash,
+    resolveTransactionDetail,
     setDialogError,
     setDialogLoading,
-    setTransactionDetailsByHash,
-    transactionDetailsByHash,
   ]);
 
   useEffect(() => {

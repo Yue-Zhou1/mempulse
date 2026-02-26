@@ -15,7 +15,6 @@ export function NewsMasthead({ model, actions }) {
   const tabs = [
     { id: 'radar', label: 'Front Page' },
     { id: 'opps', label: 'Opportunity Desk' },
-    { id: 'replay', label: 'Archives' },
   ];
 
   return (

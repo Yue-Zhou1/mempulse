@@ -1,4 +1,3 @@
-import { memo } from 'react';
 import { MAINNET_FILTER_ALL, MAINNET_FILTER_OPTIONS } from '../domain/mainnet-filter.js';
 import {
   classifyRisk,
@@ -11,106 +10,9 @@ import {
   statusForRow,
 } from '../lib/dashboard-helpers.js';
 import { NewspaperFilterSelect } from './newspaper-filter-select.jsx';
+import { RadarVirtualizedTable } from './radar-virtualized-table.jsx';
 import { RollingInt, RollingPercent } from './rolling-number.jsx';
 import { cn } from '../../../shared/lib/utils.js';
-
-const TickerRow = memo(function TickerRow({ row, feature, isActive }) {
-  const risk = classifyRisk(feature);
-  const status = statusForRow(feature);
-  const amountValue = feature
-    ? (feature.urgency_score / 10).toFixed(1)
-    : '--.--';
-  const protocolValue = feature?.protocol ?? '-';
-  const categoryValue = feature?.category ?? '-';
-  const senderValue = row?.sender ?? '-';
-  const sourceValue = row?.source_id ?? '-';
-  const mainnetValue = resolveMainnetLabel(row?.chain_id, row?.source_id);
-  const mainnetRowClasses = resolveMainnetRowClasses(mainnetValue);
-  const nonceValue = row?.nonce ?? '-';
-  const txTypeValue = row?.tx_type ?? '-';
-
-  return (
-    <tr
-      data-tx-hash={row.hash}
-      className={cn(
-        'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
-        isActive
-          ? 'bg-zinc-900 text-[#f7f1e6]'
-          : status === 'Flagged'
-            ? 'bg-zinc-900 text-[#f7f1e6]'
-            : `${mainnetRowClasses} text-zinc-800`,
-      )}
-    >
-      <td className="px-2 py-2 align-middle whitespace-nowrap">{formatTickerTime(row.seen_unix_ms)}</td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={row.hash}
-      >
-        {shortHex(row.hash, 18, 8)}
-      </td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={senderValue}
-      >
-        {shortHex(senderValue, 10, 8)}
-      </td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={sourceValue}
-      >
-        {sourceValue}
-      </td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={mainnetValue}
-      >
-        {mainnetValue}
-      </td>
-      <td className="px-2 py-2 align-middle">{txTypeValue}</td>
-      <td className="px-2 py-2 align-middle">{nonceValue}</td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={protocolValue}
-      >
-        {protocolValue}
-      </td>
-      <td
-        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
-        title={categoryValue}
-      >
-        {categoryValue}
-      </td>
-      <td className="px-2 py-2 text-right align-middle">{amountValue}</td>
-      <td className="px-2 py-2 align-middle">
-        <span
-          className={cn(
-            'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
-            statusBadgeClass(status, isActive || status === 'Flagged'),
-          )}
-        >
-          {status}
-        </span>
-      </td>
-      <td className="px-2 py-2 align-middle">
-        <span
-          className={cn(
-            'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
-            riskBadgeClass(risk.label, isActive || status === 'Flagged'),
-          )}
-        >
-          {risk.label}
-        </span>
-      </td>
-      <td className={cn('px-2 py-2 text-center align-middle font-bold', isActive ? 'text-[#f7f1e6]' : 'text-zinc-500')}>
-        •••
-      </td>
-    </tr>
-  );
-}, (left, right) => (
-  left.row === right.row
-  && left.feature === right.feature
-  && left.isActive === right.isActive
-));
 
 export function RadarScreen({ model, actions }) {
   const {
@@ -119,7 +21,8 @@ export function RadarScreen({ model, actions }) {
     query,
     hasError,
     statusMessage,
-    deferredTickerRows,
+    virtualizedTickerEnabled,
+    virtualizedTickerRows,
     featureByHash,
     selectedHash,
     filteredTransactions,
@@ -136,7 +39,6 @@ export function RadarScreen({ model, actions }) {
     totalSignalVolume,
     successRate,
     totalTxCount,
-    replayFrames,
     highRiskCount,
     featureTrendPath,
     lowRiskCount,
@@ -214,39 +116,96 @@ export function RadarScreen({ model, actions }) {
               </div>
 
               <div className="news-list-shell min-h-0 flex flex-1 flex-col overflow-hidden">
-                <div
-                  className="news-list-scroll h-full border-b-2 border-zinc-900"
-                  onClick={onTickerListClick}
-                >
-                  <table className="news-tx-table news-mono min-w-[1360px] w-full table-fixed border-collapse">
-                    <thead className="sticky top-0 z-10 border-b border-zinc-900 bg-zinc-900 text-[#f7f1e6]">
-                      <tr className="text-[13px] font-bold uppercase tracking-[0.1em]">
-                        <th scope="col" className="w-[170px] px-2 py-2 text-left">Timestamp</th>
-                        <th scope="col" className="w-[170px] px-2 py-2 text-left">Ref. ID</th>
-                        <th scope="col" className="w-[170px] px-2 py-2 text-left">Sender</th>
-                        <th scope="col" className="w-[92px] px-2 py-2 text-left">Source</th>
-                        <th scope="col" className="w-[92px] px-2 py-2 text-left">Mainnet</th>
-                        <th scope="col" className="w-[66px] px-2 py-2 text-left">Type</th>
-                        <th scope="col" className="w-[72px] px-2 py-2 text-left">Nonce</th>
-                        <th scope="col" className="w-[102px] px-2 py-2 text-left">Protocol</th>
-                        <th scope="col" className="w-[100px] px-2 py-2 text-left">Category</th>
-                        <th scope="col" className="w-[76px] px-2 py-2 text-right">Amt.</th>
-                        <th scope="col" className="w-[104px] px-2 py-2 text-left">Status</th>
-                        <th scope="col" className="w-[74px] px-2 py-2 text-left">Risk</th>
-                        <th scope="col" className="w-[36px] px-2 py-2 text-center">Op.</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {deferredTickerRows.map((row) => (
-                        <TickerRow
-                          key={row.hash}
-                          row={row}
-                          feature={featureByHash.get(row.hash)}
-                          isActive={row.hash === selectedHash}
-                        />
-                      ))}
-                    </tbody>
-                  </table>
+                <div onClick={onTickerListClick} className="min-h-0 h-full">
+                  {virtualizedTickerEnabled ? (
+                    <RadarVirtualizedTable
+                      rowModels={virtualizedTickerRows}
+                      featureByHash={featureByHash}
+                      selectedHash={selectedHash}
+                    />
+                  ) : (
+                    <div className="news-list-scroll h-full border-b-2 border-zinc-900">
+                      <table className="news-tx-table news-mono min-w-[1360px] w-full table-fixed border-collapse">
+                        <thead className="news-tx-head text-[13px] font-bold uppercase tracking-[0.1em]">
+                          <tr>
+                            <th scope="col" className="news-tx-header-cell w-[170px] px-2 py-2 text-left">Timestamp</th>
+                            <th scope="col" className="news-tx-header-cell w-[170px] px-2 py-2 text-left">Tx Hash</th>
+                            <th scope="col" className="news-tx-header-cell w-[170px] px-2 py-2 text-left">Sender</th>
+                            <th scope="col" className="news-tx-header-cell w-[92px] px-2 py-2 text-left">Source</th>
+                            <th scope="col" className="news-tx-header-cell w-[92px] px-2 py-2 text-left">Mainnet</th>
+                            <th scope="col" className="news-tx-header-cell w-[66px] px-2 py-2 text-left">Type</th>
+                            <th scope="col" className="news-tx-header-cell w-[72px] px-2 py-2 text-left">Nonce</th>
+                            <th scope="col" className="news-tx-header-cell w-[102px] px-2 py-2 text-left">Protocol</th>
+                            <th scope="col" className="news-tx-header-cell w-[100px] px-2 py-2 text-left">Category</th>
+                            <th scope="col" className="news-tx-header-cell w-[76px] px-2 py-2 text-right">Amt.</th>
+                            <th scope="col" className="news-tx-header-cell w-[104px] px-2 py-2 text-left">Status</th>
+                            <th scope="col" className="news-tx-header-cell w-[74px] px-2 py-2 text-left">Risk</th>
+                            <th scope="col" className="news-tx-header-cell w-[36px] px-2 py-2 text-center">Op.</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {virtualizedTickerRows.map((rowModel) => {
+                            const row = rowModel.row;
+                            const feature = featureByHash.get(row.hash);
+                            const status = statusForRow(feature);
+                            const risk = classifyRisk(feature);
+                            const mainnetValue = resolveMainnetLabel(row.chain_id, row.source_id);
+                            const mainnetRowClasses = resolveMainnetRowClasses(mainnetValue);
+                            const isActive = row.hash === selectedHash;
+                            const amountValue = feature ? (feature.urgency_score / 10).toFixed(1) : '--.--';
+                            return (
+                              <tr
+                                key={row.hash}
+                                data-tx-hash={row.hash}
+                                className={cn(
+                                  'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
+                                  isActive
+                                    ? 'bg-zinc-900 text-[#f7f1e6]'
+                                    : status === 'Flagged'
+                                      ? 'bg-zinc-900 text-[#f7f1e6]'
+                                      : `${mainnetRowClasses} text-zinc-800`,
+                                )}
+                              >
+                                <td className="news-tx-cell px-2 py-2 align-middle whitespace-nowrap">{formatTickerTime(row.seen_unix_ms)}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap" title={row.hash}>{shortHex(row.hash, 18, 8)}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap" title={row.sender ?? '-'}>{shortHex(row.sender ?? '-', 10, 8)}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap">{row.source_id ?? '-'}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap">{mainnetValue}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle">{row.tx_type ?? '-'}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle">{row.nonce ?? '-'}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap">{feature?.protocol ?? '-'}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap">{feature?.category ?? '-'}</td>
+                                <td className="news-tx-cell px-2 py-2 text-right align-middle">{amountValue}</td>
+                                <td className="news-tx-cell px-2 py-2 align-middle">
+                                  <span
+                                    className={cn(
+                                      'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
+                                      statusBadgeClass(status, isActive || status === 'Flagged'),
+                                    )}
+                                  >
+                                    {status}
+                                  </span>
+                                </td>
+                                <td className="news-tx-cell px-2 py-2 align-middle">
+                                  <span
+                                    className={cn(
+                                      'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
+                                      riskBadgeClass(risk.label, isActive || status === 'Flagged'),
+                                    )}
+                                  >
+                                    {risk.label}
+                                  </span>
+                                </td>
+                                <td className={cn('news-tx-cell px-2 py-2 text-center align-middle font-bold', isActive ? 'text-[#f7f1e6]' : 'text-zinc-500')}>
+                                  •••
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -329,7 +288,7 @@ export function RadarScreen({ model, actions }) {
                         <RollingInt value={totalTxCount} durationMs={500} />
                       </p>
                       <p className="news-mono mt-1 text-[10px] uppercase tracking-[0.12em]">
-                        +{replayFrames.length} replay frames
+                        tx stream volume
                       </p>
                     </div>
                     <div className="border-l border-dashed border-zinc-900 pl-2 text-center">

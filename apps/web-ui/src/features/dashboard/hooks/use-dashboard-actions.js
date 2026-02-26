@@ -9,21 +9,10 @@ export function useDashboardActions({
   setFollowLatest,
   setTransactionPage,
   transactionPageCount,
-  replayFrames,
-  setTimelineIndex,
   setSelectedHash,
   setDialogHash,
   setDialogError,
   setSelectedOpportunityKey,
-  setSelectedArchiveTxHash,
-  setSelectedArchiveOppKey,
-  setArchiveQuery,
-  setArchiveMainnetFilter,
-  setArchiveTxPage,
-  archiveTxPageCount,
-  setArchiveOppPage,
-  archiveOppPageCount,
-  refreshArchives,
 }) {
   const closeDialog = useCallback(() => {
     setDialogHash(null);
@@ -46,7 +35,7 @@ export function useDashboardActions({
       if (!(node instanceof Element) || !(listElement instanceof Element)) {
         return;
       }
-      const rowElement = node.closest('tr[data-tx-hash]');
+      const rowElement = node.closest('[data-tx-hash]');
       if (!rowElement || !listElement.contains(rowElement)) {
         return;
       }
@@ -76,50 +65,12 @@ export function useDashboardActions({
     setSelectedOpportunityKey(key);
   }, [setSelectedOpportunityKey]);
 
-  const onArchiveTxListClick = useCallback((event) => {
-    const node = event.target;
-    const container = event.currentTarget;
-    if (!(node instanceof Element) || !(container instanceof Element)) {
-      return;
-    }
-    const rowElement = node.closest('[data-archive-tx-hash]');
-    if (!rowElement || !container.contains(rowElement)) {
-      return;
-    }
-    const hash = rowElement.getAttribute('data-archive-tx-hash');
-    if (!hash) {
-      return;
-    }
-    setSelectedArchiveTxHash(hash);
-  }, [setSelectedArchiveTxHash]);
-
-  const onArchiveOppListClick = useCallback((event) => {
-    const node = event.target;
-    const container = event.currentTarget;
-    if (!(node instanceof Element) || !(container instanceof Element)) {
-      return;
-    }
-    const rowElement = node.closest('[data-archive-opp-key]');
-    if (!rowElement || !container.contains(rowElement)) {
-      return;
-    }
-    const key = rowElement.getAttribute('data-archive-opp-key');
-    if (!key) {
-      return;
-    }
-    setSelectedArchiveOppKey(key);
-  }, [setSelectedArchiveOppKey]);
-
   const onShowRadar = useCallback(() => {
     setActiveScreen('radar');
   }, [setActiveScreen]);
 
   const onShowOpps = useCallback(() => {
     setActiveScreen('opps');
-  }, [setActiveScreen]);
-
-  const onShowReplay = useCallback(() => {
-    setActiveScreen('replay');
   }, [setActiveScreen]);
 
   const onMastheadNavClick = useCallback((event) => {
@@ -154,10 +105,7 @@ export function useDashboardActions({
   const onTickerFollowClick = useCallback(() => {
     setFollowLatest(true);
     setTransactionPage(1);
-    if (replayFrames.length) {
-      setTimelineIndex(replayFrames.length - 1);
-    }
-  }, [replayFrames, setFollowLatest, setTimelineIndex, setTransactionPage]);
+  }, [setFollowLatest, setTransactionPage]);
 
   const onTickerToolbarClick = useCallback((event) => {
     const node = event.target;
@@ -228,140 +176,14 @@ export function useDashboardActions({
     transactionPageCount,
   ]);
 
-  const onArchiveQueryChange = useCallback((event) => {
-    setArchiveQuery(event.target.value);
-  }, [setArchiveQuery]);
-
-  const onArchiveMainnetFilterChange = useCallback((event) => {
-    setArchiveMainnetFilter(normalizeMainnetFilter(event.target.value));
-  }, [setArchiveMainnetFilter]);
-
-  const onArchiveTxPagePrev = useCallback(() => {
-    setArchiveTxPage((current) => Math.max(1, current - 1));
-  }, [setArchiveTxPage]);
-
-  const onArchiveTxPageNext = useCallback(() => {
-    setArchiveTxPage((current) => Math.min(archiveTxPageCount, current + 1));
-  }, [archiveTxPageCount, setArchiveTxPage]);
-
-  const onArchiveTxPaginationClick = useCallback((event) => {
-    const node = event.target;
-    const container = event.currentTarget;
-    if (!(node instanceof Element) || !(container instanceof Element)) {
-      return;
-    }
-    const control = node.closest('[data-archive-tx-page],[data-archive-tx-page-action]');
-    if (!control || !container.contains(control)) {
-      return;
-    }
-    if (control.getAttribute('data-disabled') === 'true') {
-      return;
-    }
-    const action = control.getAttribute('data-archive-tx-page-action');
-    if (action === 'prev') {
-      onArchiveTxPagePrev();
-      return;
-    }
-    if (action === 'next') {
-      onArchiveTxPageNext();
-      return;
-    }
-    const pageText = control.getAttribute('data-archive-tx-page');
-    const page = Number(pageText);
-    if (!Number.isFinite(page)) {
-      return;
-    }
-    setArchiveTxPage(Math.max(1, Math.min(archiveTxPageCount, page)));
-  }, [
-    archiveTxPageCount,
-    onArchiveTxPageNext,
-    onArchiveTxPagePrev,
-    setArchiveTxPage,
-  ]);
-
-  const onArchiveOppPagePrev = useCallback(() => {
-    setArchiveOppPage((current) => Math.max(1, current - 1));
-  }, [setArchiveOppPage]);
-
-  const onArchiveOppPageNext = useCallback(() => {
-    setArchiveOppPage((current) => Math.min(archiveOppPageCount, current + 1));
-  }, [archiveOppPageCount, setArchiveOppPage]);
-
-  const onArchiveOppPaginationClick = useCallback((event) => {
-    const node = event.target;
-    const container = event.currentTarget;
-    if (!(node instanceof Element) || !(container instanceof Element)) {
-      return;
-    }
-    const control = node.closest('[data-archive-opp-page],[data-archive-opp-page-action]');
-    if (!control || !container.contains(control)) {
-      return;
-    }
-    if (control.getAttribute('data-disabled') === 'true') {
-      return;
-    }
-    const action = control.getAttribute('data-archive-opp-page-action');
-    if (action === 'prev') {
-      onArchiveOppPagePrev();
-      return;
-    }
-    if (action === 'next') {
-      onArchiveOppPageNext();
-      return;
-    }
-    const pageText = control.getAttribute('data-archive-opp-page');
-    const page = Number(pageText);
-    if (!Number.isFinite(page)) {
-      return;
-    }
-    setArchiveOppPage(Math.max(1, Math.min(archiveOppPageCount, page)));
-  }, [
-    archiveOppPageCount,
-    onArchiveOppPageNext,
-    onArchiveOppPagePrev,
-    setArchiveOppPage,
-  ]);
-
-  const onArchiveRefreshClick = useCallback((event) => {
-    const node = event.target;
-    const container = event.currentTarget;
-    if (!(node instanceof Element) || !(container instanceof Element)) {
-      return;
-    }
-    const refreshNode = node.closest('[data-archive-refresh]');
-    if (!refreshNode || !container.contains(refreshNode)) {
-      return;
-    }
-    if (refreshNode.getAttribute('data-disabled') === 'true') {
-      return;
-    }
-    refreshArchives();
-  }, [refreshArchives]);
-
-  const onInspectArchiveTxClick = useCallback((event) => {
-    const node = event.target;
-    if (!(node instanceof Element)) {
-      return;
-    }
-    const inspectNode = node.closest('[data-inspect-hash]');
-    const hash = inspectNode?.getAttribute('data-inspect-hash');
-    if (!hash) {
-      return;
-    }
-    openTransactionByHash(hash);
-  }, [openTransactionByHash]);
-
   return {
     closeDialog,
     openTransactionByHash,
     onTickerListClick,
     onOpportunityListClick,
-    onArchiveTxListClick,
-    onArchiveOppListClick,
     onMastheadNavClick,
     onShowRadar,
     onShowOpps,
-    onShowReplay,
     onSearchChange,
     onTickerFilterToggle,
     onLiveMainnetFilterChange,
@@ -370,16 +192,5 @@ export function useDashboardActions({
     onTransactionPagePrev,
     onTransactionPageNext,
     onTransactionPaginationClick,
-    onArchiveQueryChange,
-    onArchiveMainnetFilterChange,
-    onArchiveTxPagePrev,
-    onArchiveTxPageNext,
-    onArchiveTxPaginationClick,
-    onArchiveOppPagePrev,
-    onArchiveOppPageNext,
-    onArchiveOppPaginationClick,
-    onArchiveRefreshClick,
-    onInspectArchiveTxClick,
-    refreshArchives,
   };
 }

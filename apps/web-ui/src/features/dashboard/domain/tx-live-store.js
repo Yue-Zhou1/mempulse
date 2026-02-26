@@ -1,3 +1,5 @@
+import { createCircularBuffer } from './circular-buffer.js';
+
 function resolveCap(maxItems) {
   if (!Number.isFinite(maxItems)) {
     return 0;
@@ -69,7 +71,7 @@ export function createTxLiveStore() {
 
       const cutoffUnixMs = resolveCutoffUnixMs(options.nowUnixMs, options.maxAgeMs);
       const seen = new Set();
-      const nextOrder = [];
+      const nextOrderBuffer = createCircularBuffer(cap);
       const nextByHash = new Map();
 
       for (const row of incomingRows ?? []) {
@@ -80,14 +82,14 @@ export function createTxLiveStore() {
         seen.add(hash);
         const previous = byHash.get(hash);
         const nextRow = previous && txSummaryEquivalent(previous, row) ? previous : row;
-        nextOrder.push(hash);
+        nextOrderBuffer.push(hash);
         nextByHash.set(hash, nextRow);
-        if (nextOrder.length >= cap) {
+        if (nextOrderBuffer.size() >= cap) {
           break;
         }
       }
 
-      if (nextOrder.length < cap) {
+      if (nextOrderBuffer.size() < cap) {
         for (const hash of order) {
           if (seen.has(hash)) {
             continue;
@@ -97,14 +99,15 @@ export function createTxLiveStore() {
             continue;
           }
           seen.add(hash);
-          nextOrder.push(hash);
+          nextOrderBuffer.push(hash);
           nextByHash.set(hash, existing);
-          if (nextOrder.length >= cap) {
+          if (nextOrderBuffer.size() >= cap) {
             break;
           }
         }
       }
 
+      const nextOrder = nextOrderBuffer.toArray();
       const nextRows = nextOrder.map((hash) => nextByHash.get(hash));
       const changed = !rowsReferenceEqual(rows, nextRows);
 

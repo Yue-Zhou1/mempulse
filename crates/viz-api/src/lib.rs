@@ -162,6 +162,15 @@ pub struct StreamHello {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StreamDeltaBatch {
+    pub event: String,
+    pub seq_start: u64,
+    pub seq_end: u64,
+    pub has_gap: bool,
+    pub transactions: Vec<TransactionSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub replay: Vec<ReplayPoint>,
     pub propagation: Vec<PropagationEdge>,
@@ -1556,6 +1565,14 @@ struct StreamQuery {
     after: Option<u64>,
     limit: Option<usize>,
     interval_ms: Option<u64>,
+    initial_credit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct StreamClientCredit {
+    #[serde(rename = "type")]
+    message_type: String,
+    amount: Option<u32>,
 }
 
 async fn stream(
@@ -1570,8 +1587,9 @@ async fn stream(
         propagation_edges: state.provider.propagation_edges().len(),
     };
     let after_seq_id = query.after.unwrap_or(0);
-    let batch_limit = query.limit.unwrap_or(256).clamp(1, 5_000);
-    let interval_ms = query.interval_ms.unwrap_or(250).clamp(50, 5_000);
+    let batch_limit = query.limit.unwrap_or(20).clamp(1, 20);
+    let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
+    let initial_credit = query.initial_credit.unwrap_or(0).min(64);
     let provider = state.provider.clone();
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -1581,8 +1599,31 @@ async fn stream(
             after_seq_id,
             batch_limit,
             interval_ms,
+            initial_credit,
         )
     })
+}
+
+fn transaction_summary_from_event(event: &EventEnvelope) -> Option<TransactionSummary> {
+    match &event.payload {
+        EventPayload::TxDecoded(decoded) => Some(TransactionSummary {
+            hash: format_bytes(&decoded.hash),
+            sender: format_bytes(&decoded.sender),
+            nonce: decoded.nonce,
+            tx_type: decoded.tx_type,
+            seen_unix_ms: event.ingest_ts_unix_ms,
+            source_id: event.source_id.to_string(),
+        }),
+        EventPayload::TxSeen(seen) => Some(TransactionSummary {
+            hash: format_bytes(&seen.hash),
+            sender: String::new(),
+            nonce: 0,
+            tx_type: 0,
+            seen_unix_ms: seen.seen_at_unix_ms,
+            source_id: event.source_id.to_string(),
+        }),
+        _ => None,
+    }
 }
 
 async fn handle_socket(
@@ -1592,6 +1633,7 @@ async fn handle_socket(
     mut after_seq_id: u64,
     batch_limit: usize,
     interval_ms: u64,
+    initial_credit: u32,
 ) {
     if let Ok(payload) = serde_json::to_string(&hello)
         && socket.send(Message::Text(payload.into())).await.is_err()
@@ -1601,31 +1643,81 @@ async fn handle_socket(
 
     let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut credits = initial_credit;
+    let page_limit = batch_limit.max(1);
+    let max_scan_events_per_tick = page_limit.saturating_mul(64).max(64);
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let events = provider.events(after_seq_id, &[], batch_limit);
+                if credits == 0 {
+                    continue;
+                }
+                let events = provider.events(after_seq_id, &[], max_scan_events_per_tick);
                 if events.is_empty() {
                     continue;
                 }
+                let mut seq_start = 0_u64;
+                let mut seq_end = after_seq_id;
+                let mut has_gap = false;
+                let mut transactions = Vec::new();
+
                 for event in events {
                     if event.seq_id <= after_seq_id {
                         continue;
                     }
+                    if seq_start == 0 {
+                        seq_start = event.seq_id;
+                        if after_seq_id > 0 && seq_start > after_seq_id.saturating_add(1) {
+                            has_gap = true;
+                        }
+                    }
                     after_seq_id = event.seq_id;
-                    let payload = match serde_json::to_string(&event) {
-                        Ok(payload) => payload,
-                        Err(_) => continue,
-                    };
-                    if socket.send(Message::Text(payload.into())).await.is_err() {
-                        return;
+                    seq_end = event.seq_id;
+                    if let Some(summary) = transaction_summary_from_event(&event) {
+                        if transactions.len() >= page_limit {
+                            transactions.remove(0);
+                        }
+                        transactions.push(summary);
                     }
                 }
+
+                if seq_start == 0 {
+                    continue;
+                }
+                if transactions.is_empty() {
+                    // Non-transaction events can be dense; keep credit and continue scanning
+                    // on the next tick after advancing cursor to avoid starvation.
+                    continue;
+                }
+
+                let payload = match serde_json::to_string(&StreamDeltaBatch {
+                    event: "delta_batch".to_owned(),
+                    seq_start,
+                    seq_end,
+                    has_gap,
+                    transactions,
+                }) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                        return;
+                }
+                credits = credits.saturating_sub(1);
             }
             maybe_message = socket.recv() => match maybe_message {
                 None => break,
                 Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(message) = serde_json::from_str::<StreamClientCredit>(&text)
+                        && message.message_type == "credit"
+                    {
+                        let amount = message.amount.unwrap_or(1).clamp(1, 64);
+                        credits = credits.saturating_add(amount);
+                    }
+                }
                 Some(Ok(Message::Ping(data))) => {
                     if socket.send(Message::Pong(data)).await.is_err() {
                         break;
