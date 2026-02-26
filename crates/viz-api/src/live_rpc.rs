@@ -112,6 +112,7 @@ impl LiveRpcDropMetrics {
 }
 
 static LIVE_RPC_DROP_METRICS: OnceLock<Arc<LiveRpcDropMetrics>> = OnceLock::new();
+static LIVE_RPC_FEED_START_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn live_rpc_drop_metrics() -> &'static Arc<LiveRpcDropMetrics> {
     LIVE_RPC_DROP_METRICS.get_or_init(|| Arc::new(LiveRpcDropMetrics::default()))
@@ -127,6 +128,14 @@ pub fn reset_live_rpc_drop_metrics() {
 
 pub fn observe_live_rpc_drop_reason(reason: LiveRpcDropReason) {
     live_rpc_drop_metrics().observe(reason);
+}
+
+pub fn live_rpc_feed_start_count() -> u64 {
+    LIVE_RPC_FEED_START_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn reset_live_rpc_feed_start_count() {
+    LIVE_RPC_FEED_START_COUNT.store(0, Ordering::Relaxed);
 }
 
 pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> LiveRpcDropReason {
@@ -707,6 +716,7 @@ pub fn start_live_rpc_feed(
     writer: StorageWriteHandle,
     config: LiveRpcConfig,
 ) {
+    LIVE_RPC_FEED_START_COUNT.fetch_add(1, Ordering::Relaxed);
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
         Err(_) => return,

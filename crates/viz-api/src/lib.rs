@@ -22,7 +22,6 @@ use replay::{
     replay_from_checkpoint,
 };
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use storage::{
@@ -732,14 +731,6 @@ pub fn default_state() -> AppState {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
-    let live_rpc_config = match LiveRpcConfig::from_env() {
-        Ok(config) => config,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to parse live rpc env overrides; using defaults");
-            LiveRpcConfig::default()
-        }
-    };
-    let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
     let propagation = vec![
         PropagationEdge {
@@ -755,28 +746,7 @@ pub fn default_state() -> AppState {
             p99_delay_ms: 36,
         },
     ];
-    match ingest_mode {
-        IngestSourceMode::Rpc => {
-            tracing::info!(
-                ingest_mode = ingest_mode.as_str(),
-                "starting rpc ingest mode"
-            );
-            start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
-        }
-        IngestSourceMode::P2p => {
-            tracing::info!(
-                ingest_mode = ingest_mode.as_str(),
-                "starting p2p ingest mode (external devp2p runtime expected)"
-            );
-        }
-        IngestSourceMode::Hybrid => {
-            tracing::info!(
-                ingest_mode = ingest_mode.as_str(),
-                "starting hybrid ingest mode (rpc live feed + p2p runtime)"
-            );
-            start_live_rpc_feed(storage.clone(), writer, live_rpc_config);
-        }
-    }
+    let _ = writer;
 
     let api_auth = ApiAuthConfig::from_env();
     if api_auth.enabled && api_auth.api_keys.is_empty() {
