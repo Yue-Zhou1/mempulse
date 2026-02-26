@@ -9,6 +9,7 @@ use viz_api::{
     AppState, MarketStats, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider,
     build_router,
 };
+use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
 
 #[derive(Clone)]
 struct EmptyProvider;
@@ -97,6 +98,8 @@ fn auth_state() -> AppState {
         alert_thresholds: AlertThresholdConfig::default(),
         api_rate_limiter: viz_api::auth::ApiRateLimiter::new(api_auth.requests_per_minute),
         api_auth,
+        live_rpc_chain_status_provider: Arc::new(|| Vec::<LiveRpcChainStatus>::new()),
+        live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
     }
 }
 

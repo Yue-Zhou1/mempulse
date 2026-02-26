@@ -14,7 +14,7 @@ use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
 use live_rpc::{
-    LiveRpcChainStatus, LiveRpcConfig, live_rpc_chain_status_snapshot,
+    LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
     live_rpc_drop_metrics_snapshot, start_live_rpc_feed,
 };
 use replay::{
@@ -47,6 +47,9 @@ pub struct AppState {
     pub alert_thresholds: AlertThresholdConfig,
     pub api_auth: ApiAuthConfig,
     pub api_rate_limiter: ApiRateLimiter,
+    pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
+    pub live_rpc_drop_metrics_provider:
+        Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -782,6 +785,10 @@ pub fn default_state() -> AppState {
         );
     }
     let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
+    let live_rpc_chain_status_provider =
+        Arc::new(live_rpc_chain_status_snapshot) as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+    let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
+        as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
 
     AppState {
         provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
@@ -790,6 +797,8 @@ pub fn default_state() -> AppState {
         alert_thresholds: AlertThresholdConfig::default(),
         api_auth,
         api_rate_limiter,
+        live_rpc_chain_status_provider,
+        live_rpc_drop_metrics_provider,
     }
 }
 
@@ -1159,7 +1168,7 @@ async fn dashboard_snapshot(
             chain_id,
             tx_limit,
         ),
-        chain_ingest_status: live_rpc_chain_status_snapshot(),
+        chain_ingest_status: (state.live_rpc_chain_status_provider)(),
         market_stats: state.provider.market_stats(),
         latest_seq_id,
     })
@@ -1440,7 +1449,7 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {}\n",
         snapshot.tx_decode_fail_total
     ));
-    let drop_metrics = live_rpc_drop_metrics_snapshot();
+    let drop_metrics = (state.live_rpc_drop_metrics_provider)();
     out.push_str(&format!(
         "mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {}\n",
         drop_metrics.storage_queue_full
@@ -1921,6 +1930,11 @@ mod tests {
 
     fn test_state(limit: usize) -> AppState {
         let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider =
+            Arc::new(|| Vec::<LiveRpcChainStatus>::new())
+                as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -1928,11 +1942,18 @@ mod tests {
             alert_thresholds: AlertThresholdConfig::default(),
             api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
             api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
         }
     }
 
     fn test_state_with_relay(limit: usize, relay_status: RelayDryRunStatus) -> AppState {
         let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider =
+            Arc::new(|| Vec::<LiveRpcChainStatus>::new())
+                as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -1940,6 +1961,8 @@ mod tests {
             alert_thresholds: AlertThresholdConfig::default(),
             api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
             api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
         }
     }
 
