@@ -6,6 +6,7 @@ members = [
   "crates/feature-engine",
   "crates/storage",
   "crates/viz-api",
+  "crates/node-runtime",
   "crates/replay",
   "crates/sim-engine",
   "crates/searcher",
