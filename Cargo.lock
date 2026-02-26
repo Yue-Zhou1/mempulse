@@ -1952,6 +1952,10 @@ dependencies = [
 [[package]]
 name = "node-runtime"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+]
 
 [[package]]
 name = "nu-ansi-term"
