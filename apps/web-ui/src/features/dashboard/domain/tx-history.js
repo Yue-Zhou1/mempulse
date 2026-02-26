@@ -27,7 +27,31 @@ function resolveCutoffUnixMs(options) {
   return nowUnixMs - maxAgeMs;
 }
 
-function appendRows(merged, seen, rows, cap, cutoffUnixMs) {
+function txSummaryEquivalent(left, right) {
+  return (
+    left?.hash === right?.hash
+    && left?.sender === right?.sender
+    && left?.nonce === right?.nonce
+    && left?.tx_type === right?.tx_type
+    && left?.seen_unix_ms === right?.seen_unix_ms
+    && left?.source_id === right?.source_id
+    && left?.chain_id === right?.chain_id
+  );
+}
+
+function resolveStableRow(existingByHash, row) {
+  const hash = row?.hash;
+  if (!hash) {
+    return row;
+  }
+  const existing = existingByHash.get(hash);
+  if (existing && txSummaryEquivalent(existing, row)) {
+    return existing;
+  }
+  return row;
+}
+
+function appendRows(merged, seen, rows, cap, cutoffUnixMs, existingByHash) {
   for (const row of rows ?? []) {
     if (!isWithinAgeWindow(row, cutoffUnixMs)) {
       continue;
@@ -37,7 +61,7 @@ function appendRows(merged, seen, rows, cap, cutoffUnixMs) {
       continue;
     }
     seen.add(hash);
-    merged.push(row);
+    merged.push(resolveStableRow(existingByHash, row));
     if (merged.length >= cap) {
       return true;
     }
@@ -54,10 +78,16 @@ export function mergeTransactionHistory(existingRows, incomingRows, maxItems, op
   const cutoffUnixMs = resolveCutoffUnixMs(options);
   const merged = [];
   const seen = new Set();
+  const existingByHash = new Map();
+  for (const row of existingRows ?? []) {
+    if (row?.hash) {
+      existingByHash.set(row.hash, row);
+    }
+  }
 
-  if (appendRows(merged, seen, incomingRows, cap, cutoffUnixMs)) {
+  if (appendRows(merged, seen, incomingRows, cap, cutoffUnixMs, existingByHash)) {
     return merged;
   }
-  appendRows(merged, seen, existingRows, cap, cutoffUnixMs);
+  appendRows(merged, seen, existingRows, cap, cutoffUnixMs, existingByHash);
   return merged;
 }

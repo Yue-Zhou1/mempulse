@@ -9,10 +9,14 @@ export function NewsMasthead({ model, actions }) {
   } = model;
 
   const {
-    onShowRadar,
-    onShowOpps,
-    onShowReplay,
+    onMastheadNavClick,
   } = actions;
+
+  const tabs = [
+    { id: 'radar', label: 'Front Page' },
+    { id: 'opps', label: 'Opportunity Desk' },
+    { id: 'replay', label: 'Archives' },
+  ];
 
   return (
         <header className="news-masthead px-5 pb-3 pt-4">
@@ -30,38 +34,22 @@ export function NewsMasthead({ model, actions }) {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 border-y-2 border-zinc-900 py-2">
-            <button
-              type="button"
-              onClick={onShowRadar}
-              className={cn(
-                'news-tab news-mono cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
-                activeScreen === 'radar' ? 'news-tab-active' : '',
-              )}
-            >
-              Front Page
-            </button>
-            <button
-              type="button"
-              onClick={onShowOpps}
-              className={cn(
-                'news-tab news-mono cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
-                activeScreen === 'opps' ? 'news-tab-active' : '',
-              )}
-            >
-              Opportunity Desk
-            </button>
-            <button
-              type="button"
-              onClick={onShowReplay}
-              className={cn(
-                'news-tab news-mono cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
-                activeScreen === 'replay' ? 'news-tab-active' : '',
-              )}
-            >
-              Archives
-            </button>
+            <ul className="flex flex-wrap items-center gap-2" onClick={onMastheadNavClick}>
+              {tabs.map((tab) => (
+                <li
+                  key={tab.id}
+                  data-screen-id={tab.id}
+                  className={cn(
+                    'news-tab news-mono cursor-pointer list-none px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
+                    activeScreen === tab.id ? 'news-tab-active' : '',
+                  )}
+                >
+                  {tab.label}
+                </li>
+              ))}
+            </ul>
             <div className="ml-auto flex min-w-[20rem] flex-1 flex-col items-end gap-1">
-              <div className="news-mono text-right text-[11px] uppercase tracking-[0.12em] text-zinc-700">
+              <div className="news-mono w-full text-right text-[11px] uppercase tracking-[0.12em] text-zinc-700 lg:max-w-[36rem] lg:truncate">
                 {statusMessage}
               </div>
               {chainStatusBadges.length ? (

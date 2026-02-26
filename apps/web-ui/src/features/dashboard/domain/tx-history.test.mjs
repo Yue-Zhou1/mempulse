@@ -63,3 +63,33 @@ test('mergeTransactionHistory prunes rows older than the live window', () => {
     ['0x03', '0x02'],
   );
 });
+
+test('mergeTransactionHistory reuses existing row object when incoming row is unchanged', () => {
+  const existingRow = {
+    hash: '0xaaa',
+    sender: '0x111',
+    nonce: 7,
+    tx_type: 2,
+    seen_unix_ms: 123,
+    source_id: 'eth-mainnet',
+    chain_id: 1,
+  };
+  const merged = mergeTransactionHistory(
+    [existingRow],
+    [
+      {
+        hash: '0xaaa',
+        sender: '0x111',
+        nonce: 7,
+        tx_type: 2,
+        seen_unix_ms: 123,
+        source_id: 'eth-mainnet',
+        chain_id: 1,
+      },
+    ],
+    10,
+  );
+
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0], existingRow);
+});

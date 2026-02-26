@@ -46,8 +46,7 @@ export function TransactionDialog({ model, actions }) {
                   </div>
                   <div className="news-mono mt-1 break-all text-[18px] leading-relaxed text-zinc-900">{dialogHash}</div>
                 </div>
-                <button
-                  type="button"
+                <div
                   onClick={closeDialog}
                   aria-label="Close transaction detail"
                   className="news-icon-button"
@@ -55,7 +54,7 @@ export function TransactionDialog({ model, actions }) {
                   <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
                     <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="square" />
                   </svg>
-                </button>
+                </div>
               </div>
               <div className="news-mono mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-900 pt-2 text-[16px] uppercase tracking-[0.1em] text-zinc-700">
                 <div className="flex flex-wrap items-center gap-3">
