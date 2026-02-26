@@ -4,13 +4,18 @@ This diagram captures the end-to-end MEV research pipeline implemented in this r
 
 ```mermaid
 flowchart LR
+    BIN["viz-api binary entrypoint"] --> RUNTIME["node-runtime (composition + lifecycle)"]
+
     subgraph Sources["Mempool Sources"]
         RPC["RPC Pending Stream (WS/HTTP)"]
         P2P["devp2p Peer Network"]
     end
 
-    RPC --> IRPC["ingest::rpc"]
-    P2P --> IP2P["ingest::p2p + devp2p_runtime"]
+    RPC --> RUNTIME
+    P2P --> RUNTIME
+
+    RUNTIME --> IRPC["ingest::rpc"]
+    RUNTIME --> IP2P["ingest::p2p + devp2p_runtime"]
 
     IRPC --> BUS["EventEnvelope stream"]
     IP2P --> BUS
@@ -26,7 +31,8 @@ flowchart LR
     SIM --> BUILDER["builder crate (relay dry-run client)"]
     BUILDER --> RELAY["PBS Relay / Mock Relay"]
 
-    STORAGE --> API["viz-api (Axum)"]
+    RUNTIME --> API["viz-api (Axum read/query surface)"]
+    STORAGE --> API
     REPLAY --> API
     FEAT --> API
     SEARCH --> API
@@ -46,6 +52,7 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant Src as RPC/devp2p Source
+    participant Runtime as node-runtime
     participant Ingest as ingest
     participant Log as event-log
     participant Store as storage
@@ -56,7 +63,8 @@ sequenceDiagram
     participant API as viz-api
     participant UI as web-ui
 
-    Src->>Ingest: pending tx hash / tx payload
+    Src->>Runtime: pending tx hash / tx payload
+    Runtime->>Ingest: dispatch to ingest worker
     Ingest->>Log: TxSeen
     Ingest->>Log: TxFetched
     Ingest->>Log: TxDecoded (enriched fields)
