@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { MAINNET_FILTER_ALL, MAINNET_FILTER_OPTIONS } from '../domain/mainnet-filter.js';
 import {
   classifyRisk,
@@ -12,6 +13,104 @@ import {
 import { NewspaperFilterSelect } from './newspaper-filter-select.jsx';
 import { RollingInt, RollingPercent } from './rolling-number.jsx';
 import { cn } from '../../../shared/lib/utils.js';
+
+const TickerRow = memo(function TickerRow({ row, feature, isActive }) {
+  const risk = classifyRisk(feature);
+  const status = statusForRow(feature);
+  const amountValue = feature
+    ? (feature.urgency_score / 10).toFixed(1)
+    : '--.--';
+  const protocolValue = feature?.protocol ?? '-';
+  const categoryValue = feature?.category ?? '-';
+  const senderValue = row?.sender ?? '-';
+  const sourceValue = row?.source_id ?? '-';
+  const mainnetValue = resolveMainnetLabel(row?.chain_id, row?.source_id);
+  const mainnetRowClasses = resolveMainnetRowClasses(mainnetValue);
+  const nonceValue = row?.nonce ?? '-';
+  const txTypeValue = row?.tx_type ?? '-';
+
+  return (
+    <tr
+      data-tx-hash={row.hash}
+      className={cn(
+        'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
+        isActive
+          ? 'bg-zinc-900 text-[#f7f1e6]'
+          : status === 'Flagged'
+            ? 'bg-zinc-900 text-[#f7f1e6]'
+            : `${mainnetRowClasses} text-zinc-800`,
+      )}
+    >
+      <td className="px-2 py-2 align-middle whitespace-nowrap">{formatTickerTime(row.seen_unix_ms)}</td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={row.hash}
+      >
+        {shortHex(row.hash, 18, 8)}
+      </td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={senderValue}
+      >
+        {shortHex(senderValue, 10, 8)}
+      </td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={sourceValue}
+      >
+        {sourceValue}
+      </td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={mainnetValue}
+      >
+        {mainnetValue}
+      </td>
+      <td className="px-2 py-2 align-middle">{txTypeValue}</td>
+      <td className="px-2 py-2 align-middle">{nonceValue}</td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={protocolValue}
+      >
+        {protocolValue}
+      </td>
+      <td
+        className="px-2 py-2 align-middle overflow-hidden text-ellipsis whitespace-nowrap"
+        title={categoryValue}
+      >
+        {categoryValue}
+      </td>
+      <td className="px-2 py-2 text-right align-middle">{amountValue}</td>
+      <td className="px-2 py-2 align-middle">
+        <span
+          className={cn(
+            'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
+            statusBadgeClass(status, isActive || status === 'Flagged'),
+          )}
+        >
+          {status}
+        </span>
+      </td>
+      <td className="px-2 py-2 align-middle">
+        <span
+          className={cn(
+            'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
+            riskBadgeClass(risk.label, isActive || status === 'Flagged'),
+          )}
+        >
+          {risk.label}
+        </span>
+      </td>
+      <td className={cn('px-2 py-2 text-center align-middle font-bold', isActive ? 'text-[#f7f1e6]' : 'text-zinc-500')}>
+        •••
+      </td>
+    </tr>
+  );
+}, (left, right) => (
+  left.row === right.row
+  && left.feature === right.feature
+  && left.isActive === right.isActive
+));
 
 export function RadarScreen({ model, actions }) {
   const {
@@ -47,14 +146,11 @@ export function RadarScreen({ model, actions }) {
   } = model;
 
   const {
-    onTickerFilterToggle,
-    onTickerFollowClick,
+    onTickerToolbarClick,
     onSearchChange,
     onLiveMainnetFilterChange,
     onTickerListClick,
     onTransactionPaginationClick,
-    onTransactionPagePrev,
-    onTransactionPageNext,
   } = actions;
 
   return (
@@ -69,25 +165,23 @@ export function RadarScreen({ model, actions }) {
 
               <div className="mb-1 flex flex-wrap items-center justify-between gap-2 border-b-4 border-zinc-900 pb-2">
                 <div className="news-section-title text-xl font-bold uppercase">Latest Ticker</div>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={onTickerFilterToggle}
+                <ul className="flex gap-2" onClick={onTickerToolbarClick}>
+                  <li
+                    data-ticker-action="filter"
                     className={cn(
-                      'news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                      'news-tab news-mono cursor-pointer list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
                       showTickerFilters || liveMainnetFilter !== MAINNET_FILTER_ALL ? 'news-tab-active' : '',
                     )}
                   >
                     Filter
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onTickerFollowClick}
-                    className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors"
+                  </li>
+                  <li
+                    data-ticker-action="follow"
+                    className="news-tab news-mono cursor-pointer list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors"
                   >
                     Follow
-                  </button>
-                </div>
+                  </li>
+                </ul>
               </div>
 
               <div className="mb-2 flex items-center gap-2">
@@ -110,7 +204,12 @@ export function RadarScreen({ model, actions }) {
                 </div>
               ) : null}
 
-              <div className={cn('news-mono mb-3 text-[10px] uppercase tracking-[0.12em]', hasError ? 'text-rose-700' : 'text-zinc-700')}>
+              <div
+                className={cn(
+                  'news-mono mb-3 min-h-[1rem] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] uppercase tracking-[0.12em]',
+                  hasError ? 'text-rose-700' : 'text-zinc-700',
+                )}
+              >
                 {statusMessage}
               </div>
 
@@ -138,96 +237,14 @@ export function RadarScreen({ model, actions }) {
                       </tr>
                     </thead>
                     <tbody>
-                      {deferredTickerRows.map((row) => {
-                        const feature = featureByHash.get(row.hash);
-                        const risk = classifyRisk(feature);
-                        const status = statusForRow(feature);
-                        const isActive = row.hash === selectedHash;
-                        const amountValue = feature
-                          ? (feature.urgency_score / 10).toFixed(1)
-                          : '--.--';
-                        const protocolValue = feature?.protocol ?? '-';
-                        const categoryValue = feature?.category ?? '-';
-                        const senderValue = row?.sender ?? '-';
-                        const sourceValue = row?.source_id ?? '-';
-                        const mainnetValue = resolveMainnetLabel(row?.chain_id, row?.source_id);
-                        const mainnetRowClasses = resolveMainnetRowClasses(mainnetValue);
-                        const nonceValue = row?.nonce ?? '-';
-                        const txTypeValue = row?.tx_type ?? '-';
-
-                        return (
-                          <tr
-                            key={row.hash}
-                            data-tx-hash={row.hash}
-                            className={cn(
-                              'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
-                              isActive
-                                ? 'bg-zinc-900 text-[#f7f1e6]'
-                                : status === 'Flagged'
-                                  ? 'bg-zinc-900 text-[#f7f1e6]'
-                                  : `${mainnetRowClasses} text-zinc-800`,
-                            )}
-                          >
-                            <td className="px-2 py-2 align-middle whitespace-nowrap">{formatTickerTime(row.seen_unix_ms)}</td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={row.hash}>
-                                {shortHex(row.hash, 18, 8)}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={senderValue}>
-                                {shortHex(senderValue, 10, 8)}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={sourceValue}>
-                                {sourceValue}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={mainnetValue}>
-                                {mainnetValue}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">{txTypeValue}</td>
-                            <td className="px-2 py-2 align-middle">{nonceValue}</td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={protocolValue}>
-                                {protocolValue}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">
-                              <span className="block truncate" title={categoryValue}>
-                                {categoryValue}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 text-right align-middle">{amountValue}</td>
-                            <td className="px-2 py-2 align-middle">
-                              <span
-                                className={cn(
-                                  'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
-                                  statusBadgeClass(status, isActive || status === 'Flagged'),
-                                )}
-                              >
-                                {status}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 align-middle">
-                              <span
-                                className={cn(
-                                  'border px-1 text-[12px] font-bold uppercase tracking-[0.08em]',
-                                  riskBadgeClass(risk.label, isActive || status === 'Flagged'),
-                                )}
-                              >
-                                {risk.label}
-                              </span>
-                            </td>
-                            <td className={cn('px-2 py-2 text-center align-middle font-bold', isActive ? 'text-[#f7f1e6]' : 'text-zinc-500')}>
-                              •••
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {deferredTickerRows.map((row) => (
+                        <TickerRow
+                          key={row.hash}
+                          row={row}
+                          feature={featureByHash.get(row.hash)}
+                          isActive={row.hash === selectedHash}
+                        />
+                      ))}
                     </tbody>
                   </table>
                 </div>
@@ -238,41 +255,40 @@ export function RadarScreen({ model, actions }) {
                   <div className="news-mono mb-2 text-center text-[10px] uppercase tracking-[0.14em] text-zinc-700">
                     Showing {transactionPageStart + 1}-{transactionPageEnd} of {pagedTransactions.length} rows · page {normalizedTransactionPage}/{transactionPageCount}
                   </div>
-                  <div className="flex items-center justify-center gap-1.5" onClick={onTransactionPaginationClick}>
-                    <button
-                      type="button"
-                      onClick={onTransactionPagePrev}
-                      disabled={normalizedTransactionPage <= 1}
+                  <ul className="flex items-center justify-center gap-1.5" onClick={onTransactionPaginationClick}>
+                    <li
+                      data-page-action="prev"
+                      data-disabled={normalizedTransactionPage <= 1 ? 'true' : 'false'}
                       className={cn(
-                        'news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors disabled:cursor-not-allowed disabled:opacity-40',
+                        'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                        normalizedTransactionPage <= 1 ? 'news-tab-disabled' : 'cursor-pointer',
                       )}
                     >
                       Prev
-                    </button>
+                    </li>
                     {paginationPages.map((page) => (
-                      <button
-                        type="button"
+                      <li
                         key={page}
                         data-page={page}
                         className={cn(
-                          'news-tab news-mono cursor-pointer px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                          'news-tab news-mono cursor-pointer list-none px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
                           page === normalizedTransactionPage ? 'news-tab-active' : '',
                         )}
                       >
                         {page}
-                      </button>
+                      </li>
                     ))}
-                    <button
-                      type="button"
-                      onClick={onTransactionPageNext}
-                      disabled={normalizedTransactionPage >= transactionPageCount}
+                    <li
+                      data-page-action="next"
+                      data-disabled={normalizedTransactionPage >= transactionPageCount ? 'true' : 'false'}
                       className={cn(
-                        'news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors disabled:cursor-not-allowed disabled:opacity-40',
+                        'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                        normalizedTransactionPage >= transactionPageCount ? 'news-tab-disabled' : 'cursor-pointer',
                       )}
                     >
                       Next
-                    </button>
-                  </div>
+                    </li>
+                  </ul>
                 </div>
               ) : null}
 

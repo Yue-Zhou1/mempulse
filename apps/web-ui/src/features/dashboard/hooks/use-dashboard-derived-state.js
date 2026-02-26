@@ -30,6 +30,7 @@ export function useDashboardDerivedState({
   transactionPage,
   tickerPageSize,
   tickerPageLimit,
+  maxRenderedTransactions,
   archiveQuery,
   archiveMainnetFilter,
   archiveTxPage,
@@ -175,7 +176,15 @@ export function useDashboardDerivedState({
     dialogTransaction?.source_id ?? dialogDetail?.source_id,
   );
 
-  const maxPagedRows = tickerPageSize * tickerPageLimit;
+  const maxPagedRows = Math.min(
+    tickerPageSize * tickerPageLimit,
+    Math.max(
+      tickerPageSize,
+      Number.isFinite(maxRenderedTransactions)
+        ? Math.floor(maxRenderedTransactions)
+        : tickerPageSize * tickerPageLimit,
+    ),
+  );
   const pagedTransactions = useMemo(
     () => filteredTransactions.slice(0, maxPagedRows),
     [filteredTransactions, maxPagedRows],

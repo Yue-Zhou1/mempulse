@@ -61,11 +61,15 @@ export function useDashboardActions({
 
   const onOpportunityListClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const rowButton = node.closest('button[data-opportunity-key]');
-    const key = rowButton?.getAttribute('data-opportunity-key');
+    const rowElement = node.closest('[data-opportunity-key]');
+    if (!rowElement || !container.contains(rowElement)) {
+      return;
+    }
+    const key = rowElement.getAttribute('data-opportunity-key');
     if (!key) {
       return;
     }
@@ -74,11 +78,15 @@ export function useDashboardActions({
 
   const onArchiveTxListClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const rowButton = node.closest('button[data-archive-tx-hash]');
-    const hash = rowButton?.getAttribute('data-archive-tx-hash');
+    const rowElement = node.closest('[data-archive-tx-hash]');
+    if (!rowElement || !container.contains(rowElement)) {
+      return;
+    }
+    const hash = rowElement.getAttribute('data-archive-tx-hash');
     if (!hash) {
       return;
     }
@@ -87,11 +95,15 @@ export function useDashboardActions({
 
   const onArchiveOppListClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const rowButton = node.closest('button[data-archive-opp-key]');
-    const key = rowButton?.getAttribute('data-archive-opp-key');
+    const rowElement = node.closest('[data-archive-opp-key]');
+    if (!rowElement || !container.contains(rowElement)) {
+      return;
+    }
+    const key = rowElement.getAttribute('data-archive-opp-key');
     if (!key) {
       return;
     }
@@ -108,6 +120,23 @@ export function useDashboardActions({
 
   const onShowReplay = useCallback(() => {
     setActiveScreen('replay');
+  }, [setActiveScreen]);
+
+  const onMastheadNavClick = useCallback((event) => {
+    const node = event.target;
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
+      return;
+    }
+    const tab = node.closest('[data-screen-id]');
+    if (!tab || !container.contains(tab)) {
+      return;
+    }
+    const screenId = tab.getAttribute('data-screen-id');
+    if (!screenId) {
+      return;
+    }
+    setActiveScreen(screenId);
   }, [setActiveScreen]);
 
   const onSearchChange = useCallback((event) => {
@@ -130,6 +159,26 @@ export function useDashboardActions({
     }
   }, [replayFrames, setFollowLatest, setTimelineIndex, setTransactionPage]);
 
+  const onTickerToolbarClick = useCallback((event) => {
+    const node = event.target;
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
+      return;
+    }
+    const actionNode = node.closest('[data-ticker-action]');
+    if (!actionNode || !container.contains(actionNode)) {
+      return;
+    }
+    const action = actionNode.getAttribute('data-ticker-action');
+    if (action === 'filter') {
+      onTickerFilterToggle();
+      return;
+    }
+    if (action === 'follow') {
+      onTickerFollowClick();
+    }
+  }, [onTickerFilterToggle, onTickerFollowClick]);
+
   const onTransactionPagePrev = useCallback(() => {
     setFollowLatest(false);
     setTransactionPage((current) => Math.max(1, current - 1));
@@ -142,11 +191,27 @@ export function useDashboardActions({
 
   const onTransactionPaginationClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const button = node.closest('button[data-page]');
-    const pageText = button?.getAttribute('data-page');
+    const control = node.closest('[data-page],[data-page-action]');
+    if (!control || !container.contains(control)) {
+      return;
+    }
+    if (control.getAttribute('data-disabled') === 'true') {
+      return;
+    }
+    const pageAction = control.getAttribute('data-page-action');
+    if (pageAction === 'prev') {
+      onTransactionPagePrev();
+      return;
+    }
+    if (pageAction === 'next') {
+      onTransactionPageNext();
+      return;
+    }
+    const pageText = control.getAttribute('data-page');
     const page = Number(pageText);
     if (!Number.isFinite(page)) {
       return;
@@ -155,7 +220,13 @@ export function useDashboardActions({
     if (page !== 1) {
       setFollowLatest(false);
     }
-  }, [setFollowLatest, setTransactionPage, transactionPageCount]);
+  }, [
+    onTransactionPageNext,
+    onTransactionPagePrev,
+    setFollowLatest,
+    setTransactionPage,
+    transactionPageCount,
+  ]);
 
   const onArchiveQueryChange = useCallback((event) => {
     setArchiveQuery(event.target.value);
@@ -175,17 +246,38 @@ export function useDashboardActions({
 
   const onArchiveTxPaginationClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const button = node.closest('button[data-archive-tx-page]');
-    const pageText = button?.getAttribute('data-archive-tx-page');
+    const control = node.closest('[data-archive-tx-page],[data-archive-tx-page-action]');
+    if (!control || !container.contains(control)) {
+      return;
+    }
+    if (control.getAttribute('data-disabled') === 'true') {
+      return;
+    }
+    const action = control.getAttribute('data-archive-tx-page-action');
+    if (action === 'prev') {
+      onArchiveTxPagePrev();
+      return;
+    }
+    if (action === 'next') {
+      onArchiveTxPageNext();
+      return;
+    }
+    const pageText = control.getAttribute('data-archive-tx-page');
     const page = Number(pageText);
     if (!Number.isFinite(page)) {
       return;
     }
     setArchiveTxPage(Math.max(1, Math.min(archiveTxPageCount, page)));
-  }, [archiveTxPageCount, setArchiveTxPage]);
+  }, [
+    archiveTxPageCount,
+    onArchiveTxPageNext,
+    onArchiveTxPagePrev,
+    setArchiveTxPage,
+  ]);
 
   const onArchiveOppPagePrev = useCallback(() => {
     setArchiveOppPage((current) => Math.max(1, current - 1));
@@ -197,17 +289,67 @@ export function useDashboardActions({
 
   const onArchiveOppPaginationClick = useCallback((event) => {
     const node = event.target;
-    if (!(node instanceof Element)) {
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
       return;
     }
-    const button = node.closest('button[data-archive-opp-page]');
-    const pageText = button?.getAttribute('data-archive-opp-page');
+    const control = node.closest('[data-archive-opp-page],[data-archive-opp-page-action]');
+    if (!control || !container.contains(control)) {
+      return;
+    }
+    if (control.getAttribute('data-disabled') === 'true') {
+      return;
+    }
+    const action = control.getAttribute('data-archive-opp-page-action');
+    if (action === 'prev') {
+      onArchiveOppPagePrev();
+      return;
+    }
+    if (action === 'next') {
+      onArchiveOppPageNext();
+      return;
+    }
+    const pageText = control.getAttribute('data-archive-opp-page');
     const page = Number(pageText);
     if (!Number.isFinite(page)) {
       return;
     }
     setArchiveOppPage(Math.max(1, Math.min(archiveOppPageCount, page)));
-  }, [archiveOppPageCount, setArchiveOppPage]);
+  }, [
+    archiveOppPageCount,
+    onArchiveOppPageNext,
+    onArchiveOppPagePrev,
+    setArchiveOppPage,
+  ]);
+
+  const onArchiveRefreshClick = useCallback((event) => {
+    const node = event.target;
+    const container = event.currentTarget;
+    if (!(node instanceof Element) || !(container instanceof Element)) {
+      return;
+    }
+    const refreshNode = node.closest('[data-archive-refresh]');
+    if (!refreshNode || !container.contains(refreshNode)) {
+      return;
+    }
+    if (refreshNode.getAttribute('data-disabled') === 'true') {
+      return;
+    }
+    refreshArchives();
+  }, [refreshArchives]);
+
+  const onInspectArchiveTxClick = useCallback((event) => {
+    const node = event.target;
+    if (!(node instanceof Element)) {
+      return;
+    }
+    const inspectNode = node.closest('[data-inspect-hash]');
+    const hash = inspectNode?.getAttribute('data-inspect-hash');
+    if (!hash) {
+      return;
+    }
+    openTransactionByHash(hash);
+  }, [openTransactionByHash]);
 
   return {
     closeDialog,
@@ -216,6 +358,7 @@ export function useDashboardActions({
     onOpportunityListClick,
     onArchiveTxListClick,
     onArchiveOppListClick,
+    onMastheadNavClick,
     onShowRadar,
     onShowOpps,
     onShowReplay,
@@ -223,6 +366,7 @@ export function useDashboardActions({
     onTickerFilterToggle,
     onLiveMainnetFilterChange,
     onTickerFollowClick,
+    onTickerToolbarClick,
     onTransactionPagePrev,
     onTransactionPageNext,
     onTransactionPaginationClick,
@@ -234,6 +378,8 @@ export function useDashboardActions({
     onArchiveOppPagePrev,
     onArchiveOppPageNext,
     onArchiveOppPaginationClick,
+    onArchiveRefreshClick,
+    onInspectArchiveTxClick,
     refreshArchives,
   };
 }

@@ -8,7 +8,7 @@ test('resolveUiRuntimeConfig returns defaults when env is empty', () => {
   assert.equal(config.snapshotTxLimit, 120);
   assert.equal(config.detailCacheLimit, 96);
   assert.equal(config.maxTransactionHistory, 500);
-  assert.equal(config.maxRenderedTransactions, 80);
+  assert.equal(config.maxRenderedTransactions, 500);
   assert.equal(config.transactionRetentionMs, 300_000);
   assert.equal(config.transactionRetentionMinutes, 5);
 });
@@ -89,5 +89,5 @@ test('resolveUiRuntimeConfig ignores blank runtime values and falls back to env/
   });
 
   assert.equal(config.snapshotTxLimit, 150);
-  assert.equal(config.maxRenderedTransactions, 80);
+  assert.equal(config.maxRenderedTransactions, 500);
 });

@@ -1,31 +1,162 @@
 import { useEffect } from 'react';
 import { resolveMarketStatsSnapshot } from '../domain/market-stats.js';
 import { normalizeScreenId } from '../domain/screen-mode.js';
-import { mergeTransactionHistory } from '../domain/tx-history.js';
+import {
+  buildDashboardSnapshotPath,
+  resolveDashboardSnapshotLimits,
+} from '../domain/snapshot-profile.js';
 import {
   fetchJson,
   normalizeChainStatusRows,
   opportunityRowKey,
 } from '../lib/dashboard-helpers.js';
 
-const snapshotFeatureLimit = 600;
-const snapshotOppLimit = 600;
-const snapshotReplayLimit = 1000;
 const snapshotThrottleMs = 1200;
+const transactionCommitBatchMs = 200;
 const streamBatchLimit = 512;
 const streamIntervalMs = 200;
 const streamInitialReconnectMs = 1000;
 const streamMaxReconnectMs = 30000;
 const archiveRefreshMs = 15000;
 
-function buildDashboardSnapshotPath(txLimit) {
-  const params = new URLSearchParams({
-    tx_limit: String(txLimit),
-    feature_limit: String(snapshotFeatureLimit),
-    opp_limit: String(snapshotOppLimit),
-    replay_limit: String(snapshotReplayLimit),
+function rowsReferenceEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function stabilizeRows(currentRows, nextRows, keyOf, isEquivalent) {
+  if (!Array.isArray(nextRows)) {
+    return [];
+  }
+  if (!Array.isArray(currentRows) || currentRows.length === 0 || nextRows.length === 0) {
+    return nextRows;
+  }
+
+  const currentByKey = new Map();
+  for (const row of currentRows) {
+    currentByKey.set(keyOf(row), row);
+  }
+
+  const stabilized = nextRows.map((row) => {
+    const previous = currentByKey.get(keyOf(row));
+    if (previous && isEquivalent(previous, row)) {
+      return previous;
+    }
+    return row;
   });
-  return `/dashboard/snapshot?${params.toString()}`;
+
+  return rowsReferenceEqual(currentRows, stabilized) ? currentRows : stabilized;
+}
+
+function replayPointEquivalent(left, right) {
+  return (
+    left.seq_hi === right.seq_hi
+    && left.timestamp_unix_ms === right.timestamp_unix_ms
+    && left.pending_count === right.pending_count
+  );
+}
+
+function propagationEdgeEquivalent(left, right) {
+  return (
+    left.source === right.source
+    && left.destination === right.destination
+    && left.p50_delay_ms === right.p50_delay_ms
+    && left.p99_delay_ms === right.p99_delay_ms
+  );
+}
+
+function featureSummaryEquivalent(left, right) {
+  return (
+    left.protocol === right.protocol
+    && left.category === right.category
+    && left.count === right.count
+  );
+}
+
+function featureDetailEquivalent(left, right) {
+  return (
+    left.hash === right.hash
+    && left.protocol === right.protocol
+    && left.category === right.category
+    && left.chain_id === right.chain_id
+    && left.mev_score === right.mev_score
+    && left.urgency_score === right.urgency_score
+    && left.method_selector === right.method_selector
+    && left.feature_engine_version === right.feature_engine_version
+  );
+}
+
+function txSummaryEquivalent(left, right) {
+  return (
+    left.hash === right.hash
+    && left.sender === right.sender
+    && left.nonce === right.nonce
+    && left.tx_type === right.tx_type
+    && left.seen_unix_ms === right.seen_unix_ms
+    && left.source_id === right.source_id
+    && left.chain_id === right.chain_id
+  );
+}
+
+function chainStatusEquivalent(left, right) {
+  return (
+    left.chain_key === right.chain_key
+    && left.chain_id === right.chain_id
+    && left.source_id === right.source_id
+    && left.state === right.state
+    && left.endpoint_index === right.endpoint_index
+    && left.endpoint_count === right.endpoint_count
+    && left.ws_url === right.ws_url
+    && left.http_url === right.http_url
+    && left.last_pending_unix_ms === right.last_pending_unix_ms
+    && left.silent_for_ms === right.silent_for_ms
+    && left.updated_unix_ms === right.updated_unix_ms
+    && left.last_error === right.last_error
+    && left.rotation_count === right.rotation_count
+  );
+}
+
+function reasonsEquivalent(leftReasons, rightReasons) {
+  if (leftReasons === rightReasons) {
+    return true;
+  }
+  if (!Array.isArray(leftReasons) || !Array.isArray(rightReasons)) {
+    return false;
+  }
+  if (leftReasons.length !== rightReasons.length) {
+    return false;
+  }
+  for (let index = 0; index < leftReasons.length; index += 1) {
+    if (leftReasons[index] !== rightReasons[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function opportunityEquivalent(left, right) {
+  return (
+    left.tx_hash === right.tx_hash
+    && left.status === right.status
+    && left.strategy === right.strategy
+    && left.score === right.score
+    && left.protocol === right.protocol
+    && left.category === right.category
+    && left.chain_id === right.chain_id
+    && left.source_id === right.source_id
+    && left.feature_engine_version === right.feature_engine_version
+    && left.scorer_version === right.scorer_version
+    && left.strategy_version === right.strategy_version
+    && left.detected_unix_ms === right.detected_unix_ms
+    && reasonsEquivalent(left.reasons, right.reasons)
+  );
 }
 
 function resolveStreamUrl(apiBase, afterSeqId) {
@@ -56,10 +187,13 @@ export function useDashboardLifecycleEffects({
   transactionDetailsByHash,
   closeDialog,
   followLatest,
+  recentTxRows,
   transactionRows,
   query,
   liveMainnetFilter,
+  recentTxRowsRef,
   transactionRowsRef,
+  transactionStoreRef,
   followLatestRef,
   latestSeqIdRef,
   reconnectAttemptsRef,
@@ -88,6 +222,10 @@ export function useDashboardLifecycleEffects({
   setDialogLoading,
   setDialogError,
 }) {
+  useEffect(() => {
+    recentTxRowsRef.current = recentTxRows;
+  }, [recentTxRows, recentTxRowsRef]);
+
   useEffect(() => {
     transactionRowsRef.current = transactionRows;
   }, [transactionRows, transactionRowsRef]);
@@ -138,17 +276,32 @@ export function useDashboardLifecycleEffects({
 
   useEffect(() => {
     let cancelled = false;
-    const snapshotPath = buildDashboardSnapshotPath(snapshotTxLimit);
+    const snapshotPath = buildDashboardSnapshotPath(
+      resolveDashboardSnapshotLimits({ activeScreen, snapshotTxLimit }),
+    );
+    let pendingTransactionCommit = null;
+    let transactionCommitTimer = null;
 
     const cleanupSocket = () => {
       if (streamSocketRef.current) {
         const socket = streamSocketRef.current;
         streamSocketRef.current = null;
-        socket.onopen = null;
         socket.onmessage = null;
         socket.onclose = null;
         socket.onerror = null;
-        socket.close();
+
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.onopen = () => {
+            socket.onopen = null;
+            socket.close();
+          };
+          return;
+        }
+
+        socket.onopen = null;
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+          socket.close();
+        }
       }
     };
 
@@ -166,6 +319,57 @@ export function useDashboardLifecycleEffects({
       }
     };
 
+    const clearTransactionCommitTimer = () => {
+      if (transactionCommitTimer) {
+        window.clearTimeout(transactionCommitTimer);
+        transactionCommitTimer = null;
+      }
+    };
+
+    const flushTransactionCommit = () => {
+      transactionCommitTimer = null;
+      if (cancelled || !pendingTransactionCommit) {
+        return;
+      }
+      const commit = pendingTransactionCommit;
+      pendingTransactionCommit = null;
+
+      setRecentTxRows(commit.recentTxRows);
+      setTransactionRows(commit.transactionRows);
+      setTransactionDetailsByHash((current) => {
+        const liveHashes = new Set(commit.transactionRows.map((row) => row.hash));
+        let changed = false;
+        const next = {};
+        for (const [hash, detail] of Object.entries(current)) {
+          if (liveHashes.has(hash)) {
+            next[hash] = detail;
+          } else {
+            changed = true;
+          }
+        }
+        if (!changed && Object.keys(next).length === Object.keys(current).length) {
+          return current;
+        }
+        return next;
+      });
+      setSelectedHash((current) => {
+        if (current && commit.transactionRows.some((row) => row.hash === current)) {
+          return current;
+        }
+        return commit.transactionRows[0]?.hash ?? null;
+      });
+    };
+
+    const queueTransactionCommit = (commit) => {
+      pendingTransactionCommit = commit;
+      if (transactionCommitTimer) {
+        return;
+      }
+      transactionCommitTimer = window.setTimeout(() => {
+        flushTransactionCommit();
+      }, transactionCommitBatchMs);
+    };
+
     const applySnapshot = (snapshot, sourceLabel) => {
       const replay = Array.isArray(snapshot?.replay) ? snapshot.replay : [];
       const propagation = Array.isArray(snapshot?.propagation) ? snapshot.propagation : [];
@@ -179,38 +383,74 @@ export function useDashboardLifecycleEffects({
       const txRecent = Array.isArray(snapshot?.transactions) ? snapshot.transactions : [];
       const chainStatus = normalizeChainStatusRows(snapshot?.chain_ingest_status);
 
-      const nextTransactions = mergeTransactionHistory(
+      const txSnapshot = transactionStoreRef.current.snapshot(txRecent, {
+        maxItems: maxTransactionHistory,
+        nowUnixMs: Date.now(),
+        maxAgeMs: transactionRetentionMs,
+      });
+      const nextTransactions = txSnapshot.rows;
+      const stabilizedTransactions = rowsReferenceEqual(
         transactionRowsRef.current,
-        txRecent,
-        maxTransactionHistory,
-        {
-          nowUnixMs: Date.now(),
-          maxAgeMs: transactionRetentionMs,
-        },
-      );
-      transactionRowsRef.current = nextTransactions;
+        nextTransactions,
+      )
+        ? transactionRowsRef.current
+        : nextTransactions;
+      transactionRowsRef.current = stabilizedTransactions;
 
-      setRecentTxRows(txRecent);
-      setTransactionRows(nextTransactions);
-      setTransactionDetailsByHash((current) => {
-        const liveHashes = new Set(nextTransactions.map((row) => row.hash));
-        const next = {};
-        for (const [hash, detail] of Object.entries(current)) {
-          if (liveHashes.has(hash)) {
-            next[hash] = detail;
-          }
+      const stabilizedRecentTxRows = stabilizeRows(
+        recentTxRowsRef.current,
+        txRecent,
+        (row) => row.hash,
+        txSummaryEquivalent,
+      );
+      recentTxRowsRef.current = stabilizedRecentTxRows;
+
+      queueTransactionCommit({
+        recentTxRows: stabilizedRecentTxRows,
+        transactionRows: stabilizedTransactions,
+      });
+      setReplayFrames((current) =>
+        stabilizeRows(current, replay, (row) => row.seq_hi, replayPointEquivalent),
+      );
+      setPropagationEdges((current) =>
+        stabilizeRows(
+          current,
+          propagation,
+          (row) => `${row.source}->${row.destination}`,
+          propagationEdgeEquivalent,
+        ),
+      );
+      setOpportunityRows((current) =>
+        stabilizeRows(current, opportunities, opportunityRowKey, opportunityEquivalent),
+      );
+      setFeatureSummaryRows((current) =>
+        stabilizeRows(
+          current,
+          featureSummary,
+          (row) => `${row.protocol}::${row.category}`,
+          featureSummaryEquivalent,
+        ),
+      );
+      setFeatureDetailRows((current) =>
+        stabilizeRows(current, featureDetails, (row) => row.hash, featureDetailEquivalent),
+      );
+      setChainStatusRows((current) =>
+        stabilizeRows(current, chainStatus, (row) => row.chain_key, chainStatusEquivalent),
+      );
+      setMarketStats((current) => {
+        const next = resolveMarketStatsSnapshot(snapshot?.market_stats, current);
+        if (
+          next.totalSignalVolume === current.totalSignalVolume
+          && next.totalTxCount === current.totalTxCount
+          && next.lowRiskCount === current.lowRiskCount
+          && next.mediumRiskCount === current.mediumRiskCount
+          && next.highRiskCount === current.highRiskCount
+          && next.successRate === current.successRate
+        ) {
+          return current;
         }
         return next;
       });
-      setReplayFrames(replay);
-      setPropagationEdges(propagation);
-      setOpportunityRows(opportunities);
-      setFeatureSummaryRows(featureSummary);
-      setFeatureDetailRows(featureDetails);
-      setChainStatusRows(chainStatus);
-      setMarketStats((current) =>
-        resolveMarketStatsSnapshot(snapshot?.market_stats, current),
-      );
 
       setTimelineIndex((current) => {
         if (!replay.length) {
@@ -222,12 +462,6 @@ export function useDashboardLifecycleEffects({
         return Math.min(current, replay.length - 1);
       });
 
-      setSelectedHash((current) => {
-        if (current && nextTransactions.some((row) => row.hash === current)) {
-          return current;
-        }
-        return nextTransactions[0]?.hash ?? null;
-      });
       setSelectedOpportunityKey((current) => {
         if (current && opportunities.some((row) => opportunityRowKey(row) === current)) {
           return current;
@@ -364,6 +598,8 @@ export function useDashboardLifecycleEffects({
     connectStream();
 
     return () => {
+      flushTransactionCommit();
+      clearTransactionCommitTimer();
       cancelled = true;
       clearReconnectTimer();
       clearSnapshotTimer();
@@ -371,12 +607,14 @@ export function useDashboardLifecycleEffects({
     };
   }, [
     apiBase,
+    activeScreen,
     followLatestRef,
     latestSeqIdRef,
     maxTransactionHistory,
     nextSnapshotAtRef,
     reconnectAttemptsRef,
     reconnectTimerRef,
+    recentTxRowsRef,
     setChainStatusRows,
     setFeatureDetailRows,
     setFeatureSummaryRows,
@@ -396,6 +634,7 @@ export function useDashboardLifecycleEffects({
     snapshotTimerRef,
     snapshotTxLimit,
     streamSocketRef,
+    transactionStoreRef,
     transactionRetentionMinutes,
     transactionRetentionMs,
     transactionRowsRef,

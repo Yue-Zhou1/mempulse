@@ -37,19 +37,18 @@ export function OpportunitiesScreen({ model, actions }) {
                   options={MAINNET_FILTER_OPTIONS}
                 />
               </div>
-              <div className="space-y-2" onClick={onOpportunityListClick}>
+              <ul className="space-y-2" onClick={onOpportunityListClick}>
                 {filteredOpportunityRows.map((opportunity) => {
                   const rowKey = opportunityRowKey(opportunity);
                   const isActive = selectedOpportunityKey === rowKey;
                   const tone = opportunityCandidateTone(opportunity, isActive);
                   const mainnet = resolveMainnetLabel(opportunity.chain_id, opportunity.source_id);
                   return (
-                    <button
-                      type="button"
+                    <li
                       key={rowKey}
                       data-opportunity-key={rowKey}
                       className={cn(
-                        'w-full cursor-pointer border p-3 text-left transition-colors',
+                        'w-full cursor-pointer list-none border p-3 text-left transition-colors',
                         tone.container,
                       )}
                     >
@@ -65,10 +64,10 @@ export function OpportunitiesScreen({ model, actions }) {
                       <div className={cn('news-mono mt-1 text-[11px] uppercase tracking-[0.1em]', tone.subtle)}>
                         tx {shortHex(opportunity.tx_hash, 14, 10)} · {formatRelativeTime(opportunity.detected_unix_ms)}
                       </div>
-                    </button>
+                    </li>
                   );
                 })}
-              </div>
+              </ul>
               {filteredOpportunityRows.length === 0 ? (
                 <div className="news-dotted-box mt-4 bg-[#fffdf7] p-6 text-sm text-zinc-700">
                   No opportunities available.

@@ -38,18 +38,14 @@ export function ReplayScreen({ model, actions }) {
   } = model;
 
   const {
-    refreshArchives,
+    onArchiveRefreshClick,
     onArchiveQueryChange,
     onArchiveMainnetFilterChange,
     onArchiveTxListClick,
-    onArchiveTxPagePrev,
     onArchiveTxPaginationClick,
-    onArchiveTxPageNext,
     onArchiveOppListClick,
-    onArchiveOppPagePrev,
     onArchiveOppPaginationClick,
-    onArchiveOppPageNext,
-    openTransactionByHash,
+    onInspectArchiveTxClick,
   } = actions;
 
   return (
@@ -60,17 +56,17 @@ export function ReplayScreen({ model, actions }) {
                   <div className="news-kicker">Archive Desk</div>
                   <h2 className="news-headline text-2xl font-bold">Historical Records</h2>
                 </div>
-                <button
-                  type="button"
-                  onClick={refreshArchives}
+                <div
+                  data-archive-refresh="true"
+                  data-disabled={archiveLoading ? 'true' : 'false'}
+                  onClick={onArchiveRefreshClick}
                   className={cn(
-                    'news-tab news-mono cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
-                    archiveLoading ? 'opacity-60' : '',
+                    'news-tab news-mono list-none px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors',
+                    archiveLoading ? 'news-tab-disabled' : 'cursor-pointer',
                   )}
-                  disabled={archiveLoading}
                 >
                   {archiveLoading ? 'Syncing' : 'Refresh'}
-                </button>
+                </div>
               </div>
 
               <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -114,9 +110,8 @@ export function ReplayScreen({ model, actions }) {
                       const mainnet = resolveMainnetLabel(row.chain_id, row.source_id);
                       const mainnetRowClasses = resolveMainnetRowClasses(mainnet);
                       return (
-                        <button
+                        <div
                           key={row.hash}
-                          type="button"
                           data-archive-tx-hash={row.hash}
                           className={cn(
                             'w-full cursor-pointer border px-3 py-2 text-left transition-colors',
@@ -134,7 +129,7 @@ export function ReplayScreen({ model, actions }) {
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', isActive ? 'text-zinc-300' : 'text-zinc-700')}>
                             {lifecycle} · mev {row.mev_score ?? '-'} · urgency {row.urgency_score ?? '-'}
                           </div>
-                        </button>
+                        </div>
                       );
                     })}
                     {archiveTxPageRows.length === 0 ? (
@@ -144,37 +139,40 @@ export function ReplayScreen({ model, actions }) {
                     ) : null}
                   </div>
                   <div className="mt-2 flex items-center justify-between border-t border-zinc-900 pt-2">
-                    <button
-                      type="button"
-                      onClick={onArchiveTxPagePrev}
-                      disabled={normalizedArchiveTxPage <= 1}
-                      className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      Prev
-                    </button>
-                    <div className="flex items-center gap-1" onClick={onArchiveTxPaginationClick}>
+                    <ul className="flex items-center gap-1" onClick={onArchiveTxPaginationClick}>
+                      <li
+                        data-archive-tx-page-action="prev"
+                        data-disabled={normalizedArchiveTxPage <= 1 ? 'true' : 'false'}
+                        className={cn(
+                          'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                          normalizedArchiveTxPage <= 1 ? 'news-tab-disabled' : 'cursor-pointer',
+                        )}
+                      >
+                        Prev
+                      </li>
                       {archiveTxPages.map((page) => (
-                        <button
+                        <li
                           key={`archive-tx-page-${page}`}
-                          type="button"
                           data-archive-tx-page={page}
                           className={cn(
-                            'news-tab news-mono cursor-pointer px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                            'news-tab news-mono cursor-pointer list-none px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
                             page === normalizedArchiveTxPage ? 'news-tab-active' : '',
                           )}
                         >
                           {page}
-                        </button>
+                        </li>
                       ))}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onArchiveTxPageNext}
-                      disabled={normalizedArchiveTxPage >= archiveTxPageCount}
-                      className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
+                      <li
+                        data-archive-tx-page-action="next"
+                        data-disabled={normalizedArchiveTxPage >= archiveTxPageCount ? 'true' : 'false'}
+                        className={cn(
+                          'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                          normalizedArchiveTxPage >= archiveTxPageCount ? 'news-tab-disabled' : 'cursor-pointer',
+                        )}
+                      >
                       Next
-                    </button>
+                      </li>
+                    </ul>
                   </div>
                 </div>
 
@@ -192,9 +190,8 @@ export function ReplayScreen({ model, actions }) {
                       const tone = opportunityCandidateTone(row, isActive);
                       const mainnet = resolveMainnetLabel(row.chain_id, row.source_id);
                       return (
-                        <button
+                        <div
                           key={rowKey}
-                          type="button"
                           data-archive-opp-key={rowKey}
                           className={cn('w-full cursor-pointer border px-3 py-2 text-left transition-colors', tone.container)}
                         >
@@ -210,7 +207,7 @@ export function ReplayScreen({ model, actions }) {
                           <div className={cn('news-mono mt-1 text-[10px] uppercase tracking-[0.1em]', tone.subtle)}>
                             tx {shortHex(row.tx_hash, 14, 10)} · {formatRelativeTime(row.detected_unix_ms)}
                           </div>
-                        </button>
+                        </div>
                       );
                     })}
                     {archiveOppPageRows.length === 0 ? (
@@ -220,37 +217,40 @@ export function ReplayScreen({ model, actions }) {
                     ) : null}
                   </div>
                   <div className="mt-2 flex items-center justify-between border-t border-zinc-900 pt-2">
-                    <button
-                      type="button"
-                      onClick={onArchiveOppPagePrev}
-                      disabled={normalizedArchiveOppPage <= 1}
-                      className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      Prev
-                    </button>
-                    <div className="flex items-center gap-1" onClick={onArchiveOppPaginationClick}>
+                    <ul className="flex items-center gap-1" onClick={onArchiveOppPaginationClick}>
+                      <li
+                        data-archive-opp-page-action="prev"
+                        data-disabled={normalizedArchiveOppPage <= 1 ? 'true' : 'false'}
+                        className={cn(
+                          'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                          normalizedArchiveOppPage <= 1 ? 'news-tab-disabled' : 'cursor-pointer',
+                        )}
+                      >
+                        Prev
+                      </li>
                       {archiveOppPages.map((page) => (
-                        <button
+                        <li
                           key={`archive-opp-page-${page}`}
-                          type="button"
                           data-archive-opp-page={page}
                           className={cn(
-                            'news-tab news-mono cursor-pointer px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                            'news-tab news-mono cursor-pointer list-none px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
                             page === normalizedArchiveOppPage ? 'news-tab-active' : '',
                           )}
                         >
                           {page}
-                        </button>
+                        </li>
                       ))}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onArchiveOppPageNext}
-                      disabled={normalizedArchiveOppPage >= archiveOppPageCount}
-                      className="news-tab news-mono cursor-pointer px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
+                      <li
+                        data-archive-opp-page-action="next"
+                        data-disabled={normalizedArchiveOppPage >= archiveOppPageCount ? 'true' : 'false'}
+                        className={cn(
+                          'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em]',
+                          normalizedArchiveOppPage >= archiveOppPageCount ? 'news-tab-disabled' : 'cursor-pointer',
+                        )}
+                      >
                       Next
-                    </button>
+                      </li>
+                    </ul>
                   </div>
                 </div>
               </div>
@@ -295,13 +295,13 @@ export function ReplayScreen({ model, actions }) {
                         <div>{selectedArchiveTx.peer ?? '-'}</div>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => openTransactionByHash(selectedArchiveTx.hash)}
-                      className="news-tab news-mono cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.12em]"
+                    <div
+                      data-inspect-hash={selectedArchiveTx.hash}
+                      onClick={onInspectArchiveTxClick}
+                      className="news-tab news-mono inline-flex cursor-pointer px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.12em]"
                     >
                       Inspect Tx Detail
-                    </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="mt-3 text-sm text-zinc-700">Select an archived transaction.</div>

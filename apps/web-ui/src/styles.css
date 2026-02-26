@@ -74,6 +74,7 @@ body {
 
 .news-mono {
   font-family: 'Courier Prime', 'Courier New', monospace;
+  font-variant-numeric: tabular-nums;
 }
 
 .news-tab {
@@ -91,6 +92,12 @@ body {
 .news-tab-active {
   background: #18181b;
   color: #f9f5ea;
+}
+
+.news-tab-disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+  pointer-events: none;
 }
 
 .news-chain-status-strip {
@@ -165,6 +172,7 @@ body {
   outline: none;
   cursor: pointer;
   transition: background-color 160ms ease;
+  user-select: none;
 }
 
 .news-filter-trigger:hover {
@@ -432,6 +440,17 @@ body {
 .news-tx-table {
   border-collapse: collapse;
   border-spacing: 0;
+}
+
+.news-tx-table thead th {
+  height: 2.3rem;
+  line-height: 1.05;
+}
+
+.news-tx-table tbody td {
+  height: 2.35rem;
+  line-height: 1.12;
+  vertical-align: middle;
 }
 
 .news-tx-row {

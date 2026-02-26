@@ -3,6 +3,7 @@ import { resolveApiBase } from '../../../network/api-base.js';
 import { readWindowRuntimeConfig, resolveUiRuntimeConfig } from '../domain/ui-config.js';
 import { createMarketStatsState } from '../domain/market-stats.js';
 import { normalizeScreenId } from '../domain/screen-mode.js';
+import { createTxLiveStore } from '../domain/tx-live-store.js';
 import { MAINNET_FILTER_ALL } from '../domain/mainnet-filter.js';
 import { getStoredApiBase, setStoredApiBase } from '../lib/dashboard-helpers.js';
 import { useArchiveRefresh } from './use-archive-refresh.js';
@@ -14,6 +15,7 @@ const tickerPageSize = 50;
 const tickerPageLimit = 10;
 const archiveTxPageSize = 40;
 const archiveOppPageSize = 20;
+const archiveFetchWindowPages = 12;
 
 export function useDashboardController() {
   const apiConfig = resolveApiBase({
@@ -40,9 +42,12 @@ export function useDashboardController() {
     snapshotTxLimit,
     detailCacheLimit,
     maxTransactionHistory,
+    maxRenderedTransactions,
     transactionRetentionMs,
     transactionRetentionMinutes,
   } = uiConfig;
+  const archiveTxFetchLimit = archiveTxPageSize * archiveFetchWindowPages;
+  const archiveOppFetchLimit = archiveOppPageSize * archiveFetchWindowPages;
 
   const [statusMessage, setStatusMessage] = useState('Connecting to API...');
   const [hasError, setHasError] = useState(false);
@@ -83,6 +88,8 @@ export function useDashboardController() {
   const [transactionDetailsByHash, setTransactionDetailsByHash] = useState({});
 
   const transactionRowsRef = useRef([]);
+  const recentTxRowsRef = useRef([]);
+  const transactionStoreRef = useRef(createTxLiveStore());
   const followLatestRef = useRef(followLatest);
   const latestSeqIdRef = useRef(0);
   const reconnectAttemptsRef = useRef(0);
@@ -102,6 +109,8 @@ export function useDashboardController() {
     setArchiveOppRows,
     setSelectedArchiveTxHash,
     setSelectedArchiveOppKey,
+    archiveTxFetchLimit,
+    archiveOppFetchLimit,
   });
 
   const derived = useDashboardDerivedState({
@@ -122,6 +131,7 @@ export function useDashboardController() {
     transactionPage,
     tickerPageSize,
     tickerPageLimit,
+    maxRenderedTransactions,
     archiveQuery,
     archiveMainnetFilter,
     archiveTxPage,
@@ -177,10 +187,13 @@ export function useDashboardController() {
     transactionDetailsByHash,
     closeDialog: actions.closeDialog,
     followLatest,
+    recentTxRows,
     transactionRows,
     query,
     liveMainnetFilter,
+    recentTxRowsRef,
     transactionRowsRef,
+    transactionStoreRef,
     followLatestRef,
     latestSeqIdRef,
     reconnectAttemptsRef,

@@ -87,8 +87,7 @@ export function NewspaperFilterSelect({
     >
       <span className="news-filter-label news-mono">{label}</span>
       <div className={cn('news-filter-dropdown', isOpen ? 'news-filter-dropdown-active' : '')}>
-        <button
-          type="button"
+        <div
           id={triggerId}
           aria-expanded={isOpen}
           aria-haspopup="listbox"
@@ -104,7 +103,7 @@ export function NewspaperFilterSelect({
           >
             ▼
           </span>
-        </button>
+        </div>
         <div
           id={menuId}
           role="listbox"
