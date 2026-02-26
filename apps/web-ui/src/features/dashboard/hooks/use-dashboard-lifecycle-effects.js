@@ -189,6 +189,8 @@ export function useDashboardLifecycleEffects({
   followLatest,
   recentTxRows,
   transactionRows,
+  query,
+  liveMainnetFilter,
   recentTxRowsRef,
   transactionRowsRef,
   transactionStoreRef,

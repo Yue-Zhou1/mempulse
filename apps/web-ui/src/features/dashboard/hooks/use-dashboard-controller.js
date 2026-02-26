@@ -189,6 +189,8 @@ export function useDashboardController() {
     followLatest,
     recentTxRows,
     transactionRows,
+    query,
+    liveMainnetFilter,
     recentTxRowsRef,
     transactionRowsRef,
     transactionStoreRef,
