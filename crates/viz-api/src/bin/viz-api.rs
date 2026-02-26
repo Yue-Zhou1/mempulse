@@ -15,7 +15,11 @@ async fn main() -> Result<()> {
     let runtime = runtime_builder
         .with_startup(move || {
             if matches!(ingest_mode, IngestMode::Rpc | IngestMode::Hybrid) {
-                start_live_rpc_feed(bootstrap.storage, bootstrap.writer, bootstrap.live_rpc_config);
+                start_live_rpc_feed(
+                    bootstrap.storage,
+                    bootstrap.writer,
+                    bootstrap.live_rpc_config,
+                );
             } else {
                 tracing::info!(
                     ingest_mode = %ingest_mode.as_str(),
@@ -102,5 +106,4 @@ mod tests {
         let filter = super::resolve_log_filter(Some("warn"));
         assert_eq!(filter, "warn,viz_api=info");
     }
-
 }

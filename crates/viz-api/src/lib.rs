@@ -48,8 +48,7 @@ pub struct AppState {
     pub api_auth: ApiAuthConfig,
     pub api_rate_limiter: ApiRateLimiter,
     pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
-    pub live_rpc_drop_metrics_provider:
-        Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+    pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -771,8 +770,8 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         );
     }
     let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
-    let live_rpc_chain_status_provider =
-        Arc::new(live_rpc_chain_status_snapshot) as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+    let live_rpc_chain_status_provider = Arc::new(live_rpc_chain_status_snapshot)
+        as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
     let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
         as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
 
@@ -1934,9 +1933,8 @@ mod tests {
 
     fn test_state(limit: usize) -> AppState {
         let api_auth = ApiAuthConfig::default();
-        let live_rpc_chain_status_provider =
-            Arc::new(|| Vec::<LiveRpcChainStatus>::new())
-                as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         AppState {
@@ -1953,9 +1951,8 @@ mod tests {
 
     fn test_state_with_relay(limit: usize, relay_status: RelayDryRunStatus) -> AppState {
         let api_auth = ApiAuthConfig::default();
-        let live_rpc_chain_status_provider =
-            Arc::new(|| Vec::<LiveRpcChainStatus>::new())
-                as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         AppState {

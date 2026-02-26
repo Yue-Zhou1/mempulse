@@ -125,7 +125,7 @@ fn build_test_app() -> axum::Router {
         alert_thresholds: AlertThresholdConfig::default(),
         api_auth: ApiAuthConfig::default(),
         api_rate_limiter: ApiRateLimiter::new(600),
-        live_rpc_chain_status_provider: Arc::new(|| Vec::<LiveRpcChainStatus>::new()),
+        live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
     };
     build_router(state)

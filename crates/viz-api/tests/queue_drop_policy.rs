@@ -71,7 +71,7 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
         alert_thresholds: AlertThresholdConfig::default(),
         api_auth: ApiAuthConfig::default(),
         api_rate_limiter: ApiRateLimiter::new(600),
-        live_rpc_chain_status_provider: Arc::new(|| Vec::<LiveRpcChainStatus>::new()),
+        live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(live_rpc_drop_metrics_snapshot)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
     };

@@ -2,7 +2,10 @@ use common::SourceId;
 use event_log::{EventPayload, TxSeen};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use storage::{EventStore, InMemoryStorage, NoopClickHouseSink, StorageWriteOp, StorageWriterConfig, spawn_single_writer};
+use storage::{
+    EventStore, InMemoryStorage, NoopClickHouseSink, StorageWriteOp, StorageWriterConfig,
+    spawn_single_writer,
+};
 
 fn hash(v: u8) -> [u8; 32] {
     [v; 32]
