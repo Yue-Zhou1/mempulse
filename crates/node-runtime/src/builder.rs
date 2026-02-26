@@ -10,6 +10,14 @@ pub enum IngestMode {
 }
 
 impl IngestMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::P2p => "p2p",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
     fn parse(raw: Option<&str>) -> Self {
         match raw.map(str::trim).map(str::to_ascii_lowercase) {
             Some(mode) if mode == "p2p" => Self::P2p,

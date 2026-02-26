@@ -3647,6 +3647,7 @@ dependencies = [
  "feature-engine",
  "futures",
  "hashbrown 0.16.1",
+ "node-runtime",
  "replay",
  "reqwest",
  "searcher",

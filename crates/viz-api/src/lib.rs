@@ -15,18 +15,19 @@ use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_aler
 use event_log::{EventEnvelope, EventPayload};
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
-    live_rpc_drop_metrics_snapshot, start_live_rpc_feed,
+    live_rpc_drop_metrics_snapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
 };
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
-    NoopClickHouseSink, StorageWriterConfig, spawn_single_writer,
+    NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
 };
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
@@ -49,6 +50,14 @@ pub struct AppState {
     pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
     pub live_rpc_drop_metrics_provider:
         Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeBootstrap {
+    pub storage: Arc<RwLock<InMemoryStorage>>,
+    pub writer: StorageWriteHandle,
+    pub live_rpc_config: LiveRpcConfig,
+    pub ingest_mode: IngestSourceMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -221,14 +230,14 @@ pub struct SimDetail {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IngestSourceMode {
+pub enum IngestSourceMode {
     Rpc,
     P2p,
     Hybrid,
 }
 
 impl IngestSourceMode {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             IngestSourceMode::Rpc => "rpc",
             IngestSourceMode::P2p => "p2p",
@@ -237,7 +246,7 @@ impl IngestSourceMode {
     }
 }
 
-fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
+pub fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
     match env_override.map(str::trim).map(str::to_ascii_lowercase) {
         Some(mode) if mode == "p2p" => IngestSourceMode::P2p,
         Some(mode) if mode == "hybrid" => IngestSourceMode::Hybrid,
@@ -720,7 +729,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-pub fn default_state() -> AppState {
+pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
     let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
         Ok(Some(sink)) => Arc::new(sink),
@@ -731,6 +740,14 @@ pub fn default_state() -> AppState {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
+    let live_rpc_config = match LiveRpcConfig::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse live rpc env overrides; using defaults");
+            LiveRpcConfig::default()
+        }
+    };
+    let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
     let propagation = vec![
         PropagationEdge {
@@ -746,7 +763,6 @@ pub fn default_state() -> AppState {
             p99_delay_ms: 36,
         },
     ];
-    let _ = writer;
 
     let api_auth = ApiAuthConfig::from_env();
     if api_auth.enabled && api_auth.api_keys.is_empty() {
@@ -760,8 +776,12 @@ pub fn default_state() -> AppState {
     let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
         as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
 
-    AppState {
-        provider: Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1)),
+    let state = AppState {
+        provider: Arc::new(InMemoryVizProvider::new(
+            storage.clone(),
+            Arc::new(propagation),
+            1,
+        )),
         downsample_limit: 1_000,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
@@ -769,7 +789,21 @@ pub fn default_state() -> AppState {
         api_rate_limiter,
         live_rpc_chain_status_provider,
         live_rpc_drop_metrics_provider,
-    }
+    };
+
+    (
+        state,
+        RuntimeBootstrap {
+            storage: storage.clone(),
+            writer,
+            live_rpc_config,
+            ingest_mode,
+        },
+    )
+}
+
+pub fn default_state() -> AppState {
+    default_state_with_runtime().0
 }
 
 #[cfg(test)]

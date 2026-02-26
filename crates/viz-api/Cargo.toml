@@ -13,6 +13,7 @@ event-log = { path = "../event-log" }
 feature-engine = { path = "../feature-engine" }
 futures = { workspace = true }
 hashbrown = { workspace = true }
+node-runtime = { path = "../node-runtime" }
 replay = { path = "../replay" }
 searcher = { path = "../searcher" }
 serde = { workspace = true }
