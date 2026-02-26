@@ -2,8 +2,7 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{
-    BundleSubmitted, EventEnvelope, EventPayload, OppDetected, SimCompleted, TxDecoded, TxFetched,
-    TxSeen,
+    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxDecoded, TxFetched, TxSeen,
 };
 use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
@@ -1232,21 +1231,21 @@ fn process_pending_hash_with_fetched_tx(
     }
 
     let tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
+    let tx_seen_mono_ns = tx_seen_seq_id.saturating_mul(1_000_000);
     if !try_enqueue_storage_write(
         writer,
         chain,
-        StorageWriteOp::AppendEvent(EventEnvelope {
-            seq_id: tx_seen_seq_id,
-            ingest_ts_unix_ms: now_unix_ms,
-            ingest_ts_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
+        StorageWriteOp::AppendPayload {
             source_id: chain.source_id.clone(),
+            ingest_ts_unix_ms: now_unix_ms,
+            ingest_ts_mono_ns: tx_seen_mono_ns,
             payload: EventPayload::TxSeen(TxSeen {
                 hash,
                 peer_id: "rpc-ws".to_owned(),
                 seen_at_unix_ms: now_unix_ms,
-                seen_at_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
+                seen_at_mono_ns: tx_seen_mono_ns,
             }),
-        }),
+        },
     )? {
         return Ok(());
     }
@@ -1257,7 +1256,7 @@ fn process_pending_hash_with_fetched_tx(
             hash,
             peer: "rpc-ws".to_owned(),
             first_seen_unix_ms: now_unix_ms,
-            first_seen_mono_ns: tx_seen_seq_id.saturating_mul(1_000_000),
+            first_seen_mono_ns: tx_seen_mono_ns,
             seen_count: 1,
         }),
     )? {
@@ -1345,16 +1344,9 @@ fn process_pending_hash_with_fetched_tx(
         for opportunity in
             build_opportunity_records(&decoded, &raw_tx, now_unix_ms, resolved_chain_id)
         {
-            let start_seq_id =
-                next_seq_id.fetch_add(rule_versioned_event_count() as u64, Ordering::Relaxed);
-            let events = build_rule_versioned_events(
-                start_seq_id,
-                now_unix_ms,
-                &chain.source_id,
-                &opportunity,
-            );
-            for event in events {
-                if !try_enqueue_storage_write(writer, chain, StorageWriteOp::AppendEvent(event))? {
+            let payloads = build_rule_versioned_payloads(&opportunity);
+            for payload in payloads {
+                if !append_event(writer, chain, next_seq_id, now_unix_ms, payload)? {
                     return Ok(());
                 }
             }
@@ -1382,13 +1374,12 @@ fn append_event(
     try_enqueue_storage_write(
         writer,
         chain,
-        StorageWriteOp::AppendEvent(EventEnvelope {
-            seq_id,
+        StorageWriteOp::AppendPayload {
+            source_id: chain.source_id.clone(),
             ingest_ts_unix_ms: now_unix_ms,
             ingest_ts_mono_ns: seq_id.saturating_mul(1_000_000),
-            source_id: chain.source_id.clone(),
             payload,
-        }),
+        },
     )
 }
 
@@ -1542,68 +1533,41 @@ fn build_opportunity_records(
     .collect()
 }
 
-fn rule_versioned_event_count() -> usize {
-    3
-}
-
-fn build_rule_versioned_events(
-    start_seq_id: u64,
-    now_unix_ms: i64,
-    source_id: &SourceId,
-    opportunity: &OpportunityRecord,
-) -> Vec<EventEnvelope> {
+fn build_rule_versioned_payloads(opportunity: &OpportunityRecord) -> Vec<EventPayload> {
     let hash_prefix = format_fixed_hex(&opportunity.tx_hash)[2..10].to_owned();
     let sim_id = format!("sim-{hash_prefix}-{}", opportunity.detected_unix_ms);
     let bundle_id = format!("bundle-{hash_prefix}-{}", opportunity.detected_unix_ms);
 
     vec![
-        EventEnvelope {
-            seq_id: start_seq_id,
-            ingest_ts_unix_ms: now_unix_ms,
-            ingest_ts_mono_ns: start_seq_id.saturating_mul(1_000_000),
-            source_id: source_id.clone(),
-            payload: EventPayload::OppDetected(OppDetected {
-                hash: opportunity.tx_hash,
-                strategy: opportunity.strategy.clone(),
-                score: opportunity.score,
-                protocol: opportunity.protocol.clone(),
-                category: opportunity.category.clone(),
-                feature_engine_version: opportunity.feature_engine_version.clone(),
-                scorer_version: opportunity.scorer_version.clone(),
-                strategy_version: opportunity.strategy_version.clone(),
-                reasons: opportunity.reasons.clone(),
-            }),
-        },
-        EventEnvelope {
-            seq_id: start_seq_id.saturating_add(1),
-            ingest_ts_unix_ms: now_unix_ms,
-            ingest_ts_mono_ns: start_seq_id.saturating_add(1).saturating_mul(1_000_000),
-            source_id: source_id.clone(),
-            payload: EventPayload::SimCompleted(SimCompleted {
-                hash: opportunity.tx_hash,
-                sim_id: sim_id.clone(),
-                status: "not_run".to_owned(),
-                feature_engine_version: opportunity.feature_engine_version.clone(),
-                scorer_version: opportunity.scorer_version.clone(),
-                strategy_version: opportunity.strategy_version.clone(),
-            }),
-        },
-        EventEnvelope {
-            seq_id: start_seq_id.saturating_add(2),
-            ingest_ts_unix_ms: now_unix_ms,
-            ingest_ts_mono_ns: start_seq_id.saturating_add(2).saturating_mul(1_000_000),
-            source_id: source_id.clone(),
-            payload: EventPayload::BundleSubmitted(BundleSubmitted {
-                hash: opportunity.tx_hash,
-                bundle_id,
-                sim_id,
-                relay: "not_submitted".to_owned(),
-                accepted: false,
-                feature_engine_version: opportunity.feature_engine_version.clone(),
-                scorer_version: opportunity.scorer_version.clone(),
-                strategy_version: opportunity.strategy_version.clone(),
-            }),
-        },
+        EventPayload::OppDetected(OppDetected {
+            hash: opportunity.tx_hash,
+            strategy: opportunity.strategy.clone(),
+            score: opportunity.score,
+            protocol: opportunity.protocol.clone(),
+            category: opportunity.category.clone(),
+            feature_engine_version: opportunity.feature_engine_version.clone(),
+            scorer_version: opportunity.scorer_version.clone(),
+            strategy_version: opportunity.strategy_version.clone(),
+            reasons: opportunity.reasons.clone(),
+        }),
+        EventPayload::SimCompleted(SimCompleted {
+            hash: opportunity.tx_hash,
+            sim_id: sim_id.clone(),
+            status: "not_run".to_owned(),
+            feature_engine_version: opportunity.feature_engine_version.clone(),
+            scorer_version: opportunity.scorer_version.clone(),
+            strategy_version: opportunity.strategy_version.clone(),
+        }),
+        EventPayload::BundleSubmitted(BundleSubmitted {
+            hash: opportunity.tx_hash,
+            bundle_id,
+            sim_id,
+            relay: "not_submitted".to_owned(),
+            accepted: false,
+            feature_engine_version: opportunity.feature_engine_version.clone(),
+            scorer_version: opportunity.scorer_version.clone(),
+            strategy_version: opportunity.strategy_version.clone(),
+        }),
     ]
 }
 
@@ -2135,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn build_rule_versioned_events_emits_opp_sim_and_bundle_with_same_versions() {
+    fn build_rule_versioned_payloads_emit_opp_sim_and_bundle_with_same_versions() {
         let tx_hash = [0x11; 32];
         let opportunity = OpportunityRecord {
             tx_hash,
@@ -2151,18 +2115,10 @@ mod tests {
             detected_unix_ms: 1_700_000_001_000,
         };
 
-        let events = build_rule_versioned_events(
-            41,
-            1_700_000_001_111,
-            &SourceId::new("rpc-live"),
-            &opportunity,
-        );
+        let events = build_rule_versioned_payloads(&opportunity);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].seq_id, 41);
-        assert_eq!(events[1].seq_id, 42);
-        assert_eq!(events[2].seq_id, 43);
 
-        match &events[0].payload {
+        match &events[0] {
             EventPayload::OppDetected(opp) => {
                 assert_eq!(opp.hash, tx_hash);
                 assert_eq!(
@@ -2175,7 +2131,7 @@ mod tests {
             other => panic!("expected OppDetected payload, got {other:?}"),
         }
 
-        match &events[1].payload {
+        match &events[1] {
             EventPayload::SimCompleted(sim) => {
                 assert_eq!(sim.hash, tx_hash);
                 assert_eq!(sim.status, "not_run");
@@ -2189,7 +2145,7 @@ mod tests {
             other => panic!("expected SimCompleted payload, got {other:?}"),
         }
 
-        match &events[2].payload {
+        match &events[2] {
             EventPayload::BundleSubmitted(bundle) => {
                 assert_eq!(bundle.hash, tx_hash);
                 assert!(!bundle.accepted);

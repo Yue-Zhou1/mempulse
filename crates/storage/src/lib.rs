@@ -5,7 +5,7 @@ mod wal;
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use common::{Address, PeerId, TxHash};
+use common::{Address, PeerId, SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, GlobalSequencer, cmp_deterministic};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
@@ -475,6 +475,12 @@ impl EventStore for InMemoryStorage {
 #[derive(Clone, Debug)]
 pub enum StorageWriteOp {
     AppendEvent(EventEnvelope),
+    AppendPayload {
+        source_id: SourceId,
+        payload: EventPayload,
+        ingest_ts_unix_ms: i64,
+        ingest_ts_mono_ns: u64,
+    },
     UpsertTxSeen(TxSeenRecord),
     UpsertTxFull(TxFullRecord),
     UpsertTxFeatures(TxFeaturesRecord),
@@ -717,6 +723,27 @@ fn apply_write_op(
     match op {
         StorageWriteOp::AppendEvent(event) => {
             let event = sequencer.assign(event);
+            if let Some(wal) = wal
+                && let Err(err) = wal.append_event(&event)
+            {
+                tracing::warn!(error = %err, "failed to append event to storage WAL");
+            }
+            storage.append_event(event.clone());
+            batch.push(event);
+        }
+        StorageWriteOp::AppendPayload {
+            source_id,
+            payload,
+            ingest_ts_unix_ms,
+            ingest_ts_mono_ns,
+        } => {
+            let event = sequencer.assign(EventEnvelope {
+                seq_id: 0,
+                ingest_ts_unix_ms,
+                ingest_ts_mono_ns,
+                source_id,
+                payload,
+            });
             if let Some(wal) = wal
                 && let Err(err) = wal.append_event(&event)
             {
