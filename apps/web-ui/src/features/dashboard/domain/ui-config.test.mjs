@@ -76,3 +76,18 @@ test('resolveUiRuntimeConfig clamps invalid values and render does not exceed hi
   assert.equal(config.transactionRetentionMs, 30_000);
   assert.equal(config.transactionRetentionMinutes, 1);
 });
+
+test('resolveUiRuntimeConfig ignores blank runtime values and falls back to env/defaults', () => {
+  const config = resolveUiRuntimeConfig({
+    runtime: {
+      txSnapshotLimit: '   ',
+      txRenderLimit: null,
+    },
+    env: {
+      VITE_UI_TX_SNAPSHOT_LIMIT: '150',
+    },
+  });
+
+  assert.equal(config.snapshotTxLimit, 150);
+  assert.equal(config.maxRenderedTransactions, 80);
+});

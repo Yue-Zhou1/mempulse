@@ -5,6 +5,7 @@ import { createMarketStatsState, resolveMarketStatsSnapshot } from './market-sta
 test('resolveMarketStatsSnapshot returns defaults when payload is missing', () => {
   assert.deepEqual(resolveMarketStatsSnapshot(undefined), createMarketStatsState());
   assert.deepEqual(resolveMarketStatsSnapshot(null), createMarketStatsState());
+
   const fallback = {
     totalSignalVolume: 10,
     totalTxCount: 11,
@@ -46,4 +47,24 @@ test('resolveMarketStatsSnapshot derives success rate when bps is missing', () =
   });
 
   assert.equal(stats.successRate, 95);
+});
+
+test('resolveMarketStatsSnapshot clamps negative and invalid values', () => {
+  const stats = resolveMarketStatsSnapshot({
+    total_signal_volume: -10,
+    total_tx_count: 'abc',
+    low_risk_count: -1,
+    medium_risk_count: 3.7,
+    high_risk_count: null,
+    success_rate_bps: 20_000,
+  });
+
+  assert.deepEqual(stats, {
+    totalSignalVolume: 0,
+    totalTxCount: 0,
+    lowRiskCount: 0,
+    mediumRiskCount: 3,
+    highRiskCount: 0,
+    successRate: 100,
+  });
 });

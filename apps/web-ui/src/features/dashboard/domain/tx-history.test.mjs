@@ -38,9 +38,9 @@ test('mergeTransactionHistory enforces max item cap', () => {
   );
 });
 
-test('mergeTransactionHistory returns empty rows when max is zero', () => {
-  const merged = mergeTransactionHistory([{ hash: '0x01' }], [{ hash: '0x02' }], 0);
-  assert.deepEqual(merged, []);
+test('mergeTransactionHistory returns empty rows when max is zero or invalid', () => {
+  assert.deepEqual(mergeTransactionHistory([{ hash: '0x01' }], [{ hash: '0x02' }], 0), []);
+  assert.deepEqual(mergeTransactionHistory([{ hash: '0x01' }], [{ hash: '0x02' }], Number.NaN), []);
 });
 
 test('mergeTransactionHistory prunes rows older than the live window', () => {

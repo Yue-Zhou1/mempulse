@@ -9,19 +9,21 @@ import {
 } from './mainnet-filter.js';
 
 test('normalizeMainnetFilter falls back to all for invalid values', () => {
-  assert.equal(normalizeMainnetFilter(''), MAINNET_FILTER_ALL);
-  assert.equal(normalizeMainnetFilter(null), MAINNET_FILTER_ALL);
-  assert.equal(normalizeMainnetFilter('not-a-chain'), MAINNET_FILTER_ALL);
+  for (const input of ['', null, undefined, 'not-a-chain']) {
+    assert.equal(normalizeMainnetFilter(input), MAINNET_FILTER_ALL);
+  }
 });
 
 test('normalizeMainnetFilter accepts known labels case-insensitively', () => {
   assert.equal(normalizeMainnetFilter('ethereum'), 'Ethereum');
   assert.equal(normalizeMainnetFilter('BASE'), 'Base');
+  assert.equal(normalizeMainnetFilter(' optimism '), 'Optimism');
 });
 
 test('matchesMainnetFilter returns true for all filter', () => {
-  assert.equal(matchesMainnetFilter('Ethereum', MAINNET_FILTER_ALL), true);
-  assert.equal(matchesMainnetFilter('Base', MAINNET_FILTER_ALL), true);
+  for (const mainnet of ['Ethereum', 'Base', 'Optimism']) {
+    assert.equal(matchesMainnetFilter(mainnet, MAINNET_FILTER_ALL), true);
+  }
 });
 
 test('matchesMainnetFilter requires exact mainnet label for specific filter', () => {

@@ -1,3 +1,11 @@
+const METRIC_FIELDS = Object.freeze([
+  Object.freeze({ stateKey: 'totalSignalVolume', rawKey: 'total_signal_volume' }),
+  Object.freeze({ stateKey: 'totalTxCount', rawKey: 'total_tx_count' }),
+  Object.freeze({ stateKey: 'lowRiskCount', rawKey: 'low_risk_count' }),
+  Object.freeze({ stateKey: 'mediumRiskCount', rawKey: 'medium_risk_count' }),
+  Object.freeze({ stateKey: 'highRiskCount', rawKey: 'high_risk_count' }),
+]);
+
 function toNonNegativeInt(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -38,19 +46,10 @@ export function resolveMarketStatsSnapshot(rawStats, fallbackState = createMarke
     return fallback;
   }
 
-  const totalSignalVolume = toNonNegativeInt(rawStats.total_signal_volume);
-  const totalTxCount = toNonNegativeInt(rawStats.total_tx_count);
-  const lowRiskCount = toNonNegativeInt(rawStats.low_risk_count);
-  const mediumRiskCount = toNonNegativeInt(rawStats.medium_risk_count);
-  const highRiskCount = toNonNegativeInt(rawStats.high_risk_count);
-  const successRate = toSuccessRate(rawStats.success_rate_bps, totalTxCount, highRiskCount);
-
-  return {
-    totalSignalVolume,
-    totalTxCount,
-    lowRiskCount,
-    mediumRiskCount,
-    highRiskCount,
-    successRate,
-  };
+  const next = {};
+  for (const field of METRIC_FIELDS) {
+    next[field.stateKey] = toNonNegativeInt(rawStats[field.rawKey]);
+  }
+  next.successRate = toSuccessRate(rawStats.success_rate_bps, next.totalTxCount, next.highRiskCount);
+  return next;
 }
