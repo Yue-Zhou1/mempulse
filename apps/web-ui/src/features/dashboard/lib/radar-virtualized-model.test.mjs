@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildVirtualizedTickerRows,
+  rowsFromVirtualizedModels,
   resolveVirtualizedSelectionIndex,
 } from './radar-virtualized-model.js';
 
@@ -55,4 +56,16 @@ test('resolveVirtualizedSelectionIndex accounts for visible window offset', () =
 
   assert.equal(resolveVirtualizedSelectionIndex(rows, '0x03', 40), 42);
   assert.equal(resolveVirtualizedSelectionIndex(rows, '0xmissing', 40), -1);
+});
+
+test('rowsFromVirtualizedModels drops padded null slots', () => {
+  const sourceRows = [
+    { hash: '0xaaa', sender: '0x1' },
+    { hash: '0xbbb', sender: '0x2' },
+  ];
+  const virtualizedRows = buildVirtualizedTickerRows(sourceRows, 5);
+
+  const rows = rowsFromVirtualizedModels(virtualizedRows);
+
+  assert.deepEqual(rows, sourceRows);
 });

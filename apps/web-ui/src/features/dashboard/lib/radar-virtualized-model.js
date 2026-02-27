@@ -45,6 +45,19 @@ export function buildVirtualizedTickerRows(
   return previous && reusedCount === size ? previous : models;
 }
 
+export function rowsFromVirtualizedModels(rowModels) {
+  if (!Array.isArray(rowModels)) {
+    return [];
+  }
+  const rows = [];
+  for (const model of rowModels) {
+    if (model?.row) {
+      rows.push(model.row);
+    }
+  }
+  return rows;
+}
+
 export function resolveVirtualizedSelectionIndex(rows, selectedHash, visibleOffset = 0) {
   if (!Array.isArray(rows) || !selectedHash) {
     return -1;

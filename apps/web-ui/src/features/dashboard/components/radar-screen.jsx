@@ -9,6 +9,7 @@ import {
   statusBadgeClass,
   statusForRow,
 } from '../lib/dashboard-helpers.js';
+import { rowsFromVirtualizedModels } from '../lib/radar-virtualized-model.js';
 import { NewspaperFilterSelect } from './newspaper-filter-select.jsx';
 import { RadarVirtualizedTable } from './radar-virtualized-table.jsx';
 import { RollingInt, RollingPercent } from './rolling-number.jsx';
@@ -54,6 +55,7 @@ export function RadarScreen({ model, actions }) {
     onTickerListClick,
     onTransactionPaginationClick,
   } = actions;
+  const nonVirtualizedTickerRows = rowsFromVirtualizedModels(virtualizedTickerRows);
 
   return (
           <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 overflow-hidden bg-[#f7f1e6] p-4 lg:grid-cols-[minmax(0,1fr)_minmax(360px,420px)] xl:grid-cols-[minmax(0,1fr)_460px]">
@@ -144,8 +146,7 @@ export function RadarScreen({ model, actions }) {
                           </tr>
                         </thead>
                         <tbody>
-                          {virtualizedTickerRows.map((rowModel) => {
-                            const row = rowModel.row;
+                          {nonVirtualizedTickerRows.map((row) => {
                             const feature = featureByHash.get(row.hash);
                             const status = statusForRow(feature);
                             const risk = classifyRisk(feature);
