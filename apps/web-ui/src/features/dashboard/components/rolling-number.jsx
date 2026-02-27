@@ -1,75 +1,100 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { createRollingNumberAnimator } from '../lib/rolling-number-animator.js';
 
-function easeOutCubic(progress) {
-  return 1 - (1 - progress) ** 3;
-}
+const INT_NUMBER_FORMATTER = new Intl.NumberFormat();
 
-function useRollingNumber(value, options = {}) {
+function useRollingNumber(value, formatValue, options = {}) {
   const durationMs = Number.isFinite(options.durationMs)
     ? Math.max(120, Math.floor(options.durationMs))
     : 520;
   const sanitizedTarget = Number.isFinite(value) ? value : 0;
-  const [displayValue, setDisplayValue] = useState(sanitizedTarget);
   const displayValueRef = useRef(sanitizedTarget);
-  const frameRef = useRef(null);
+  const spanRef = useRef(null);
+  const animatorRef = useRef(null);
+  const stopAnimationRef = useRef(null);
+  const lastRenderedTextRef = useRef(formatValue(sanitizedTarget));
+
+  if (!animatorRef.current) {
+    animatorRef.current = createRollingNumberAnimator();
+  }
 
   useEffect(() => {
-    displayValueRef.current = displayValue;
-  }, [displayValue]);
-
-  useEffect(() => {
-    const fromValue = displayValueRef.current;
-    if (sanitizedTarget <= fromValue) {
-      if (frameRef.current) {
-        window.cancelAnimationFrame(frameRef.current);
-        frameRef.current = null;
-      }
-      displayValueRef.current = sanitizedTarget;
-      setDisplayValue(sanitizedTarget);
+    const node = spanRef.current;
+    if (!node) {
       return undefined;
     }
 
-    let startTs = null;
-    const delta = sanitizedTarget - fromValue;
-
-    const tick = (ts) => {
-      if (startTs == null) {
-        startTs = ts;
-      }
-      const progress = Math.min(1, (ts - startTs) / durationMs);
-      const nextValue = fromValue + delta * easeOutCubic(progress);
+    const updateDisplay = (nextValue) => {
       displayValueRef.current = nextValue;
-      setDisplayValue(nextValue);
-      if (progress < 1) {
-        frameRef.current = window.requestAnimationFrame(tick);
-      } else {
-        frameRef.current = null;
+      const text = formatValue(nextValue);
+      if (text === lastRenderedTextRef.current) {
+        return;
       }
+      node.textContent = text;
+      lastRenderedTextRef.current = text;
     };
 
-    frameRef.current = window.requestAnimationFrame(tick);
+    const fromValue = displayValueRef.current;
+    if (sanitizedTarget <= fromValue) {
+      if (typeof stopAnimationRef.current === 'function') {
+        stopAnimationRef.current();
+      }
+      updateDisplay(sanitizedTarget);
+      return undefined;
+    }
+
+    if (typeof stopAnimationRef.current === 'function') {
+      stopAnimationRef.current();
+    }
+    stopAnimationRef.current = animatorRef.current.start({
+      fromValue,
+      toValue: sanitizedTarget,
+      durationMs,
+      onUpdate: updateDisplay,
+      onComplete: updateDisplay,
+    });
+
     return () => {
-      if (frameRef.current) {
-        window.cancelAnimationFrame(frameRef.current);
-        frameRef.current = null;
+      if (typeof stopAnimationRef.current === 'function') {
+        stopAnimationRef.current();
+        stopAnimationRef.current = null;
       }
     };
-  }, [durationMs, sanitizedTarget]);
+  }, [durationMs, formatValue, sanitizedTarget]);
 
-  return displayValue;
+  const initialText = useMemo(
+    () => formatValue(sanitizedTarget),
+    [formatValue, sanitizedTarget],
+  );
+
+  return {
+    spanRef,
+    initialText,
+  };
 }
 
 export function RollingInt({ value, durationMs = 520, className }) {
-  const display = useRollingNumber(value, { durationMs });
-  return <span className={className}>{Math.round(display).toLocaleString()}</span>;
+  const formatValue = useCallback(
+    (nextValue) => INT_NUMBER_FORMATTER.format(Math.round(Number(nextValue) || 0)),
+    [],
+  );
+  const { spanRef, initialText } = useRollingNumber(value, formatValue, { durationMs });
+  return (
+    <span ref={spanRef} className={className}>
+      {initialText}
+    </span>
+  );
 }
 
 export function RollingPercent({ value, durationMs = 520, className, suffix = '%' }) {
-  const display = useRollingNumber(value, { durationMs });
+  const formatValue = useCallback(
+    (nextValue) => `${(Number(nextValue) || 0).toFixed(1)}${suffix}`,
+    [suffix],
+  );
+  const { spanRef, initialText } = useRollingNumber(value, formatValue, { durationMs });
   return (
-    <span className={className}>
-      {display.toFixed(1)}
-      {suffix}
+    <span ref={spanRef} className={className}>
+      {initialText}
     </span>
   );
 }

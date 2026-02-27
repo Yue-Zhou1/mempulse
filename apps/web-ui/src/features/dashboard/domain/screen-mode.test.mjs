@@ -8,11 +8,11 @@ test('normalizeScreenId defaults to radar for unknown values', () => {
   }
 });
 
-test('normalizeScreenId accepts radar, opps, and replay', () => {
-  assert.deepEqual(screenIds, ['radar', 'opps', 'replay']);
+test('normalizeScreenId accepts radar and opps only', () => {
+  assert.deepEqual(screenIds, ['radar', 'opps']);
   assert.equal(normalizeScreenId('radar'), 'radar');
   assert.equal(normalizeScreenId('opps'), 'opps');
-  assert.equal(normalizeScreenId('replay'), 'replay');
+  assert.equal(normalizeScreenId('replay'), 'radar');
 });
 
 test('normalizeScreenId trims and lowercases input', () => {

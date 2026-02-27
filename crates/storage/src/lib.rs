@@ -129,6 +129,13 @@ pub struct RecentTransactionRecord {
     pub source_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FeatureSummaryBucket {
+    pub protocol: String,
+    pub category: String,
+    pub count: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MarketStatsSnapshot {
     pub total_signal_volume: u64,
@@ -159,10 +166,19 @@ pub struct InMemoryStorage {
     events: VecDeque<EventEnvelope>,
     event_index: Vec<EventEnvelope>,
     tx_seen: VecDeque<TxSeenRecord>,
+    tx_seen_counts: FastMap<TxHash, usize>,
+    tx_seen_lookup: FastMap<TxHash, TxSeenRecord>,
     tx_full: VecDeque<TxFullRecord>,
+    tx_full_counts: FastMap<TxHash, usize>,
+    tx_full_lookup: FastMap<TxHash, TxFullRecord>,
     tx_features: VecDeque<TxFeaturesRecord>,
+    tx_features_counts: FastMap<TxHash, usize>,
+    tx_features_lookup: FastMap<TxHash, TxFeaturesRecord>,
+    feature_summary_counts: FastMap<(String, String), u64>,
     opportunities: VecDeque<OpportunityRecord>,
     tx_lifecycle: VecDeque<TxLifecycleRecord>,
+    tx_lifecycle_counts: FastMap<TxHash, usize>,
+    tx_lifecycle_lookup: FastMap<TxHash, TxLifecycleRecord>,
     peer_stats: VecDeque<PeerStatsRecord>,
     write_latency_ns: VecDeque<u64>,
     recent_tx_order: VecDeque<TxHash>,
@@ -192,10 +208,19 @@ impl InMemoryStorage {
             events: VecDeque::new(),
             event_index: Vec::new(),
             tx_seen: VecDeque::new(),
+            tx_seen_counts: FastMap::default(),
+            tx_seen_lookup: FastMap::default(),
             tx_full: VecDeque::new(),
+            tx_full_counts: FastMap::default(),
+            tx_full_lookup: FastMap::default(),
             tx_features: VecDeque::new(),
+            tx_features_counts: FastMap::default(),
+            tx_features_lookup: FastMap::default(),
+            feature_summary_counts: FastMap::default(),
             opportunities: VecDeque::new(),
             tx_lifecycle: VecDeque::new(),
+            tx_lifecycle_counts: FastMap::default(),
+            tx_lifecycle_lookup: FastMap::default(),
             peer_stats: VecDeque::new(),
             write_latency_ns: VecDeque::new(),
             recent_tx_order: VecDeque::new(),
@@ -208,7 +233,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_seen(&mut self, record: TxSeenRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_seen, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_seen,
+            &mut self.tx_seen_counts,
+            &mut self.tx_seen_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.market_stats.total_tx_count = self.market_stats.total_tx_count.saturating_add(1);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
@@ -216,7 +248,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_full(&mut self, record: TxFullRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_full, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_full,
+            &mut self.tx_full_counts,
+            &mut self.tx_full_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }
@@ -224,7 +263,33 @@ impl InMemoryStorage {
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
         let start = Instant::now();
         let mev_score = record.mev_score;
-        push_bounded(&mut self.tx_features, record, self.config.table_capacity);
+        let hash = record.hash;
+        if let Some(previous) = self.tx_features_lookup.get(&hash).cloned() {
+            self.decrement_feature_summary_count(&previous.protocol, &previous.category);
+        }
+        self.increment_feature_summary_count(&record.protocol, &record.category);
+        self.tx_features.push_back(record.clone());
+        *self.tx_features_counts.entry(hash).or_insert(0) += 1;
+        self.tx_features_lookup.insert(hash, record);
+
+        while self.tx_features.len() > self.config.table_capacity {
+            if let Some(evicted) = self.tx_features.pop_front() {
+                let evicted_hash = evicted.hash;
+                if let Some(count) = self.tx_features_counts.get_mut(&evicted_hash) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.tx_features_counts.remove(&evicted_hash);
+                        if let Some(removed_latest) = self.tx_features_lookup.remove(&evicted_hash)
+                        {
+                            self.decrement_feature_summary_count(
+                                &removed_latest.protocol,
+                                &removed_latest.category,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.market_stats.total_signal_volume =
             self.market_stats.total_signal_volume.saturating_add(1);
         if mev_score >= 80 {
@@ -248,7 +313,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_lifecycle, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_lifecycle,
+            &mut self.tx_lifecycle_counts,
+            &mut self.tx_lifecycle_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }
@@ -264,12 +336,24 @@ impl InMemoryStorage {
         &self.tx_seen
     }
 
+    pub fn tx_seen_by_hash(&self, hash: &TxHash) -> Option<&TxSeenRecord> {
+        self.tx_seen_lookup.get(hash)
+    }
+
     pub fn tx_full(&self) -> &VecDeque<TxFullRecord> {
         &self.tx_full
     }
 
+    pub fn tx_full_by_hash(&self, hash: &TxHash) -> Option<&TxFullRecord> {
+        self.tx_full_lookup.get(hash)
+    }
+
     pub fn tx_features(&self) -> &VecDeque<TxFeaturesRecord> {
         &self.tx_features
+    }
+
+    pub fn tx_features_by_hash(&self, hash: &TxHash) -> Option<&TxFeaturesRecord> {
+        self.tx_features_lookup.get(hash)
     }
 
     pub fn opportunities(&self) -> Vec<OpportunityRecord> {
@@ -283,8 +367,70 @@ impl InMemoryStorage {
         out
     }
 
+    pub fn dashboard_feature_summary(&self, limit: usize) -> Vec<FeatureSummaryBucket> {
+        let target = limit.max(1);
+        let mut out = self
+            .feature_summary_counts
+            .iter()
+            .map(|((protocol, category), count)| FeatureSummaryBucket {
+                protocol: protocol.clone(),
+                category: category.clone(),
+                count: *count,
+            })
+            .collect::<Vec<_>>();
+        out.sort_unstable_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.protocol.cmp(&right.protocol))
+                .then_with(|| left.category.cmp(&right.category))
+        });
+        out.truncate(target);
+        out
+    }
+
+    pub fn dashboard_feature_details_recent(&self, limit: usize) -> Vec<TxFeaturesRecord> {
+        let target = limit.max(1);
+        let mut out = Vec::with_capacity(target);
+        let mut emitted_hashes: FastSet<TxHash> = FastSet::default();
+
+        for row in self.tx_features.iter().rev() {
+            if !emitted_hashes.insert(row.hash) {
+                continue;
+            }
+            out.push(row.clone());
+            if out.len() >= target {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn dashboard_opportunities_recent(
+        &self,
+        limit: usize,
+        min_score: u32,
+    ) -> Vec<OpportunityRecord> {
+        let target = limit.max(1);
+        let mut out = Vec::with_capacity(target);
+        for row in self.opportunities.iter().rev() {
+            if row.score < min_score {
+                continue;
+            }
+            out.push(row.clone());
+            if out.len() >= target {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn tx_lifecycle(&self) -> &VecDeque<TxLifecycleRecord> {
         &self.tx_lifecycle
+    }
+
+    pub fn tx_lifecycle_by_hash(&self, hash: &TxHash) -> Option<&TxLifecycleRecord> {
+        self.tx_lifecycle_lookup.get(hash)
     }
 
     pub fn peer_stats(&self) -> &VecDeque<PeerStatsRecord> {
@@ -363,6 +509,21 @@ impl InMemoryStorage {
         );
     }
 
+    fn increment_feature_summary_count(&mut self, protocol: &str, category: &str) {
+        let key = (protocol.to_owned(), category.to_owned());
+        *self.feature_summary_counts.entry(key).or_insert(0) += 1;
+    }
+
+    fn decrement_feature_summary_count(&mut self, protocol: &str, category: &str) {
+        let key = (protocol.to_owned(), category.to_owned());
+        if let Some(count) = self.feature_summary_counts.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.feature_summary_counts.remove(&key);
+            }
+        }
+    }
+
     fn bump_read_model_revision(&mut self) {
         self.read_model_revision = self.read_model_revision.saturating_add(1);
     }
@@ -438,10 +599,18 @@ impl EventStore for InMemoryStorage {
             self.upsert_tx_lifecycle(record);
         }
 
-        let insert_at = self
-            .event_index
-            .partition_point(|existing| cmp_deterministic(existing, &event).is_lt());
-        self.event_index.insert(insert_at, event.clone());
+        let append_to_tail = match self.event_index.last() {
+            None => true,
+            Some(last) => !cmp_deterministic(last, &event).is_gt(),
+        };
+        if append_to_tail {
+            self.event_index.push(event.clone());
+        } else {
+            let insert_at = self
+                .event_index
+                .partition_point(|existing| cmp_deterministic(existing, &event).is_lt());
+            self.event_index.insert(insert_at, event.clone());
+        }
         self.events.push_back(event);
         while self.events.len() > self.config.event_capacity {
             if let Some(old_event) = self.events.pop_front() {
@@ -786,6 +955,37 @@ fn push_bounded<T>(deque: &mut VecDeque<T>, value: T, capacity: usize) {
     }
 }
 
+fn push_bounded_hash_indexed<T, FHash>(
+    deque: &mut VecDeque<T>,
+    counts: &mut FastMap<TxHash, usize>,
+    lookup: &mut FastMap<TxHash, T>,
+    value: T,
+    capacity: usize,
+    hash_of: FHash,
+) where
+    T: Clone,
+    FHash: Fn(&T) -> TxHash,
+{
+    let value_hash = hash_of(&value);
+    deque.push_back(value.clone());
+    *counts.entry(value_hash).or_insert(0) += 1;
+    lookup.insert(value_hash, value);
+
+    while deque.len() > capacity {
+        let Some(evicted) = deque.pop_front() else {
+            break;
+        };
+        let evicted_hash = hash_of(&evicted);
+        if let Some(count) = counts.get_mut(&evicted_hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&evicted_hash);
+                lookup.remove(&evicted_hash);
+            }
+        }
+    }
+}
+
 fn remove_event_from_sorted_index(events: &mut Vec<EventEnvelope>, target: &EventEnvelope) {
     let mut index = match events.binary_search_by(|existing| cmp_deterministic(existing, target)) {
         Ok(index) => index,
@@ -1007,6 +1207,59 @@ mod tests {
         assert_eq!(store.tx_lifecycle().len(), 1);
         assert_eq!(store.peer_stats().len(), 1);
         assert!(store.avg_write_latency_ns().is_some());
+        assert_eq!(
+            store.tx_seen_by_hash(&hash(1)).map(|row| row.seen_count),
+            Some(1)
+        );
+        assert_eq!(
+            store.tx_full_by_hash(&hash(1)).map(|row| row.nonce),
+            Some(1)
+        );
+        assert_eq!(
+            store.tx_features_by_hash(&hash(1)).map(|row| row.mev_score),
+            Some(80)
+        );
+        assert_eq!(
+            store
+                .tx_lifecycle_by_hash(&hash(1))
+                .map(|row| row.status.as_str()),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn hash_indexes_evict_entries_when_rows_fall_out_of_capacity() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            table_capacity: 2,
+            ..StorageConfig::default()
+        });
+
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(1),
+            peer: "peer-a".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_000,
+            first_seen_mono_ns: 10,
+            seen_count: 1,
+        });
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(2),
+            peer: "peer-b".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_010,
+            first_seen_mono_ns: 20,
+            seen_count: 1,
+        });
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(3),
+            peer: "peer-c".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_020,
+            first_seen_mono_ns: 30,
+            seen_count: 1,
+        });
+
+        assert_eq!(store.tx_seen().len(), 2);
+        assert!(store.tx_seen_by_hash(&hash(1)).is_none());
+        assert!(store.tx_seen_by_hash(&hash(2)).is_some());
+        assert!(store.tx_seen_by_hash(&hash(3)).is_some());
     }
 
     #[test]
@@ -1382,6 +1635,71 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tx_hash, hash(3));
         assert_eq!(rows[1].tx_hash, hash(2));
+    }
+
+    #[test]
+    fn dashboard_feature_summary_tracks_latest_feature_by_hash_and_eviction() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            event_capacity: 100,
+            recent_tx_capacity: 100,
+            table_capacity: 2,
+            write_latency_capacity: 100,
+        });
+
+        store.upsert_tx_features(TxFeaturesRecord {
+            hash: hash(1),
+            chain_id: Some(1),
+            protocol: "uniswap-v2".to_owned(),
+            category: "swap".to_owned(),
+            mev_score: 80,
+            urgency_score: 10,
+            method_selector: None,
+            feature_engine_version: "feature-engine.v1".to_owned(),
+        });
+        store.upsert_tx_features(TxFeaturesRecord {
+            hash: hash(1),
+            chain_id: Some(1),
+            protocol: "curve".to_owned(),
+            category: "swap".to_owned(),
+            mev_score: 70,
+            urgency_score: 10,
+            method_selector: None,
+            feature_engine_version: "feature-engine.v1".to_owned(),
+        });
+        store.upsert_tx_features(TxFeaturesRecord {
+            hash: hash(2),
+            chain_id: Some(1),
+            protocol: "curve".to_owned(),
+            category: "swap".to_owned(),
+            mev_score: 65,
+            urgency_score: 10,
+            method_selector: None,
+            feature_engine_version: "feature-engine.v1".to_owned(),
+        });
+
+        let summary = store.dashboard_feature_summary(10);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].protocol, "curve");
+        assert_eq!(summary[0].category, "swap");
+        assert_eq!(summary[0].count, 2);
+
+        store.upsert_tx_features(TxFeaturesRecord {
+            hash: hash(3),
+            chain_id: Some(1),
+            protocol: "balancer".to_owned(),
+            category: "swap".to_owned(),
+            mev_score: 60,
+            urgency_score: 10,
+            method_selector: None,
+            feature_engine_version: "feature-engine.v1".to_owned(),
+        });
+
+        let summary = store.dashboard_feature_summary(10);
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].protocol, "balancer");
+        assert_eq!(summary[0].count, 1);
+        assert_eq!(summary[1].protocol, "curve");
+        assert_eq!(summary[1].count, 1);
     }
 
     #[test]

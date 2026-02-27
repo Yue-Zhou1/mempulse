@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   classifyRisk,
+  fetchJson,
   formatDurationToken,
+  isAbortError,
   normalizeChainStatusRows,
   opportunityRowKey,
   paginationWindow,
@@ -96,4 +98,52 @@ test('opportunityRowKey includes hash strategy and timestamp', () => {
     '0xabc::arb::123456',
   );
   assert.equal(opportunityRowKey({}), '::::');
+});
+
+test('fetchJson uses no-store cache policy by default', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return {
+      ok: true,
+      async json() {
+        return { ok: true };
+      },
+    };
+  };
+
+  try {
+    const payload = await fetchJson('http://127.0.0.1:3000', '/dashboard/snapshot');
+    assert.deepEqual(payload, { ok: true });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'http://127.0.0.1:3000/dashboard/snapshot');
+    assert.equal(calls[0].options?.cache, 'no-store');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('isAbortError detects abort-style exceptions and ignores regular failures', async () => {
+  const abortLikeError = Object.assign(new Error('The operation was aborted.'), {
+    name: 'AbortError',
+  });
+  assert.equal(isAbortError(abortLikeError), true);
+  assert.equal(isAbortError({ name: 'AbortError' }), true);
+  assert.equal(isAbortError({ code: 'ABORT_ERR' }), true);
+  assert.equal(isAbortError(new Error('network unavailable')), false);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw abortLikeError;
+  };
+
+  try {
+    await assert.rejects(
+      fetchJson('http://127.0.0.1:3000', '/transactions/0xabc'),
+      (error) => isAbortError(error),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

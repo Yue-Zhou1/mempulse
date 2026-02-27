@@ -1,4 +1,4 @@
-use axum::{body::Body, http::Request};
+use axum::{body::Body, http::Request, http::StatusCode};
 use builder::RelayDryRunStatus;
 use common::AlertThresholdConfig;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
@@ -10,7 +10,7 @@ use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
 use viz_api::{
-    AppState, DashboardSnapshot, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
+    AppState, DashboardSnapshotV2, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
     TransactionDetail, TransactionSummary, VizDataProvider, build_router,
 };
 
@@ -207,7 +207,7 @@ async fn api_chain_filters_apply_to_recent_features_opps_and_transactions() {
 }
 
 #[tokio::test]
-async fn api_chain_filters_apply_to_dashboard_snapshot() {
+async fn api_legacy_dashboard_snapshot_route_is_not_registered() {
     let app = build_test_app();
 
     let response = app
@@ -222,10 +222,27 @@ async fn api_chain_filters_apply_to_dashboard_snapshot() {
         .await
         .expect("dashboard response");
 
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_chain_filters_apply_to_dashboard_snapshot_v2() {
+    let app = build_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/snapshot-v2?chain_id=1&tx_limit=10&feature_limit=10&opp_limit=10")
+                .body(Body::empty())
+                .expect("dashboard v2 request"),
+        )
+        .await
+        .expect("dashboard v2 response");
+
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
-        .expect("dashboard body");
-    let payload: DashboardSnapshot = serde_json::from_slice(&body).expect("dashboard payload");
+        .expect("dashboard v2 body");
+    let payload: DashboardSnapshotV2 = serde_json::from_slice(&body).expect("dashboard v2 payload");
     assert!(
         payload
             .feature_details
@@ -239,4 +256,5 @@ async fn api_chain_filters_apply_to_dashboard_snapshot() {
             .all(|row| row.chain_id == Some(1))
     );
     assert_eq!(payload.transactions.len(), 1);
+    assert!(payload.revision > 0);
 }

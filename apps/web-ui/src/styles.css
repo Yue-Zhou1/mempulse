@@ -440,11 +440,22 @@ body {
 .news-tx-table {
   border-collapse: collapse;
   border-spacing: 0;
+  table-layout: fixed;
 }
 
-.news-tx-table thead th {
-  height: 2.3rem;
+.news-tx-head {
+  position: relative;
+  z-index: 12;
+}
+
+.news-tx-header-cell {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  background-color: #f7f1e6;
+  border-bottom: 1px dashed #18181b;
   line-height: 1.05;
+  white-space: nowrap;
 }
 
 .news-tx-table tbody td {
@@ -455,6 +466,13 @@ body {
 
 .news-tx-row {
   will-change: auto;
+}
+
+.news-tx-cell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (prefers-reduced-motion: reduce) {

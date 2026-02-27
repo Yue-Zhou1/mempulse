@@ -244,12 +244,22 @@ export function chainStatusTone(state) {
   return 'bg-[#fffdf7] text-zinc-700 border-zinc-700';
 }
 
-export async function fetchJson(apiBase, path) {
-  const response = await fetch(`${apiBase}${path}`);
+export async function fetchJson(apiBase, path, requestInit = undefined) {
+  const response = await fetch(`${apiBase}${path}`, {
+    cache: 'no-store',
+    ...requestInit,
+  });
   if (!response.ok) {
     throw new Error(`failed ${path}: HTTP ${response.status}`);
   }
   return response.json();
+}
+
+export function isAbortError(error) {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  return error.name === 'AbortError' || error.code === 'ABORT_ERR';
 }
 
 export function classifyRisk(feature) {

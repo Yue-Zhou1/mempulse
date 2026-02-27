@@ -15,7 +15,6 @@ test('resolveDashboardSnapshotLimits returns radar-focused limits', () => {
     txLimit: 120,
     featureLimit: 280,
     oppLimit: 220,
-    replayLimit: 160,
   });
 });
 
@@ -26,37 +25,60 @@ test('resolveDashboardSnapshotLimits returns opps-focused limits', () => {
   });
 
   assert.deepEqual(limits, {
-    txLimit: 80,
-    featureLimit: 160,
+    txLimit: 1,
+    featureLimit: 1,
     oppLimit: 600,
-    replayLimit: 80,
   });
 });
 
-test('resolveDashboardSnapshotLimits returns replay-focused limits', () => {
+test('resolveDashboardSnapshotLimits minimizes tx and feature payload on opps screen', () => {
   const limits = resolveDashboardSnapshotLimits({
-    activeScreen: 'replay',
-    snapshotTxLimit: 200,
+    activeScreen: 'opps',
+    snapshotTxLimit: 500,
   });
 
   assert.deepEqual(limits, {
-    txLimit: 40,
-    featureLimit: 80,
-    oppLimit: 120,
-    replayLimit: 60,
+    txLimit: 1,
+    featureLimit: 1,
+    oppLimit: 600,
   });
 });
 
-test('buildDashboardSnapshotPath encodes all snapshot limit params', () => {
+test('resolveDashboardSnapshotLimits falls back to radar limits for removed replay screen', () => {
+  const limits = resolveDashboardSnapshotLimits({
+    activeScreen: 'replay',
+    snapshotTxLimit: 140,
+  });
+
+  assert.deepEqual(limits, {
+    txLimit: 140,
+    featureLimit: 280,
+    oppLimit: 220,
+  });
+});
+
+test('resolveDashboardSnapshotLimits keeps feature limit aligned with large radar tx windows', () => {
+  const limits = resolveDashboardSnapshotLimits({
+    activeScreen: 'radar',
+    snapshotTxLimit: 500,
+  });
+
+  assert.deepEqual(limits, {
+    txLimit: 500,
+    featureLimit: 500,
+    oppLimit: 220,
+  });
+});
+
+test('buildDashboardSnapshotPath uses snapshot-v2 by default', () => {
   const path = buildDashboardSnapshotPath({
     txLimit: 80,
     featureLimit: 160,
     oppLimit: 600,
-    replayLimit: 80,
   });
 
   assert.equal(
     path,
-    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600&replay_limit=80',
+    '/dashboard/snapshot-v2?tx_limit=80&feature_limit=160&opp_limit=600',
   );
 });
