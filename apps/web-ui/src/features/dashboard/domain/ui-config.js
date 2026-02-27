@@ -3,7 +3,7 @@ const DEFAULT_CONFIG = Object.freeze({
   detailCacheLimit: 96,
   maxTransactionHistory: 500,
   maxFeatureHistory: 500,
-  maxOpportunityHistory: 500,
+  maxOpportunityHistory: 100,
   maxRenderedTransactions: 500,
   streamBatchMs: 1_000,
   samplingLagThresholdMs: 30,
@@ -20,7 +20,7 @@ const DEFAULT_CONFIG = Object.freeze({
 const LIMITS = Object.freeze({
   snapshotTxLimit: Object.freeze({ min: 1, max: 500 }),
   detailCacheLimit: Object.freeze({ min: 16, max: 1_024 }),
-  maxTransactionHistory: Object.freeze({ min: 50, max: 5_000 }),
+  maxTransactionHistory: Object.freeze({ min: 50, max: 500 }),
   maxFeatureHistory: Object.freeze({ min: 50, max: 10_000 }),
   maxOpportunityHistory: Object.freeze({ min: 50, max: 10_000 }),
   maxRenderedTransactions: Object.freeze({ min: 25, max: 1_000 }),
