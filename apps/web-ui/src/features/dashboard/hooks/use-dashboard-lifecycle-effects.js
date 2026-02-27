@@ -7,6 +7,7 @@ import {
 } from '../domain/snapshot-profile.js';
 import {
   fetchJson,
+  isAbortError,
   normalizeChainStatusRows,
   opportunityRowKey,
 } from '../lib/dashboard-helpers.js';
@@ -17,6 +18,7 @@ import {
 import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
 import { createSystemHealthMonitor } from '../lib/system-health.js';
 import { useDashboardStreamWorker } from './use-dashboard-stream-worker.js';
+import { shouldScheduleGapResync } from '../workers/stream-protocol.js';
 
 const snapshotThrottleMs = 1200;
 const streamBatchLimit = 20;
@@ -191,6 +193,7 @@ export function useDashboardLifecycleEffects({
   transactionStoreRef,
   followLatestRef,
   latestSeqIdRef,
+  lastGapSnapshotAtRef,
   reconnectAttemptsRef,
   reconnectTimerRef,
   snapshotTimerRef,
@@ -266,6 +269,7 @@ export function useDashboardLifecycleEffects({
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
     let steadySnapshotTimer = null;
+    let snapshotRequestAbortController = null;
     let sampledCommit = null;
     let streamBatchIndex = 0;
     let frameProbeRafId = null;
@@ -307,6 +311,13 @@ export function useDashboardLifecycleEffects({
       if (steadySnapshotTimer) {
         window.clearInterval(steadySnapshotTimer);
         steadySnapshotTimer = null;
+      }
+    };
+
+    const abortSnapshotRequest = () => {
+      if (snapshotRequestAbortController) {
+        snapshotRequestAbortController.abort();
+        snapshotRequestAbortController = null;
       }
     };
 
@@ -590,21 +601,32 @@ export function useDashboardLifecycleEffects({
       if (cancelled || snapshotInFlightRef.current) {
         return;
       }
+      const requestAbortController = new AbortController();
+      snapshotRequestAbortController = requestAbortController;
       snapshotInFlightRef.current = true;
       try {
-        const snapshot = await fetchJson(apiBase, snapshotPath);
-        if (cancelled) {
+        const snapshot = await fetchJson(apiBase, snapshotPath, {
+          signal: requestAbortController.signal,
+        });
+        if (cancelled || snapshotRequestAbortController !== requestAbortController) {
           return;
         }
         setHasError(false);
         applySnapshot(snapshot, sourceLabel);
       } catch (error) {
-        if (cancelled) {
+        if (
+          cancelled
+          || snapshotRequestAbortController !== requestAbortController
+          || isAbortError(error)
+        ) {
           return;
         }
         setHasError(true);
         setStatusMessage(`Snapshot sync failed: ${error.message}`);
       } finally {
+        if (snapshotRequestAbortController === requestAbortController) {
+          snapshotRequestAbortController = null;
+        }
         snapshotInFlightRef.current = false;
       }
     };
@@ -677,18 +699,22 @@ export function useDashboardLifecycleEffects({
             return;
           }
 
+          const previousSeqId = latestSeqIdRef.current;
           const seqId = batch.latestSeqId;
-          if (!Number.isFinite(seqId) || seqId <= latestSeqIdRef.current) {
+          if (!Number.isFinite(seqId) || seqId <= previousSeqId) {
             return;
           }
 
-          const hasGap = batch.hasGap
-            || (
-              latestSeqIdRef.current > 0
-              && seqId > latestSeqIdRef.current + 1
-            );
           applyDeltaTransactions(batch.transactions, 'ws-delta', seqId);
-          if (hasGap) {
+          if (shouldScheduleGapResync({
+            previousSeqId,
+            latestSeqId: seqId,
+            hasGap: batch.hasGap,
+            nowUnixMs: Date.now(),
+            lastResyncUnixMs: lastGapSnapshotAtRef.current,
+            cooldownMs: steadySnapshotRefreshMs,
+          })) {
+            lastGapSnapshotAtRef.current = Date.now();
             scheduleSnapshot('ws-gap-resync', true);
           }
         },
@@ -727,6 +753,7 @@ export function useDashboardLifecycleEffects({
     return () => {
       flushTransactionCommit();
       cancelled = true;
+      abortSnapshotRequest();
       cancelTickerCommit();
       systemHealth.clearTrailingFlush();
       clearReconnectTimer();
@@ -747,6 +774,7 @@ export function useDashboardLifecycleEffects({
     disconnectWorker,
     followLatestRef,
     latestSeqIdRef,
+    lastGapSnapshotAtRef,
     maxFeatureHistory,
     maxOpportunityHistory,
     maxTransactionHistory,
@@ -787,10 +815,13 @@ export function useDashboardLifecycleEffects({
     }
 
     let cancelled = false;
+    const detailRequestAbortController = new AbortController();
     setDialogLoading(true);
     setDialogError('');
 
-    fetchJson(apiBase, `/transactions/${encodeURIComponent(dialogHash)}`)
+    fetchJson(apiBase, `/transactions/${encodeURIComponent(dialogHash)}`, {
+      signal: detailRequestAbortController.signal,
+    })
       .then((detail) => {
         if (cancelled) {
           return;
@@ -799,7 +830,7 @@ export function useDashboardLifecycleEffects({
         setDialogLoading(false);
       })
       .catch((error) => {
-        if (cancelled) {
+        if (cancelled || isAbortError(error)) {
           return;
         }
         setDialogLoading(false);
@@ -808,6 +839,7 @@ export function useDashboardLifecycleEffects({
 
     return () => {
       cancelled = true;
+      detailRequestAbortController.abort();
     };
   }, [
     apiBase,

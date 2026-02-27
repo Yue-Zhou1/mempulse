@@ -28,6 +28,10 @@ impl VizDataProvider for EmptyProvider {
         Vec::new()
     }
 
+    fn latest_seq_id(&self) -> Option<u64> {
+        None
+    }
+
     fn propagation_edges(&self) -> Vec<viz_api::PropagationEdge> {
         Vec::new()
     }

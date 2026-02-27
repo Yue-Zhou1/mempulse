@@ -6,6 +6,7 @@ import {
   isStreamInitMessage,
   normalizeWorkerError,
   resolveDeltaBatchGap,
+  resolveSequenceGap,
 } from './stream-protocol.js';
 
 let socket = null;

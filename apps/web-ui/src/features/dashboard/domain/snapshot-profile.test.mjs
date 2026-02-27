@@ -44,7 +44,7 @@ test('resolveDashboardSnapshotLimits falls back to radar limits for removed repl
   });
 });
 
-test('buildDashboardSnapshotPath encodes snapshot limit params without replay controls', () => {
+test('buildDashboardSnapshotPath disables replay payload on routine dashboard snapshots', () => {
   const path = buildDashboardSnapshotPath({
     txLimit: 80,
     featureLimit: 160,
@@ -53,6 +53,6 @@ test('buildDashboardSnapshotPath encodes snapshot limit params without replay co
 
   assert.equal(
     path,
-    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600',
+    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600&replay_limit=0',
   );
 });

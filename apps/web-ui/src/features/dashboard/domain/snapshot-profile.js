@@ -50,6 +50,7 @@ export function buildDashboardSnapshotPath({ txLimit, featureLimit, oppLimit }) 
     tx_limit: String(txLimit),
     feature_limit: String(featureLimit),
     opp_limit: String(oppLimit),
+    replay_limit: '0',
   });
   return `/dashboard/snapshot?${params.toString()}`;
 }

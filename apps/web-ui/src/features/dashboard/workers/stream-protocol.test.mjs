@@ -8,6 +8,8 @@ import {
   normalizeWorkerError,
   resolveDeltaBatchGap,
   resolveSequenceGap,
+  shouldResyncFromBatch,
+  shouldScheduleGapResync,
 } from './stream-protocol.js';
 
 test('createStreamInitMessage validates and normalizes init config', () => {
@@ -69,6 +71,54 @@ test('resolveDeltaBatchGap only checks seq_start continuity', () => {
   assert.equal(resolveDeltaBatchGap(100, 101, false), false);
   assert.equal(resolveDeltaBatchGap(100, 110, false), true);
   assert.equal(resolveDeltaBatchGap(100, 101, true), true);
+});
+
+test('shouldResyncFromBatch only resyncs on explicit gap flags', () => {
+  assert.equal(shouldResyncFromBatch(100, 120, false), false);
+  assert.equal(shouldResyncFromBatch(100, 120, true), true);
+  assert.equal(shouldResyncFromBatch(120, 120, true), false);
+  assert.equal(shouldResyncFromBatch(120, 119, true), false);
+});
+
+test('shouldScheduleGapResync enforces cooldown for repeated gap signals', () => {
+  const previousSeqId = 100;
+  const latestSeqId = 120;
+  const nowUnixMs = 20_000;
+  const cooldownMs = 10_000;
+
+  assert.equal(
+    shouldScheduleGapResync({
+      previousSeqId,
+      latestSeqId,
+      hasGap: false,
+      nowUnixMs,
+      lastResyncUnixMs: 0,
+      cooldownMs,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldScheduleGapResync({
+      previousSeqId,
+      latestSeqId,
+      hasGap: true,
+      nowUnixMs,
+      lastResyncUnixMs: 15_001,
+      cooldownMs,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldScheduleGapResync({
+      previousSeqId,
+      latestSeqId,
+      hasGap: true,
+      nowUnixMs,
+      lastResyncUnixMs: 9_999,
+      cooldownMs,
+    }),
+    true,
+  );
 });
 
 test('normalizeWorkerError returns stable message payload', () => {

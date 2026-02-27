@@ -159,10 +159,18 @@ pub struct InMemoryStorage {
     events: VecDeque<EventEnvelope>,
     event_index: Vec<EventEnvelope>,
     tx_seen: VecDeque<TxSeenRecord>,
+    tx_seen_counts: FastMap<TxHash, usize>,
+    tx_seen_lookup: FastMap<TxHash, TxSeenRecord>,
     tx_full: VecDeque<TxFullRecord>,
+    tx_full_counts: FastMap<TxHash, usize>,
+    tx_full_lookup: FastMap<TxHash, TxFullRecord>,
     tx_features: VecDeque<TxFeaturesRecord>,
+    tx_features_counts: FastMap<TxHash, usize>,
+    tx_features_lookup: FastMap<TxHash, TxFeaturesRecord>,
     opportunities: VecDeque<OpportunityRecord>,
     tx_lifecycle: VecDeque<TxLifecycleRecord>,
+    tx_lifecycle_counts: FastMap<TxHash, usize>,
+    tx_lifecycle_lookup: FastMap<TxHash, TxLifecycleRecord>,
     peer_stats: VecDeque<PeerStatsRecord>,
     write_latency_ns: VecDeque<u64>,
     recent_tx_order: VecDeque<TxHash>,
@@ -192,10 +200,18 @@ impl InMemoryStorage {
             events: VecDeque::new(),
             event_index: Vec::new(),
             tx_seen: VecDeque::new(),
+            tx_seen_counts: FastMap::default(),
+            tx_seen_lookup: FastMap::default(),
             tx_full: VecDeque::new(),
+            tx_full_counts: FastMap::default(),
+            tx_full_lookup: FastMap::default(),
             tx_features: VecDeque::new(),
+            tx_features_counts: FastMap::default(),
+            tx_features_lookup: FastMap::default(),
             opportunities: VecDeque::new(),
             tx_lifecycle: VecDeque::new(),
+            tx_lifecycle_counts: FastMap::default(),
+            tx_lifecycle_lookup: FastMap::default(),
             peer_stats: VecDeque::new(),
             write_latency_ns: VecDeque::new(),
             recent_tx_order: VecDeque::new(),
@@ -208,7 +224,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_seen(&mut self, record: TxSeenRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_seen, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_seen,
+            &mut self.tx_seen_counts,
+            &mut self.tx_seen_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.market_stats.total_tx_count = self.market_stats.total_tx_count.saturating_add(1);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
@@ -216,7 +239,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_full(&mut self, record: TxFullRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_full, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_full,
+            &mut self.tx_full_counts,
+            &mut self.tx_full_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }
@@ -224,7 +254,14 @@ impl InMemoryStorage {
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
         let start = Instant::now();
         let mev_score = record.mev_score;
-        push_bounded(&mut self.tx_features, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_features,
+            &mut self.tx_features_counts,
+            &mut self.tx_features_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.market_stats.total_signal_volume =
             self.market_stats.total_signal_volume.saturating_add(1);
         if mev_score >= 80 {
@@ -248,7 +285,14 @@ impl InMemoryStorage {
 
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.tx_lifecycle, record, self.config.table_capacity);
+        push_bounded_hash_indexed(
+            &mut self.tx_lifecycle,
+            &mut self.tx_lifecycle_counts,
+            &mut self.tx_lifecycle_lookup,
+            record,
+            self.config.table_capacity,
+            |row| row.hash,
+        );
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }
@@ -264,12 +308,24 @@ impl InMemoryStorage {
         &self.tx_seen
     }
 
+    pub fn tx_seen_by_hash(&self, hash: &TxHash) -> Option<&TxSeenRecord> {
+        self.tx_seen_lookup.get(hash)
+    }
+
     pub fn tx_full(&self) -> &VecDeque<TxFullRecord> {
         &self.tx_full
     }
 
+    pub fn tx_full_by_hash(&self, hash: &TxHash) -> Option<&TxFullRecord> {
+        self.tx_full_lookup.get(hash)
+    }
+
     pub fn tx_features(&self) -> &VecDeque<TxFeaturesRecord> {
         &self.tx_features
+    }
+
+    pub fn tx_features_by_hash(&self, hash: &TxHash) -> Option<&TxFeaturesRecord> {
+        self.tx_features_lookup.get(hash)
     }
 
     pub fn opportunities(&self) -> Vec<OpportunityRecord> {
@@ -285,6 +341,10 @@ impl InMemoryStorage {
 
     pub fn tx_lifecycle(&self) -> &VecDeque<TxLifecycleRecord> {
         &self.tx_lifecycle
+    }
+
+    pub fn tx_lifecycle_by_hash(&self, hash: &TxHash) -> Option<&TxLifecycleRecord> {
+        self.tx_lifecycle_lookup.get(hash)
     }
 
     pub fn peer_stats(&self) -> &VecDeque<PeerStatsRecord> {
@@ -794,6 +854,37 @@ fn push_bounded<T>(deque: &mut VecDeque<T>, value: T, capacity: usize) {
     }
 }
 
+fn push_bounded_hash_indexed<T, FHash>(
+    deque: &mut VecDeque<T>,
+    counts: &mut FastMap<TxHash, usize>,
+    lookup: &mut FastMap<TxHash, T>,
+    value: T,
+    capacity: usize,
+    hash_of: FHash,
+) where
+    T: Clone,
+    FHash: Fn(&T) -> TxHash,
+{
+    let value_hash = hash_of(&value);
+    deque.push_back(value.clone());
+    *counts.entry(value_hash).or_insert(0) += 1;
+    lookup.insert(value_hash, value);
+
+    while deque.len() > capacity {
+        let Some(evicted) = deque.pop_front() else {
+            break;
+        };
+        let evicted_hash = hash_of(&evicted);
+        if let Some(count) = counts.get_mut(&evicted_hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&evicted_hash);
+                lookup.remove(&evicted_hash);
+            }
+        }
+    }
+}
+
 fn remove_event_from_sorted_index(events: &mut Vec<EventEnvelope>, target: &EventEnvelope) {
     let mut index = match events.binary_search_by(|existing| cmp_deterministic(existing, target)) {
         Ok(index) => index,
@@ -1015,6 +1106,54 @@ mod tests {
         assert_eq!(store.tx_lifecycle().len(), 1);
         assert_eq!(store.peer_stats().len(), 1);
         assert!(store.avg_write_latency_ns().is_some());
+        assert_eq!(
+            store.tx_seen_by_hash(&hash(1)).map(|row| row.seen_count),
+            Some(1)
+        );
+        assert_eq!(store.tx_full_by_hash(&hash(1)).map(|row| row.nonce), Some(1));
+        assert_eq!(
+            store.tx_features_by_hash(&hash(1)).map(|row| row.mev_score),
+            Some(80)
+        );
+        assert_eq!(
+            store.tx_lifecycle_by_hash(&hash(1)).map(|row| row.status.as_str()),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn hash_indexes_evict_entries_when_rows_fall_out_of_capacity() {
+        let mut store = InMemoryStorage::with_config(StorageConfig {
+            table_capacity: 2,
+            ..StorageConfig::default()
+        });
+
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(1),
+            peer: "peer-a".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_000,
+            first_seen_mono_ns: 10,
+            seen_count: 1,
+        });
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(2),
+            peer: "peer-b".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_010,
+            first_seen_mono_ns: 20,
+            seen_count: 1,
+        });
+        store.upsert_tx_seen(TxSeenRecord {
+            hash: hash(3),
+            peer: "peer-c".to_owned(),
+            first_seen_unix_ms: 1_700_000_000_020,
+            first_seen_mono_ns: 30,
+            seen_count: 1,
+        });
+
+        assert_eq!(store.tx_seen().len(), 2);
+        assert!(store.tx_seen_by_hash(&hash(1)).is_none());
+        assert!(store.tx_seen_by_hash(&hash(2)).is_some());
+        assert!(store.tx_seen_by_hash(&hash(3)).is_some());
     }
 
     #[test]

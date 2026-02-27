@@ -115,6 +115,32 @@ export function resolveDeltaBatchGap(previousSeqId, seqStart, hasGapFlag = false
   return resolveSequenceGap(previousSeqId, seqStart);
 }
 
+export function shouldResyncFromBatch(previousSeqId, latestSeqId, hasGap = false) {
+  const previous = normalizeSeqId(previousSeqId);
+  const latest = normalizeSeqId(latestSeqId);
+  if (latest <= previous) {
+    return false;
+  }
+  return Boolean(hasGap);
+}
+
+export function shouldScheduleGapResync({
+  previousSeqId,
+  latestSeqId,
+  hasGap = false,
+  nowUnixMs = Date.now(),
+  lastResyncUnixMs = 0,
+  cooldownMs = 10_000,
+} = {}) {
+  if (!shouldResyncFromBatch(previousSeqId, latestSeqId, hasGap)) {
+    return false;
+  }
+  const now = Number.isFinite(nowUnixMs) ? Math.floor(nowUnixMs) : Date.now();
+  const last = Number.isFinite(lastResyncUnixMs) ? Math.floor(lastResyncUnixMs) : 0;
+  const cooldown = Number.isFinite(cooldownMs) ? Math.max(0, Math.floor(cooldownMs)) : 0;
+  return now - last >= cooldown;
+}
+
 export function normalizeWorkerError(errorLike) {
   const message = typeof errorLike?.message === 'string' && errorLike.message
     ? errorLike.message

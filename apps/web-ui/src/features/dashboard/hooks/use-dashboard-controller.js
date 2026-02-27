@@ -91,6 +91,7 @@ export function useDashboardController() {
   const transactionStoreRef = useRef(createTxLiveStore());
   const followLatestRef = useRef(followLatest);
   const latestSeqIdRef = useRef(0);
+  const lastGapSnapshotAtRef = useRef(0);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef(null);
   const snapshotTimerRef = useRef(null);
@@ -168,6 +169,7 @@ export function useDashboardController() {
     transactionStoreRef,
     followLatestRef,
     latestSeqIdRef,
+    lastGapSnapshotAtRef,
     reconnectAttemptsRef,
     reconnectTimerRef,
     snapshotTimerRef,

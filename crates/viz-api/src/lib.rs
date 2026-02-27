@@ -24,7 +24,7 @@ use replay::{
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
     NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
@@ -290,6 +290,7 @@ fn map_market_stats(snapshot: MarketStatsSnapshot) -> MarketStats {
 pub trait VizDataProvider: Send + Sync {
     fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
     -> Vec<EventEnvelope>;
+    fn latest_seq_id(&self) -> Option<u64>;
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
     fn feature_summary(&self) -> Vec<FeatureSummary>;
@@ -479,6 +480,13 @@ impl VizDataProvider for InMemoryVizProvider {
         self.dashboard_cache_snapshot().replay_points
     }
 
+    fn latest_seq_id(&self) -> Option<u64> {
+        self.storage
+            .read()
+            .ok()
+            .and_then(|storage| storage.latest_seq_id())
+    }
+
     fn propagation_edges(&self) -> Vec<PropagationEdge> {
         let mut edges = (*self.propagation).clone();
         edges.sort_unstable_by(|left, right| {
@@ -611,22 +619,10 @@ impl VizDataProvider for InMemoryVizProvider {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
         let hash = parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
-            let seen = storage
-                .tx_seen()
-                .iter()
-                .rev()
-                .find(|seen| seen.hash == hash)?;
-            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
-            let feature = storage
-                .tx_features()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
-            let lifecycle = storage
-                .tx_lifecycle()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
+            let seen = storage.tx_seen_by_hash(&hash)?;
+            let full = storage.tx_full_by_hash(&hash);
+            let feature = storage.tx_features_by_hash(&hash);
+            let lifecycle = storage.tx_lifecycle_by_hash(&hash);
             let fallback_lifecycle = lifecycle
                 .is_none()
                 .then(|| current_lifecycle(&storage.list_events(), hash));
@@ -1144,6 +1140,7 @@ async fn dashboard_snapshot(
     State(state): State<AppState>,
     Query(query): Query<DashboardSnapshotQuery>,
 ) -> Json<DashboardSnapshot> {
+    let started_at = Instant::now();
     let tx_limit = query.tx_limit.unwrap_or(250).clamp(1, 500);
     let feature_limit = query.feature_limit.unwrap_or(600).clamp(1, 2_000);
     let opp_limit = query.opp_limit.unwrap_or(600).clamp(1, 2_000);
@@ -1152,16 +1149,21 @@ async fn dashboard_snapshot(
     let replay_limit = query
         .replay_limit
         .unwrap_or(state.downsample_limit)
-        .clamp(50, 5_000);
+        .clamp(0, 5_000);
 
-    let replay_points = state.provider.replay_points();
-    let latest_seq_id = replay_points.last().map(|point| point.seq_hi).unwrap_or(0);
+    let (replay, latest_seq_id) = if replay_limit == 0 {
+        (Vec::new(), state.provider.latest_seq_id().unwrap_or(0))
+    } else {
+        let replay_points = state.provider.replay_points();
+        let latest_seq_id = replay_points.last().map(|point| point.seq_hi).unwrap_or(0);
+        (downsample(&replay_points, replay_limit), latest_seq_id)
+    };
     let feature_scan_limit = chain_filter_scan_limit(feature_limit, chain_id);
     let opp_scan_limit = chain_filter_scan_limit(opp_limit, chain_id);
     let tx_scan_limit = chain_filter_scan_limit(tx_limit, chain_id);
 
-    Json(DashboardSnapshot {
-        replay: downsample(&replay_points, replay_limit),
+    let snapshot = DashboardSnapshot {
+        replay,
         propagation: downsample(&state.provider.propagation_edges(), state.downsample_limit),
         opportunities: filter_opportunities_by_chain(
             state.provider.opportunities(opp_scan_limit, min_score),
@@ -1183,7 +1185,21 @@ async fn dashboard_snapshot(
         chain_ingest_status: (state.live_rpc_chain_status_provider)(),
         market_stats: state.provider.market_stats(),
         latest_seq_id,
-    })
+    };
+    tracing::debug!(
+        tx_limit,
+        feature_limit,
+        opp_limit,
+        replay_limit,
+        chain_id = ?chain_id,
+        replay_points = snapshot.replay.len(),
+        opportunities = snapshot.opportunities.len(),
+        feature_details = snapshot.feature_details.len(),
+        transactions = snapshot.transactions.len(),
+        elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+        "dashboard snapshot built",
+    );
+    Json(snapshot)
 }
 
 async fn transactions(
@@ -1327,11 +1343,15 @@ async fn transaction_by_hash(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<Json<TransactionDetail>, StatusCode> {
-    state
-        .provider
-        .transaction_detail_by_hash(&hash)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    let started_at = Instant::now();
+    let detail = state.provider.transaction_detail_by_hash(&hash);
+    tracing::debug!(
+        hash = %hash,
+        found = detail.is_some(),
+        elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+        "transaction detail lookup completed",
+    );
+    detail.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn relay_dry_run_status(State(state): State<AppState>) -> Json<RelayDryRunStatus> {
@@ -1825,6 +1845,10 @@ mod tests {
                     pending_count: 30,
                 },
             ]
+        }
+
+        fn latest_seq_id(&self) -> Option<u64> {
+            Some(3)
         }
 
         fn propagation_edges(&self) -> Vec<PropagationEdge> {
@@ -2358,6 +2382,29 @@ mod tests {
         assert_eq!(payload.market_stats.total_signal_volume, 9_536);
         assert_eq!(payload.market_stats.success_rate_bps, 9_949);
         let _ = payload.chain_ingest_status;
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_route_supports_replay_limit_zero_fast_path() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/dashboard/snapshot?tx_limit=1&feature_limit=1&opp_limit=1&replay_limit=0",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: DashboardSnapshot = serde_json::from_slice(&body).unwrap();
+        assert!(payload.replay.is_empty());
+        assert_eq!(payload.latest_seq_id, 3);
     }
 
     #[tokio::test]
