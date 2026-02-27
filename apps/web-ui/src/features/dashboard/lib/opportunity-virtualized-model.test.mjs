@@ -43,6 +43,29 @@ test('buildVirtualizedOpportunityWindow tracks middle-of-list scroll offsets', (
   assert.equal(windowModel.paddingTop, windowModel.startIndex * 100);
 });
 
+test('buildVirtualizedOpportunityWindow clamps stale scroll offsets when row count shrinks', () => {
+  const rows = [
+    { tx_hash: '0x1', strategy: 'A', detected_unix_ms: 1_700_000_000_001 },
+    { tx_hash: '0x2', strategy: 'B', detected_unix_ms: 1_700_000_000_002 },
+    { tx_hash: '0x3', strategy: 'C', detected_unix_ms: 1_700_000_000_003 },
+  ];
+
+  const windowModel = buildVirtualizedOpportunityWindow(rows, {
+    scrollTop: 9_999_999,
+    viewportHeight: 480,
+    rowHeightPx: 96,
+    overscanRows: 4,
+  });
+
+  assert.equal(windowModel.totalRowCount, 3);
+  assert.equal(windowModel.startIndex, 0);
+  assert.equal(windowModel.endIndex, 3);
+  assert.deepEqual(
+    windowModel.visibleRows.map((row) => row.tx_hash),
+    ['0x1', '0x2', '0x3'],
+  );
+});
+
 test('buildVirtualizedOpportunityWindow normalizes invalid inputs', () => {
   const windowModel = buildVirtualizedOpportunityWindow(null, {
     scrollTop: Number.NaN,

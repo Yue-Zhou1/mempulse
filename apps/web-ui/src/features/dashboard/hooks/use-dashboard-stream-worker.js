@@ -7,6 +7,21 @@ import {
   normalizeWorkerError,
 } from '../workers/stream-protocol.js';
 
+export function disconnectDashboardStreamWorker(worker) {
+  if (!worker) {
+    return;
+  }
+  worker.onmessage = null;
+  worker.onerror = null;
+  worker.onmessageerror = null;
+  worker.postMessage(createStreamStopMessage());
+  worker.terminate();
+}
+
+export function shouldHandleDashboardWorkerEvent(workerRef, worker) {
+  return workerRef?.current === worker;
+}
+
 export function useDashboardStreamWorker() {
   const workerRef = useRef(null);
 
@@ -16,8 +31,7 @@ export function useDashboardStreamWorker() {
       return;
     }
     workerRef.current = null;
-    worker.postMessage(createStreamStopMessage());
-    worker.terminate();
+    disconnectDashboardStreamWorker(worker);
   }, []);
 
   const connectWorker = useCallback(({
@@ -45,6 +59,9 @@ export function useDashboardStreamWorker() {
     workerRef.current = worker;
 
     worker.onmessage = (event) => {
+      if (!shouldHandleDashboardWorkerEvent(workerRef, worker)) {
+        return;
+      }
       const message = event.data;
       if (message?.type === 'stream:open') {
         onOpen?.();
@@ -64,6 +81,9 @@ export function useDashboardStreamWorker() {
     };
 
     worker.onerror = (errorEvent) => {
+      if (!shouldHandleDashboardWorkerEvent(workerRef, worker)) {
+        return;
+      }
       onError?.(normalizeWorkerError(errorEvent));
     };
 

@@ -48,7 +48,8 @@ export function buildVirtualizedOpportunityWindow(rows, options = {}) {
   }
 
   const visibleCapacity = Math.max(1, Math.ceil(viewportHeight / rowHeightPx));
-  const baseStart = Math.floor(scrollTop / rowHeightPx);
+  const maxBaseStart = Math.max(0, totalRowCount - visibleCapacity);
+  const baseStart = Math.min(Math.floor(scrollTop / rowHeightPx), maxBaseStart);
   const startIndex = Math.max(0, baseStart - overscanRows);
   const endIndex = Math.min(
     totalRowCount,
