@@ -3579,7 +3579,10 @@ mod tests {
         };
 
         let serialized = serde_json::to_value(payload).expect("serialize stream v2 payload");
-        assert_eq!(serialized["market_stats"]["total_tx_count"], serde_json::json!(456));
+        assert_eq!(
+            serialized["market_stats"]["total_tx_count"],
+            serde_json::json!(456)
+        );
         assert_eq!(
             serialized["market_stats"]["success_rate_bps"],
             serde_json::json!(9_211)
