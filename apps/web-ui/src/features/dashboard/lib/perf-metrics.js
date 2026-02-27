@@ -165,8 +165,56 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
     transactionCommitDurationsMs: [],
     frameDurationsMs: [],
     heapSamplesBytes: [],
+    network: {
+      snapshot: {
+        started: 0,
+        completed: 0,
+        failed: 0,
+        aborted: 0,
+        deferred: 0,
+        inFlight: 0,
+        peakInFlight: 0,
+      },
+      detail: {
+        started: 0,
+        completed: 0,
+        failed: 0,
+        aborted: 0,
+        inFlight: 0,
+        peakInFlight: 0,
+      },
+    },
     updatedAtUnixMs: Date.now(),
   };
+
+  function beginNetworkRequest(target) {
+    const bucket = state.network[target];
+    if (!bucket) {
+      return;
+    }
+    bucket.started += 1;
+    bucket.inFlight += 1;
+    bucket.peakInFlight = Math.max(bucket.peakInFlight, bucket.inFlight);
+    state.updatedAtUnixMs = Date.now();
+  }
+
+  function finishNetworkRequest(target, status = 'completed') {
+    const bucket = state.network[target];
+    if (!bucket) {
+      return;
+    }
+    if (bucket.inFlight > 0) {
+      bucket.inFlight -= 1;
+    }
+    if (status === 'aborted') {
+      bucket.aborted += 1;
+    } else if (status === 'failed') {
+      bucket.failed += 1;
+    } else {
+      bucket.completed += 1;
+    }
+    state.updatedAtUnixMs = Date.now();
+  }
 
   const monitor = {
     recordSnapshotApply(durationMs) {
@@ -186,6 +234,22 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
       pushBoundedSample(state.heapSamplesBytes, heapBytes, sampleLimit);
       state.updatedAtUnixMs = Date.now();
     },
+    markSnapshotDeferred() {
+      state.network.snapshot.deferred += 1;
+      state.updatedAtUnixMs = Date.now();
+    },
+    beginSnapshotRequest() {
+      beginNetworkRequest('snapshot');
+    },
+    finishSnapshotRequest(status = 'completed') {
+      finishNetworkRequest('snapshot', status);
+    },
+    beginDetailRequest() {
+      beginNetworkRequest('detail');
+    },
+    finishDetailRequest(status = 'completed') {
+      finishNetworkRequest('detail', status);
+    },
     snapshot() {
       return {
         updatedAtUnixMs: state.updatedAtUnixMs,
@@ -202,6 +266,10 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
           rollingFps: frameFps.snapshot().fps,
         },
         heap: reduceHeapSamples(state.heapSamplesBytes),
+        network: {
+          snapshot: { ...state.network.snapshot },
+          detail: { ...state.network.detail },
+        },
       };
     },
   };
@@ -209,6 +277,11 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
   if (globalWindow && typeof globalWindow === 'object') {
     globalWindow.__MEMPULSE_PERF__ = {
       snapshot: () => monitor.snapshot(),
+      markSnapshotDeferred: () => monitor.markSnapshotDeferred(),
+      beginSnapshotRequest: () => monitor.beginSnapshotRequest(),
+      finishSnapshotRequest: (status) => monitor.finishSnapshotRequest(status),
+      beginDetailRequest: () => monitor.beginDetailRequest(),
+      finishDetailRequest: (status) => monitor.finishDetailRequest(status),
     };
   }
 

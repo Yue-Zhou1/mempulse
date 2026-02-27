@@ -13,7 +13,7 @@ use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
 use viz_api::{
-    AppState, DashboardSnapshot, InMemoryVizProvider, PropagationEdge, VizDataProvider,
+    AppState, DashboardSnapshotV2, InMemoryVizProvider, PropagationEdge, VizDataProvider,
     build_router,
 };
 
@@ -260,13 +260,13 @@ fn seed_address(seed: u64) -> [u8; 20] {
     address
 }
 
-async fn measure_snapshot_latency_ms(state: &AppState) -> (f64, DashboardSnapshot) {
+async fn measure_snapshot_latency_ms(state: &AppState) -> (f64, DashboardSnapshotV2) {
     let app = build_router(state.clone());
     let start = Instant::now();
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/dashboard/snapshot?tx_limit=500&feature_limit=500&opp_limit=500&replay_limit=500")
+                .uri("/dashboard/snapshot-v2?tx_limit=500&feature_limit=500&opp_limit=500")
                 .body(Body::empty())
                 .expect("build snapshot request"),
         )
@@ -278,7 +278,7 @@ async fn measure_snapshot_latency_ms(state: &AppState) -> (f64, DashboardSnapsho
     let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
         .await
         .expect("read snapshot response body");
-    let snapshot: DashboardSnapshot =
+    let snapshot: DashboardSnapshotV2 =
         serde_json::from_slice(&body).expect("decode dashboard snapshot json");
     (elapsed_ms, snapshot)
 }

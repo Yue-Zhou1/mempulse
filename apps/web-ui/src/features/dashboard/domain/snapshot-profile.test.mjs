@@ -25,8 +25,21 @@ test('resolveDashboardSnapshotLimits returns opps-focused limits', () => {
   });
 
   assert.deepEqual(limits, {
-    txLimit: 80,
-    featureLimit: 160,
+    txLimit: 1,
+    featureLimit: 1,
+    oppLimit: 600,
+  });
+});
+
+test('resolveDashboardSnapshotLimits minimizes tx and feature payload on opps screen', () => {
+  const limits = resolveDashboardSnapshotLimits({
+    activeScreen: 'opps',
+    snapshotTxLimit: 500,
+  });
+
+  assert.deepEqual(limits, {
+    txLimit: 1,
+    featureLimit: 1,
     oppLimit: 600,
   });
 });
@@ -44,7 +57,20 @@ test('resolveDashboardSnapshotLimits falls back to radar limits for removed repl
   });
 });
 
-test('buildDashboardSnapshotPath disables replay payload on routine dashboard snapshots', () => {
+test('resolveDashboardSnapshotLimits keeps feature limit aligned with large radar tx windows', () => {
+  const limits = resolveDashboardSnapshotLimits({
+    activeScreen: 'radar',
+    snapshotTxLimit: 500,
+  });
+
+  assert.deepEqual(limits, {
+    txLimit: 500,
+    featureLimit: 500,
+    oppLimit: 220,
+  });
+});
+
+test('buildDashboardSnapshotPath uses snapshot-v2 by default', () => {
   const path = buildDashboardSnapshotPath({
     txLimit: 80,
     featureLimit: 160,
@@ -53,6 +79,6 @@ test('buildDashboardSnapshotPath disables replay payload on routine dashboard sn
 
   assert.equal(
     path,
-    '/dashboard/snapshot?tx_limit=80&feature_limit=160&opp_limit=600&replay_limit=0',
+    '/dashboard/snapshot-v2?tx_limit=80&feature_limit=160&opp_limit=600',
   );
 });

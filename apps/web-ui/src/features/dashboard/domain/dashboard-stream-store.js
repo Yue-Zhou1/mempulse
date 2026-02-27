@@ -68,6 +68,9 @@ function resolveRequestFrame(options) {
   if (typeof globalThis?.requestAnimationFrame === 'function') {
     return globalThis.requestAnimationFrame.bind(globalThis);
   }
+  if (typeof globalThis?.setTimeout === 'function') {
+    return (callback) => globalThis.setTimeout(() => callback(Date.now()), 0);
+  }
   return null;
 }
 
@@ -77,6 +80,9 @@ function resolveCancelFrame(options) {
   }
   if (typeof globalThis?.cancelAnimationFrame === 'function') {
     return globalThis.cancelAnimationFrame.bind(globalThis);
+  }
+  if (typeof globalThis?.clearTimeout === 'function') {
+    return globalThis.clearTimeout.bind(globalThis);
   }
   return null;
 }

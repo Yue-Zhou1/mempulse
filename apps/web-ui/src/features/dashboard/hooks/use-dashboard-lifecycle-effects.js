@@ -5,6 +5,7 @@ import {
   buildDashboardSnapshotPath,
   resolveDashboardSnapshotLimits,
 } from '../domain/snapshot-profile.js';
+import { resolveDashboardRuntimePolicy } from '../domain/screen-runtime-policy.js';
 import {
   fetchJson,
   isAbortError,
@@ -18,7 +19,7 @@ import {
 import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
 import { createSystemHealthMonitor } from '../lib/system-health.js';
 import { useDashboardStreamWorker } from './use-dashboard-stream-worker.js';
-import { shouldScheduleGapResync } from '../workers/stream-protocol.js';
+import { shouldApplyStreamBatch, shouldScheduleGapResync } from '../workers/stream-protocol.js';
 
 const snapshotThrottleMs = 1200;
 const streamBatchLimit = 20;
@@ -129,6 +130,84 @@ function chainStatusEquivalent(left, right) {
   );
 }
 
+function mergeFeatureDetailRows(existingRows, incomingRows, maxItems) {
+  const cap = Number.isFinite(maxItems)
+    ? Math.max(1, Math.floor(maxItems))
+    : Number.POSITIVE_INFINITY;
+  const nextRows = [];
+  const seen = new Set();
+  const existingByHash = new Map();
+
+  for (const row of existingRows ?? []) {
+    if (row?.hash) {
+      existingByHash.set(row.hash, row);
+    }
+  }
+
+  const appendRows = (rows) => {
+    for (const row of rows ?? []) {
+      const hash = row?.hash;
+      if (!hash || seen.has(hash)) {
+        continue;
+      }
+      seen.add(hash);
+      const previous = existingByHash.get(hash);
+      nextRows.push(previous && featureDetailEquivalent(previous, row) ? previous : row);
+      if (nextRows.length >= cap) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (appendRows(incomingRows)) {
+    return nextRows;
+  }
+  appendRows(existingRows);
+  return nextRows;
+}
+
+function mergeOpportunityRows(existingRows, incomingRows, maxItems) {
+  const cap = Number.isFinite(maxItems)
+    ? Math.max(1, Math.floor(maxItems))
+    : Number.POSITIVE_INFINITY;
+  const nextRows = [];
+  const seen = new Set();
+  const existingByKey = new Map();
+
+  for (const row of existingRows ?? []) {
+    const key = opportunityRowKey(row);
+    if (key) {
+      existingByKey.set(key, row);
+    }
+  }
+
+  const appendRows = (rows) => {
+    for (const row of rows ?? []) {
+      const key = opportunityRowKey(row);
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      const previous = existingByKey.get(key);
+      nextRows.push(previous && opportunityEquivalent(previous, row) ? previous : row);
+      if (nextRows.length >= cap) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const orderedIncoming = [...(incomingRows ?? [])].sort(
+    (left, right) => Number(right?.detected_unix_ms ?? 0) - Number(left?.detected_unix_ms ?? 0),
+  );
+  if (appendRows(orderedIncoming)) {
+    return nextRows;
+  }
+  appendRows(existingRows);
+  return nextRows;
+}
+
 function reasonsEquivalent(leftReasons, rightReasons) {
   if (leftReasons === rightReasons) {
     return true;
@@ -176,6 +255,8 @@ export function useDashboardLifecycleEffects({
   samplingStride,
   samplingFlushIdleMs,
   heapEmergencyPurgeMb,
+  devPerformanceEntryCleanupEnabled,
+  devPerformanceEntryCleanupIntervalMs,
   workerEnabled,
   transactionRetentionMs,
   transactionRetentionMinutes,
@@ -216,7 +297,7 @@ export function useDashboardLifecycleEffects({
   setDialogLoading,
   setDialogError,
 }) {
-  const { connectWorker, disconnectWorker } = useDashboardStreamWorker();
+  const { connectWorker, disconnectWorker, sendCredit } = useDashboardStreamWorker();
 
   useEffect(() => {
     recentTxRowsRef.current = recentTxRows;
@@ -259,13 +340,11 @@ export function useDashboardLifecycleEffects({
 
   useEffect(() => {
     let cancelled = false;
-    const snapshotPath = buildDashboardSnapshotPath(
-      resolveDashboardSnapshotLimits({ activeScreen, snapshotTxLimit }),
-    );
     const perfMonitor = createDashboardPerfMonitor(globalThis?.window);
     const resolvedStreamBatchMs = Number.isFinite(streamBatchMs)
       ? Math.max(100, Math.floor(streamBatchMs))
       : 500;
+    const runtimePolicy = resolveDashboardRuntimePolicy(activeScreen);
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
     let steadySnapshotTimer = null;
@@ -274,6 +353,13 @@ export function useDashboardLifecycleEffects({
     let streamBatchIndex = 0;
     let frameProbeRafId = null;
     let lastAnimationFrameTs = null;
+    let performanceEntryCleanupTimer = null;
+    let pendingDeltaFlushCancel = null;
+    let pendingDeltaTransactions = [];
+    let pendingDeltaFeatureRows = [];
+    let pendingDeltaOpportunityRows = [];
+    let pendingDeltaMarketStats = null;
+    let pendingDeltaLatestSeqId = null;
 
     const cleanupStreamWorker = () => {
       disconnectWorker();
@@ -332,6 +418,57 @@ export function useDashboardLifecycleEffects({
       lastAnimationFrameTs = null;
     };
 
+    const clearPerformanceEntryCleanupTimer = () => {
+      if (performanceEntryCleanupTimer) {
+        window.clearInterval(performanceEntryCleanupTimer);
+        performanceEntryCleanupTimer = null;
+      }
+    };
+
+    const clearPerformanceEntries = () => {
+      if (!import.meta.env.DEV || !devPerformanceEntryCleanupEnabled) {
+        return;
+      }
+      const perf = globalThis?.performance;
+      if (!perf || typeof perf !== 'object') {
+        return;
+      }
+      if (typeof perf.clearMeasures === 'function') {
+        perf.clearMeasures();
+      }
+      if (typeof perf.clearMarks === 'function') {
+        perf.clearMarks();
+      }
+      if (typeof perf.clearResourceTimings === 'function') {
+        perf.clearResourceTimings();
+      }
+    };
+
+    const appendPendingRows = (targetRows, incomingRows) => {
+      if (!Array.isArray(incomingRows) || incomingRows.length === 0) {
+        return;
+      }
+      for (const row of incomingRows) {
+        targetRows.push(row);
+      }
+    };
+
+    const cancelPendingDeltaFlush = () => {
+      if (typeof pendingDeltaFlushCancel === 'function') {
+        pendingDeltaFlushCancel();
+      }
+      pendingDeltaFlushCancel = null;
+    };
+
+    const resetPendingStreamDelta = () => {
+      cancelPendingDeltaFlush();
+      pendingDeltaTransactions = [];
+      pendingDeltaFeatureRows = [];
+      pendingDeltaOpportunityRows = [];
+      pendingDeltaMarketStats = null;
+      pendingDeltaLatestSeqId = null;
+    };
+
     const flushSampledCommit = () => {
       if (!sampledCommit) {
         return false;
@@ -360,6 +497,7 @@ export function useDashboardLifecycleEffects({
         return;
       }
 
+      resetPendingStreamDelta();
       sampledCommit = null;
       streamBatchIndex = 0;
       cancelTickerCommit();
@@ -425,6 +563,23 @@ export function useDashboardLifecycleEffects({
       }
     };
 
+    const clearTransactionBuffers = () => {
+      resetPendingStreamDelta();
+      sampledCommit = null;
+      streamBatchIndex = 0;
+      cancelTickerCommit();
+      transactionStoreRef.current.reset();
+      recentTxRowsRef.current = [];
+      transactionRowsRef.current = [];
+      enqueueTickerCommit({
+        recentTxRows: [],
+        transactionRows: [],
+      });
+      flushTickerCommit();
+      setFeatureSummaryRows((current) => (current.length ? [] : current));
+      setFeatureDetailRows((current) => (current.length ? [] : current));
+    };
+
     const flushTransactionCommit = () => {
       if (cancelled) {
         return;
@@ -451,6 +606,26 @@ export function useDashboardLifecycleEffects({
           return;
         }
         flushTransactionCommit();
+      });
+    };
+
+    const commitMarketStats = (rawStats) => {
+      if (!rawStats || typeof rawStats !== 'object') {
+        return;
+      }
+      setMarketStats((current) => {
+        const next = resolveMarketStatsSnapshot(rawStats, current);
+        if (
+          next.totalSignalVolume === current.totalSignalVolume
+          && next.totalTxCount === current.totalTxCount
+          && next.lowRiskCount === current.lowRiskCount
+          && next.mediumRiskCount === current.mediumRiskCount
+          && next.highRiskCount === current.highRiskCount
+          && next.successRate === current.successRate
+        ) {
+          return current;
+        }
+        return next;
       });
     };
 
@@ -505,77 +680,153 @@ export function useDashboardLifecycleEffects({
       );
     };
 
+    const applyDeltaFeatureDetails = (featureRows) => {
+      const incoming = Array.isArray(featureRows) ? featureRows : [];
+      if (!incoming.length) {
+        return;
+      }
+      setFeatureDetailRows((current) => {
+        const merged = mergeFeatureDetailRows(current, incoming, maxFeatureHistory);
+        return rowsReferenceEqual(current, merged) ? current : merged;
+      });
+    };
+
+    const applyDeltaOpportunities = (opportunityRows) => {
+      const incoming = Array.isArray(opportunityRows) ? opportunityRows : [];
+      if (!incoming.length) {
+        return;
+      }
+      setOpportunityRows((current) => {
+        const merged = mergeOpportunityRows(current, incoming, maxOpportunityHistory);
+        return rowsReferenceEqual(current, merged) ? current : merged;
+      });
+    };
+
+    const flushPendingStreamDelta = () => {
+      const nextMarketStats = pendingDeltaMarketStats;
+      const nextOpportunityRows = pendingDeltaOpportunityRows;
+      const nextFeatureRows = pendingDeltaFeatureRows;
+      const nextTransactions = pendingDeltaTransactions;
+      const nextLatestSeqId = pendingDeltaLatestSeqId;
+      pendingDeltaMarketStats = null;
+      pendingDeltaOpportunityRows = [];
+      pendingDeltaFeatureRows = [];
+      pendingDeltaTransactions = [];
+      pendingDeltaLatestSeqId = null;
+
+      if (runtimePolicy.shouldComputeRadarDerived) {
+        commitMarketStats(nextMarketStats);
+      }
+      applyDeltaOpportunities(nextOpportunityRows);
+      if (runtimePolicy.shouldProcessTxStream) {
+        applyDeltaFeatureDetails(nextFeatureRows);
+        if (nextTransactions.length || Number.isFinite(nextLatestSeqId)) {
+          applyDeltaTransactions(nextTransactions, 'ws-delta', nextLatestSeqId);
+        }
+      } else if (Number.isFinite(nextLatestSeqId)) {
+        latestSeqIdRef.current = Math.max(latestSeqIdRef.current, nextLatestSeqId);
+      }
+    };
+
+    const schedulePendingStreamDeltaFlush = () => {
+      if (pendingDeltaFlushCancel || cancelled) {
+        return;
+      }
+
+      if (
+        typeof window.requestAnimationFrame === 'function'
+        && typeof window.cancelAnimationFrame === 'function'
+      ) {
+        const rafId = window.requestAnimationFrame(() => {
+          pendingDeltaFlushCancel = null;
+          flushPendingStreamDelta();
+        });
+        pendingDeltaFlushCancel = () => {
+          window.cancelAnimationFrame(rafId);
+        };
+        return;
+      }
+
+      const timeoutId = window.setTimeout(() => {
+        pendingDeltaFlushCancel = null;
+        flushPendingStreamDelta();
+      }, 0);
+      pendingDeltaFlushCancel = () => {
+        window.clearTimeout(timeoutId);
+      };
+    };
+
     const applySnapshot = (snapshot, sourceLabel) => {
       const applyStartedAt = resolvePerfNow();
       const opportunities = Array.isArray(snapshot?.opportunities)
         ? snapshot.opportunities.slice(0, maxOpportunityHistory)
         : [];
-      const featureSummary = Array.isArray(snapshot?.feature_summary)
+      const featureSummary = runtimePolicy.shouldComputeRadarDerived && Array.isArray(snapshot?.feature_summary)
         ? snapshot.feature_summary
         : [];
-      const featureDetails = Array.isArray(snapshot?.feature_details)
+      const featureDetails = runtimePolicy.shouldComputeRadarDerived && Array.isArray(snapshot?.feature_details)
         ? snapshot.feature_details.slice(0, maxFeatureHistory)
         : [];
-      const txRecent = Array.isArray(snapshot?.transactions) ? snapshot.transactions : [];
+      const txRecent = runtimePolicy.shouldProcessTxStream && Array.isArray(snapshot?.transactions)
+        ? snapshot.transactions
+        : [];
       const chainStatus = normalizeChainStatusRows(snapshot?.chain_ingest_status);
 
-      const txSnapshot = transactionStoreRef.current.snapshot(txRecent, {
-        maxItems: maxTransactionHistory,
-        nowUnixMs: Date.now(),
-        maxAgeMs: transactionRetentionMs,
-      });
-      const nextTransactions = txSnapshot.rows;
-      const stabilizedTransactions = rowsReferenceEqual(
-        transactionRowsRef.current,
-        nextTransactions,
-      )
-        ? transactionRowsRef.current
-        : nextTransactions;
-      transactionRowsRef.current = stabilizedTransactions;
+      let transactionCount = transactionRowsRef.current.length;
+      if (runtimePolicy.shouldProcessTxStream) {
+        const txSnapshot = transactionStoreRef.current.snapshot(txRecent, {
+          maxItems: maxTransactionHistory,
+          nowUnixMs: Date.now(),
+          maxAgeMs: transactionRetentionMs,
+        });
+        const nextTransactions = txSnapshot.rows;
+        const stabilizedTransactions = rowsReferenceEqual(
+          transactionRowsRef.current,
+          nextTransactions,
+        )
+          ? transactionRowsRef.current
+          : nextTransactions;
+        transactionRowsRef.current = stabilizedTransactions;
 
-      const stabilizedRecentTxRows = stabilizeRows(
-        recentTxRowsRef.current,
-        txRecent,
-        (row) => row.hash,
-        txSummaryEquivalent,
-      );
-      recentTxRowsRef.current = stabilizedRecentTxRows;
+        const stabilizedRecentTxRows = stabilizeRows(
+          recentTxRowsRef.current,
+          txRecent,
+          (row) => row.hash,
+          txSummaryEquivalent,
+        );
+        recentTxRowsRef.current = stabilizedRecentTxRows;
 
-      queueTransactionCommit({
-        recentTxRows: stabilizedRecentTxRows,
-        transactionRows: stabilizedTransactions,
-      });
+        queueTransactionCommit({
+          recentTxRows: stabilizedRecentTxRows,
+          transactionRows: stabilizedTransactions,
+        });
+        transactionCount = stabilizedTransactions.length;
+      }
       setOpportunityRows((current) =>
         stabilizeRows(current, opportunities, opportunityRowKey, opportunityEquivalent),
       );
-      setFeatureSummaryRows((current) =>
-        stabilizeRows(
-          current,
-          featureSummary,
-          (row) => `${row.protocol}::${row.category}`,
-          featureSummaryEquivalent,
-        ),
-      );
-      setFeatureDetailRows((current) =>
-        stabilizeRows(current, featureDetails, (row) => row.hash, featureDetailEquivalent),
-      );
+      if (runtimePolicy.shouldComputeRadarDerived) {
+        setFeatureSummaryRows((current) =>
+          stabilizeRows(
+            current,
+            featureSummary,
+            (row) => `${row.protocol}::${row.category}`,
+            featureSummaryEquivalent,
+          ),
+        );
+        setFeatureDetailRows((current) =>
+          stabilizeRows(current, featureDetails, (row) => row.hash, featureDetailEquivalent),
+        );
+      } else {
+        setFeatureSummaryRows((current) => (current.length ? [] : current));
+        setFeatureDetailRows((current) => (current.length ? [] : current));
+      }
       setChainStatusRows((current) =>
         stabilizeRows(current, chainStatus, (row) => row.chain_key, chainStatusEquivalent),
       );
-      setMarketStats((current) => {
-        const next = resolveMarketStatsSnapshot(snapshot?.market_stats, current);
-        if (
-          next.totalSignalVolume === current.totalSignalVolume
-          && next.totalTxCount === current.totalTxCount
-          && next.lowRiskCount === current.lowRiskCount
-          && next.mediumRiskCount === current.mediumRiskCount
-          && next.highRiskCount === current.highRiskCount
-          && next.successRate === current.successRate
-        ) {
-          return current;
-        }
-        return next;
-      });
+      if (runtimePolicy.shouldComputeRadarDerived) {
+        commitMarketStats(snapshot?.market_stats);
+      }
 
       setSelectedOpportunityKey((current) => {
         if (current && opportunities.some((row) => opportunityRowKey(row) === current)) {
@@ -591,24 +842,38 @@ export function useDashboardLifecycleEffects({
 
       const lastUpdated = new Date().toLocaleTimeString();
       setStatusMessage(
-        `Connected(${sourceLabel}) · opps=${opportunities.length} · features=${featureDetails.length} · tx=${nextTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
+        `Connected(${sourceLabel}) · opps=${opportunities.length} · features=${featureDetails.length} · tx=${transactionCount}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
       );
       perfMonitor.recordSnapshotApply(resolvePerfNow() - applyStartedAt);
       captureHeapSample();
     };
 
-    const syncSnapshot = async (sourceLabel) => {
-      if (cancelled || snapshotInFlightRef.current) {
+    const syncSnapshot = async (sourceLabel, options = {}) => {
+      if (cancelled) {
         return;
       }
+      if (snapshotInFlightRef.current) {
+        perfMonitor.markSnapshotDeferred();
+        return;
+      }
+      const forceTxWindow = Boolean(options?.forceTxWindow);
+      const effectiveSnapshotPath = buildDashboardSnapshotPath(
+        resolveDashboardSnapshotLimits({
+          activeScreen,
+          snapshotTxLimit: forceTxWindow ? maxTransactionHistory : snapshotTxLimit,
+        }),
+      );
       const requestAbortController = new AbortController();
       snapshotRequestAbortController = requestAbortController;
       snapshotInFlightRef.current = true;
+      perfMonitor.beginSnapshotRequest();
+      let requestStatus = 'completed';
       try {
-        const snapshot = await fetchJson(apiBase, snapshotPath, {
+        const snapshot = await fetchJson(apiBase, effectiveSnapshotPath, {
           signal: requestAbortController.signal,
         });
         if (cancelled || snapshotRequestAbortController !== requestAbortController) {
+          requestStatus = 'aborted';
           return;
         }
         setHasError(false);
@@ -619,20 +884,27 @@ export function useDashboardLifecycleEffects({
           || snapshotRequestAbortController !== requestAbortController
           || isAbortError(error)
         ) {
+          requestStatus = 'aborted';
           return;
         }
+        requestStatus = 'failed';
         setHasError(true);
         setStatusMessage(`Snapshot sync failed: ${error.message}`);
       } finally {
         if (snapshotRequestAbortController === requestAbortController) {
           snapshotRequestAbortController = null;
         }
+        perfMonitor.finishSnapshotRequest(requestStatus);
         snapshotInFlightRef.current = false;
       }
     };
 
-    const scheduleSnapshot = (sourceLabel, immediate = false) => {
-      if (cancelled || snapshotTimerRef.current) {
+    const scheduleSnapshot = (sourceLabel, immediate = false, options = {}) => {
+      if (cancelled) {
+        return;
+      }
+      if (snapshotTimerRef.current) {
+        perfMonitor.markSnapshotDeferred();
         return;
       }
       const now = Date.now();
@@ -642,7 +914,7 @@ export function useDashboardLifecycleEffects({
       snapshotTimerRef.current = window.setTimeout(async () => {
         snapshotTimerRef.current = null;
         nextSnapshotAtRef.current = Date.now() + snapshotThrottleMs;
-        await syncSnapshot(sourceLabel);
+        await syncSnapshot(sourceLabel, options);
       }, delay);
     };
 
@@ -666,17 +938,26 @@ export function useDashboardLifecycleEffects({
       if (cancelled) {
         return;
       }
+      resetPendingStreamDelta();
       cleanupStreamWorker();
       clearFallbackSnapshotPollTimer();
+      clearSteadySnapshotTimer();
       if (!workerEnabled) {
         reconnectAttemptsRef.current = 0;
+        const fallbackSnapshotRefreshMs = runtimePolicy.shouldProcessTxStream
+          ? snapshotThrottleMs
+          : steadySnapshotRefreshMs;
         setStatusMessage(
-          `Worker pipeline disabled · polling snapshots every ${snapshotThrottleMs}ms`,
+          `Worker pipeline disabled · polling snapshots every ${fallbackSnapshotRefreshMs}ms`,
         );
-        scheduleSnapshot('snapshot-poll-bootstrap', true);
+        scheduleSnapshot('snapshot-poll-bootstrap', true, {
+          forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+        });
         fallbackSnapshotPollTimer = window.setInterval(() => {
-          scheduleSnapshot('snapshot-poll', true);
-        }, snapshotThrottleMs);
+          scheduleSnapshot('snapshot-poll', true, {
+            forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+          });
+        }, fallbackSnapshotRefreshMs);
         return;
       }
       connectWorker({
@@ -692,20 +973,46 @@ export function useDashboardLifecycleEffects({
           }
           reconnectAttemptsRef.current = 0;
           setHasError(false);
-          scheduleSnapshot('ws-open', true);
+          scheduleSnapshot('ws-open', true, {
+            forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+          });
         },
         onBatch: (batch) => {
           if (cancelled) {
             return;
           }
 
-          const previousSeqId = latestSeqIdRef.current;
+          const previousSeqId = Number.isFinite(pendingDeltaLatestSeqId)
+            ? Math.max(latestSeqIdRef.current, pendingDeltaLatestSeqId)
+            : latestSeqIdRef.current;
           const seqId = batch.latestSeqId;
-          if (!Number.isFinite(seqId) || seqId <= previousSeqId) {
+          if (!shouldApplyStreamBatch({
+            previousSeqId,
+            latestSeqId: seqId,
+            transactionCount: Array.isArray(batch.transactions) ? batch.transactions.length : 0,
+            featureCount: Array.isArray(batch.featureRows) ? batch.featureRows.length : 0,
+            opportunityCount: Array.isArray(batch.opportunityRows)
+              ? batch.opportunityRows.length
+              : 0,
+          })) {
+            pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
+            schedulePendingStreamDeltaFlush();
+            sendCredit(1);
             return;
           }
 
-          applyDeltaTransactions(batch.transactions, 'ws-delta', seqId);
+          pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
+          appendPendingRows(pendingDeltaOpportunityRows, batch.opportunityRows);
+          if (runtimePolicy.shouldProcessTxStream) {
+            appendPendingRows(pendingDeltaFeatureRows, batch.featureRows);
+            appendPendingRows(pendingDeltaTransactions, batch.transactions);
+          }
+          if (Number.isFinite(seqId)) {
+            pendingDeltaLatestSeqId = Number.isFinite(pendingDeltaLatestSeqId)
+              ? Math.max(pendingDeltaLatestSeqId, seqId)
+              : seqId;
+          }
+          schedulePendingStreamDeltaFlush();
           if (shouldScheduleGapResync({
             previousSeqId,
             latestSeqId: seqId,
@@ -715,8 +1022,11 @@ export function useDashboardLifecycleEffects({
             cooldownMs: steadySnapshotRefreshMs,
           })) {
             lastGapSnapshotAtRef.current = Date.now();
-            scheduleSnapshot('ws-gap-resync', true);
+            scheduleSnapshot('ws-gap-resync', true, {
+              forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+            });
           }
+          sendCredit(1);
         },
         onClose: () => {
           if (cancelled) {
@@ -736,21 +1046,35 @@ export function useDashboardLifecycleEffects({
     };
 
     setStatusMessage(
-      `Connecting stream to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
+      `Connecting stream(v2) to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
     );
     setHasError(false);
+    if (!runtimePolicy.shouldProcessTxStream) {
+      clearTransactionBuffers();
+    }
     startFrameProbe();
     captureHeapSample();
     heapSampleTimer = window.setInterval(() => {
       captureHeapSample();
     }, 5000);
-    steadySnapshotTimer = window.setInterval(() => {
-      scheduleSnapshot('steady-refresh', true);
-    }, steadySnapshotRefreshMs);
-    scheduleSnapshot('bootstrap', true);
+    if (import.meta.env.DEV && devPerformanceEntryCleanupEnabled) {
+      clearPerformanceEntries();
+      performanceEntryCleanupTimer = window.setInterval(() => {
+        clearPerformanceEntries();
+      }, devPerformanceEntryCleanupIntervalMs);
+    }
+    scheduleSnapshot('bootstrap', true, {
+      forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+    });
     connectStream();
+    if (workerEnabled && runtimePolicy.shouldProcessTxStream) {
+      steadySnapshotTimer = window.setInterval(() => {
+        scheduleSnapshot('steady-refresh', true);
+      }, steadySnapshotRefreshMs);
+    }
 
     return () => {
+      resetPendingStreamDelta();
       flushTransactionCommit();
       cancelled = true;
       abortSnapshotRequest();
@@ -762,6 +1086,7 @@ export function useDashboardLifecycleEffects({
       clearFallbackSnapshotPollTimer();
       clearSteadySnapshotTimer();
       clearFrameProbe();
+      clearPerformanceEntryCleanupTimer();
       cleanupStreamWorker();
     };
   }, [
@@ -783,6 +1108,8 @@ export function useDashboardLifecycleEffects({
     samplingStride,
     samplingFlushIdleMs,
     heapEmergencyPurgeMb,
+    devPerformanceEntryCleanupEnabled,
+    devPerformanceEntryCleanupIntervalMs,
     workerEnabled,
     nextSnapshotAtRef,
     reconnectAttemptsRef,
@@ -800,6 +1127,7 @@ export function useDashboardLifecycleEffects({
     snapshotInFlightRef,
     snapshotTimerRef,
     snapshotTxLimit,
+    sendCredit,
     transactionStoreRef,
     transactionRetentionMinutes,
     transactionRetentionMs,
@@ -816,14 +1144,28 @@ export function useDashboardLifecycleEffects({
 
     let cancelled = false;
     const detailRequestAbortController = new AbortController();
+    const perfApi = globalThis?.window?.__MEMPULSE_PERF__;
+    const beginDetailRequest = () => {
+      if (typeof perfApi?.beginDetailRequest === 'function') {
+        perfApi.beginDetailRequest();
+      }
+    };
+    const finishDetailRequest = (status) => {
+      if (typeof perfApi?.finishDetailRequest === 'function') {
+        perfApi.finishDetailRequest(status);
+      }
+    };
     setDialogLoading(true);
     setDialogError('');
+    beginDetailRequest();
+    let detailRequestStatus = 'completed';
 
     fetchJson(apiBase, `/transactions/${encodeURIComponent(dialogHash)}`, {
       signal: detailRequestAbortController.signal,
     })
       .then((detail) => {
         if (cancelled) {
+          detailRequestStatus = 'aborted';
           return;
         }
         setTransactionDetailByHash(dialogHash, detail, detailCacheLimit);
@@ -831,10 +1173,15 @@ export function useDashboardLifecycleEffects({
       })
       .catch((error) => {
         if (cancelled || isAbortError(error)) {
+          detailRequestStatus = 'aborted';
           return;
         }
+        detailRequestStatus = 'failed';
         setDialogLoading(false);
         setDialogError(`Failed to load tx details: ${error.message}`);
+      })
+      .finally(() => {
+        finishDetailRequest(detailRequestStatus);
       });
 
     return () => {

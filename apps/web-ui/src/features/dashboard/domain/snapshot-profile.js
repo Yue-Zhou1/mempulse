@@ -4,8 +4,8 @@ const RADAR_PROFILE = Object.freeze({
 });
 
 const OPPS_PROFILE = Object.freeze({
-  txLimit: 80,
-  featureLimit: 160,
+  txLimit: 1,
+  featureLimit: 1,
   oppLimit: 600,
 });
 
@@ -40,17 +40,20 @@ export function resolveDashboardSnapshotLimits({ activeScreen, snapshotTxLimit }
 
   return {
     txLimit: boundedSnapshotTxLimit,
-    featureLimit: RADAR_PROFILE.featureLimit,
+    featureLimit: Math.max(RADAR_PROFILE.featureLimit, boundedSnapshotTxLimit),
     oppLimit: RADAR_PROFILE.oppLimit,
   };
 }
 
-export function buildDashboardSnapshotPath({ txLimit, featureLimit, oppLimit }) {
+export function buildDashboardSnapshotPath({
+  txLimit,
+  featureLimit,
+  oppLimit,
+}) {
   const params = new URLSearchParams({
     tx_limit: String(txLimit),
     feature_limit: String(featureLimit),
     opp_limit: String(oppLimit),
-    replay_limit: '0',
   });
-  return `/dashboard/snapshot?${params.toString()}`;
+  return `/dashboard/snapshot-v2?${params.toString()}`;
 }

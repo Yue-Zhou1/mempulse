@@ -1,5 +1,6 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { filterRowsByMainnet } from '../domain/mainnet-filter.js';
+import { resolveDashboardRuntimePolicy } from '../domain/screen-runtime-policy.js';
 import {
   chainStatusTone,
   formatChainStatusChainKey,
@@ -16,7 +17,11 @@ import {
   resolveVirtualizedSelectionIndex,
 } from '../lib/radar-virtualized-model.js';
 
+const EMPTY_ROWS = [];
+const EMPTY_FEATURE_MAP = new Map();
+
 export function useDashboardDerivedState({
+  activeScreen,
   transactionRows,
   liveMainnetFilter,
   query,
@@ -38,15 +43,28 @@ export function useDashboardDerivedState({
   setTransactionPage,
   setSelectedOpportunityKey,
 }) {
+  const previousVirtualizedTickerRowsRef = useRef(null);
+  const runtimePolicy = useMemo(
+    () => resolveDashboardRuntimePolicy(activeScreen),
+    [activeScreen],
+  );
+  const shouldComputeRadarDerived = runtimePolicy.shouldComputeRadarDerived;
+
   const featureByHash = useMemo(() => {
+    if (!shouldComputeRadarDerived && !dialogHash) {
+      return EMPTY_FEATURE_MAP;
+    }
     const map = new Map();
     for (const row of featureDetailRows) {
       map.set(row.hash, row);
     }
     return map;
-  }, [featureDetailRows]);
+  }, [dialogHash, featureDetailRows, shouldComputeRadarDerived]);
 
   const filteredTransactions = useMemo(() => {
+    if (!shouldComputeRadarDerived) {
+      return EMPTY_ROWS;
+    }
     const scopedRows = filterRowsByMainnet(
       transactionRows,
       (row) => resolveMainnetLabel(row.chain_id, row.source_id),
@@ -71,7 +89,13 @@ export function useDashboardDerivedState({
         || feature?.category?.toLowerCase().includes(needle)
       );
     });
-  }, [featureByHash, liveMainnetFilter, query, transactionRows]);
+  }, [
+    featureByHash,
+    liveMainnetFilter,
+    query,
+    shouldComputeRadarDerived,
+    transactionRows,
+  ]);
 
   const filteredOpportunityRows = useMemo(
     () => filterRowsByMainnet(
@@ -83,8 +107,10 @@ export function useDashboardDerivedState({
   );
 
   const selectedTransaction = useMemo(
-    () => transactionRows.find((row) => row.hash === selectedHash) ?? null,
-    [selectedHash, transactionRows],
+    () => (shouldComputeRadarDerived
+      ? transactionRows.find((row) => row.hash === selectedHash) ?? null
+      : null),
+    [selectedHash, shouldComputeRadarDerived, transactionRows],
   );
 
   const selectedDetail = useMemo(() => {
@@ -160,8 +186,10 @@ export function useDashboardDerivedState({
     ),
   );
   const pagedTransactions = useMemo(
-    () => filteredTransactions.slice(0, maxPagedRows),
-    [filteredTransactions, maxPagedRows],
+    () => (shouldComputeRadarDerived
+      ? filteredTransactions.slice(0, maxPagedRows)
+      : EMPTY_ROWS),
+    [filteredTransactions, maxPagedRows, shouldComputeRadarDerived],
   );
 
   const transactionPageCount = Math.max(
@@ -170,13 +198,26 @@ export function useDashboardDerivedState({
   );
   const normalizedTransactionPage = Math.min(transactionPage, transactionPageCount);
   const transactionPageStart = (normalizedTransactionPage - 1) * tickerPageSize;
-  const latestTickerRows = pagedTransactions.slice(
-    transactionPageStart,
-    transactionPageStart + tickerPageSize,
+  const latestTickerRows = useMemo(
+    () => (shouldComputeRadarDerived
+      ? pagedTransactions.slice(
+        transactionPageStart,
+        transactionPageStart + tickerPageSize,
+      )
+      : EMPTY_ROWS),
+    [pagedTransactions, shouldComputeRadarDerived, tickerPageSize, transactionPageStart],
   );
   const deferredTickerRows = latestTickerRows;
   const virtualizedTickerRows = useMemo(
-    () => buildVirtualizedTickerRows(deferredTickerRows, tickerPageSize),
+    () => {
+      const next = buildVirtualizedTickerRows(
+        deferredTickerRows,
+        tickerPageSize,
+        previousVirtualizedTickerRowsRef.current,
+      );
+      previousVirtualizedTickerRowsRef.current = next;
+      return next;
+    },
     [deferredTickerRows, tickerPageSize],
   );
   const virtualizedSelectedTickerIndex = useMemo(

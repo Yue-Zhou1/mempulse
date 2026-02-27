@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
 use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
 use viz_api::{
-    AppState, MarketStats, ReplayPoint, TransactionDetail, TransactionSummary, VizDataProvider,
-    build_router,
+    AppState, DashboardCacheMetrics, MarketStats, ReplayPoint, TransactionDetail,
+    TransactionSummary, VizDataProvider, build_router,
 };
 
 #[derive(Clone)]
@@ -69,6 +69,10 @@ impl VizDataProvider for EmptyProvider {
             high_risk_count: 0,
             success_rate_bps: 10_000,
         }
+    }
+
+    fn dashboard_cache_metrics(&self) -> DashboardCacheMetrics {
+        DashboardCacheMetrics::default()
     }
 
     fn metric_snapshot(&self) -> MetricSnapshot {

@@ -8,20 +8,41 @@ function normalizeFixedSize(size) {
   return Math.min(DEFAULT_FIXED_TICKER_SIZE, Math.max(1, Math.floor(parsed)));
 }
 
-export function buildVirtualizedTickerRows(rows, fixedSize = DEFAULT_FIXED_TICKER_SIZE) {
+export function buildVirtualizedTickerRows(
+  rows,
+  fixedSize = DEFAULT_FIXED_TICKER_SIZE,
+  previousModels = null,
+) {
   const normalizedRows = Array.isArray(rows) ? rows : [];
   const size = normalizeFixedSize(fixedSize);
+  const previous = Array.isArray(previousModels) && previousModels.length === size
+    ? previousModels
+    : null;
   const models = [];
+  let reusedCount = 0;
   for (let index = 0; index < size; index += 1) {
     const row = normalizedRows[index] ?? null;
+    const hash = row?.hash ?? null;
+    const previousModel = previous?.[index] ?? null;
+    if (
+      previousModel
+      && previousModel.index === index
+      && previousModel.key === `slot-${index}`
+      && previousModel.hash === hash
+      && previousModel.row === row
+    ) {
+      models.push(previousModel);
+      reusedCount += 1;
+      continue;
+    }
     models.push({
       key: `slot-${index}`,
-      hash: row?.hash ?? null,
+      hash,
       row,
       index,
     });
   }
-  return models;
+  return previous && reusedCount === size ? previous : models;
 }
 
 export function resolveVirtualizedSelectionIndex(rows, selectedHash, visibleOffset = 0) {

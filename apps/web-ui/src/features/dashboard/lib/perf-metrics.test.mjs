@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   aggregateLongTasks,
   calculateDroppedFrameRatio,
+  createDashboardPerfMonitor,
   createRollingFpsCalculator,
   reduceHeapSamples,
 } from './perf-metrics.js';
@@ -55,4 +56,27 @@ test('calculateDroppedFrameRatio returns percentage of frames over budget', () =
   assert.equal(ratio.totalFrames, 4);
   assert.equal(ratio.droppedFrames, 2);
   assert.equal(ratio.ratio, 0.5);
+});
+
+test('createDashboardPerfMonitor tracks snapshot/detail request pending and queued telemetry', () => {
+  const monitor = createDashboardPerfMonitor();
+
+  monitor.markSnapshotDeferred();
+  monitor.beginSnapshotRequest();
+  monitor.beginDetailRequest();
+
+  let snapshot = monitor.snapshot();
+  assert.equal(snapshot.network.snapshot.deferred, 1);
+  assert.equal(snapshot.network.snapshot.inFlight, 1);
+  assert.equal(snapshot.network.snapshot.peakInFlight, 1);
+  assert.equal(snapshot.network.detail.inFlight, 1);
+
+  monitor.finishSnapshotRequest('aborted');
+  monitor.finishDetailRequest('completed');
+
+  snapshot = monitor.snapshot();
+  assert.equal(snapshot.network.snapshot.aborted, 1);
+  assert.equal(snapshot.network.snapshot.inFlight, 0);
+  assert.equal(snapshot.network.detail.completed, 1);
+  assert.equal(snapshot.network.detail.inFlight, 0);
 });

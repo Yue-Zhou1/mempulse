@@ -45,6 +45,48 @@ test('stream store merges multiple queued batches into one frame commit', () => 
   );
 });
 
+test('stream store defaults to requestAnimationFrame scheduler when available', () => {
+  const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const rafCallbacks = [];
+  const timeoutCallbacks = [];
+
+  globalThis.requestAnimationFrame = (callback) => {
+    rafCallbacks.push(callback);
+    return rafCallbacks.length;
+  };
+  globalThis.cancelAnimationFrame = () => {};
+  globalThis.setTimeout = (callback) => {
+    timeoutCallbacks.push(callback);
+    return timeoutCallbacks.length;
+  };
+  globalThis.clearTimeout = () => {};
+
+  try {
+    useDashboardStreamStore.getState().enqueueTickerCommit({
+      recentTxRows: [{ hash: '0x9' }],
+      transactionRows: [{ hash: '0x9' }],
+    });
+
+    assert.equal(rafCallbacks.length, 1);
+    assert.equal(timeoutCallbacks.length, 0);
+    assert.deepEqual(useDashboardStreamStore.getState().transactionRows, []);
+
+    rafCallbacks[0](0);
+    assert.deepEqual(
+      useDashboardStreamStore.getState().transactionRows.map((row) => row.hash),
+      ['0x9'],
+    );
+  } finally {
+    globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
 test('store selector subscriptions stay isolated by field', () => {
   let transactionRowsUpdates = 0;
   let selectionUpdates = 0;

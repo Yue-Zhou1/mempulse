@@ -20,6 +20,20 @@ test('buildVirtualizedTickerRows keeps stable slot keys and row references', () 
   assert.equal(first[2].row, null);
 });
 
+test('buildVirtualizedTickerRows reuses previous models when rows are unchanged', () => {
+  const rows = [
+    { hash: '0xaaa', sender: '0x1' },
+    { hash: '0xbbb', sender: '0x2' },
+  ];
+  const first = buildVirtualizedTickerRows(rows, 5);
+  const rowsWithNewArrayIdentity = rows.slice();
+  const second = buildVirtualizedTickerRows(rowsWithNewArrayIdentity, 5, first);
+
+  assert.equal(second, first);
+  assert.equal(second[0], first[0]);
+  assert.equal(second[1], first[1]);
+});
+
 test('buildVirtualizedTickerRows enforces a hard 50-slot table size', () => {
   const rows = Array.from({ length: 80 }, (_, index) => ({
     hash: `0x${index.toString(16).padStart(4, '0')}`,

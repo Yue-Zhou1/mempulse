@@ -8,8 +8,8 @@ test('resolveUiRuntimeConfig returns defaults when env is empty', () => {
   assert.equal(config.snapshotTxLimit, 120);
   assert.equal(config.detailCacheLimit, 96);
   assert.equal(config.maxTransactionHistory, 500);
-  assert.equal(config.maxFeatureHistory, 1500);
-  assert.equal(config.maxOpportunityHistory, 1500);
+  assert.equal(config.maxFeatureHistory, 500);
+  assert.equal(config.maxOpportunityHistory, 500);
   assert.equal(config.maxRenderedTransactions, 500);
   assert.equal(config.transactionRetentionMs, 300_000);
   assert.equal(config.transactionRetentionMinutes, 5);
@@ -20,6 +20,8 @@ test('resolveUiRuntimeConfig returns defaults when env is empty', () => {
   assert.equal(config.samplingStride, 5);
   assert.equal(config.samplingFlushIdleMs, 500);
   assert.equal(config.heapEmergencyPurgeMb, 400);
+  assert.equal(config.devPerformanceEntryCleanupEnabled, true);
+  assert.equal(config.devPerformanceEntryCleanupIntervalMs, 15000);
 });
 
 test('resolveUiRuntimeConfig accepts valid env overrides', () => {
@@ -39,6 +41,8 @@ test('resolveUiRuntimeConfig accepts valid env overrides', () => {
       VITE_UI_SAMPLING_STRIDE: '7',
       VITE_UI_SAMPLING_FLUSH_IDLE_MS: '650',
       VITE_UI_HEAP_EMERGENCY_PURGE_MB: '512',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP: 'false',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP_INTERVAL_MS: '9000',
     },
   });
 
@@ -57,6 +61,8 @@ test('resolveUiRuntimeConfig accepts valid env overrides', () => {
   assert.equal(config.samplingStride, 7);
   assert.equal(config.samplingFlushIdleMs, 650);
   assert.equal(config.heapEmergencyPurgeMb, 512);
+  assert.equal(config.devPerformanceEntryCleanupEnabled, false);
+  assert.equal(config.devPerformanceEntryCleanupIntervalMs, 9000);
 });
 
 test('resolveUiRuntimeConfig runtime config overrides env values', () => {
@@ -76,6 +82,8 @@ test('resolveUiRuntimeConfig runtime config overrides env values', () => {
       samplingStride: 6,
       samplingFlushIdleMs: 540,
       heapEmergencyPurgeMb: 450,
+      devPerformanceEntryCleanupEnabled: false,
+      devPerformanceEntryCleanupIntervalMs: 7000,
     },
     env: {
       VITE_UI_TX_SNAPSHOT_LIMIT: '200',
@@ -92,6 +100,8 @@ test('resolveUiRuntimeConfig runtime config overrides env values', () => {
       VITE_UI_SAMPLING_STRIDE: '7',
       VITE_UI_SAMPLING_FLUSH_IDLE_MS: '650',
       VITE_UI_HEAP_EMERGENCY_PURGE_MB: '512',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP: 'true',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP_INTERVAL_MS: '9000',
     },
   });
 
@@ -110,6 +120,8 @@ test('resolveUiRuntimeConfig runtime config overrides env values', () => {
   assert.equal(config.samplingStride, 6);
   assert.equal(config.samplingFlushIdleMs, 540);
   assert.equal(config.heapEmergencyPurgeMb, 450);
+  assert.equal(config.devPerformanceEntryCleanupEnabled, false);
+  assert.equal(config.devPerformanceEntryCleanupIntervalMs, 7000);
 });
 
 test('resolveUiRuntimeConfig clamps invalid values and render does not exceed history', () => {
@@ -127,6 +139,8 @@ test('resolveUiRuntimeConfig clamps invalid values and render does not exceed hi
       VITE_UI_SAMPLING_STRIDE: '0',
       VITE_UI_SAMPLING_FLUSH_IDLE_MS: '5',
       VITE_UI_HEAP_EMERGENCY_PURGE_MB: '9999',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP: 'invalid',
+      VITE_UI_DEV_PERF_ENTRY_CLEANUP_INTERVAL_MS: '1',
     },
   });
 
@@ -143,6 +157,8 @@ test('resolveUiRuntimeConfig clamps invalid values and render does not exceed hi
   assert.equal(config.samplingStride, 1);
   assert.equal(config.samplingFlushIdleMs, 100);
   assert.equal(config.heapEmergencyPurgeMb, 1024);
+  assert.equal(config.devPerformanceEntryCleanupEnabled, true);
+  assert.equal(config.devPerformanceEntryCleanupIntervalMs, 5000);
 });
 
 test('resolveUiRuntimeConfig ignores blank runtime values and falls back to env/defaults', () => {

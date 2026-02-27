@@ -1304,15 +1304,6 @@ fn process_pending_hash_with_fetched_tx(
             max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
             calldata_len: Some(raw_tx.len() as u32),
         };
-        if !append_event(
-            writer,
-            chain,
-            next_seq_id,
-            now_unix_ms,
-            EventPayload::TxDecoded(decoded.clone()),
-        )? {
-            return Ok(());
-        }
         if !try_enqueue_storage_write(
             writer,
             chain,
@@ -1348,6 +1339,15 @@ fn process_pending_hash_with_fetched_tx(
                 method_selector: analysis.method_selector,
                 feature_engine_version: feature_engine_version().to_owned(),
             }),
+        )? {
+            return Ok(());
+        }
+        if !append_event(
+            writer,
+            chain,
+            next_seq_id,
+            now_unix_ms,
+            EventPayload::TxDecoded(decoded.clone()),
         )? {
             return Ok(());
         }

@@ -14,6 +14,20 @@ function normalizeSeqId(value) {
   return normalizeInteger(value, 0, 0);
 }
 
+function normalizeMarketStats(rawStats) {
+  if (!rawStats || typeof rawStats !== 'object') {
+    return null;
+  }
+  return {
+    total_signal_volume: normalizeInteger(rawStats.total_signal_volume, 0, 0),
+    total_tx_count: normalizeInteger(rawStats.total_tx_count, 0, 0),
+    low_risk_count: normalizeInteger(rawStats.low_risk_count, 0, 0),
+    medium_risk_count: normalizeInteger(rawStats.medium_risk_count, 0, 0),
+    high_risk_count: normalizeInteger(rawStats.high_risk_count, 0, 0),
+    success_rate_bps: normalizeInteger(rawStats.success_rate_bps, 0, 0),
+  };
+}
+
 export function createStreamInitMessage({
   apiBase,
   afterSeqId = 0,
@@ -55,8 +69,11 @@ export function isStreamInitMessage(message) {
 export function createStreamBatchMessage({
   latestSeqId = 0,
   transactions = [],
+  featureRows = [],
+  opportunityRows = [],
   hasGap = false,
   sawHello = false,
+  marketStats = null,
 }) {
   const normalizedTransactions = (Array.isArray(transactions) ? transactions : [])
     .map((row) => ({
@@ -68,12 +85,56 @@ export function createStreamBatchMessage({
       source_id: String(row?.source_id ?? ''),
     }))
     .filter((row) => row.hash.length > 0);
+  const normalizedFeatureRows = (Array.isArray(featureRows) ? featureRows : [])
+    .map((row) => {
+      const normalizedChainId = Number(row?.chain_id);
+      return {
+        hash: String(row?.hash ?? ''),
+        protocol: String(row?.protocol ?? ''),
+        category: String(row?.category ?? ''),
+        chain_id: Number.isFinite(normalizedChainId)
+          ? Math.max(0, Math.floor(normalizedChainId))
+          : null,
+        mev_score: normalizeInteger(row?.mev_score, 0, 0),
+        urgency_score: normalizeInteger(row?.urgency_score, 0, 0),
+        method_selector: row?.method_selector == null ? null : String(row.method_selector),
+        feature_engine_version: String(row?.feature_engine_version ?? ''),
+      };
+    })
+    .filter((row) => row.hash.length > 0);
+  const normalizedOpportunityRows = (Array.isArray(opportunityRows) ? opportunityRows : [])
+    .map((row) => {
+      const normalizedChainId = Number(row?.chain_id);
+      const reasons = Array.isArray(row?.reasons)
+        ? row.reasons.map((reason) => String(reason ?? '')).filter((reason) => reason.length > 0)
+        : [];
+      return {
+        tx_hash: String(row?.tx_hash ?? ''),
+        status: String(row?.status ?? ''),
+        strategy: String(row?.strategy ?? ''),
+        score: normalizeInteger(row?.score, 0, 0),
+        protocol: String(row?.protocol ?? ''),
+        category: String(row?.category ?? ''),
+        chain_id: Number.isFinite(normalizedChainId)
+          ? Math.max(0, Math.floor(normalizedChainId))
+          : null,
+        feature_engine_version: String(row?.feature_engine_version ?? ''),
+        scorer_version: String(row?.scorer_version ?? ''),
+        strategy_version: String(row?.strategy_version ?? ''),
+        reasons,
+        detected_unix_ms: normalizeInteger(row?.detected_unix_ms, 0, 0),
+      };
+    })
+    .filter((row) => row.tx_hash.length > 0);
   return {
     type: 'stream:batch',
     latestSeqId: normalizeSeqId(latestSeqId),
     transactions: normalizedTransactions,
+    featureRows: normalizedFeatureRows,
+    opportunityRows: normalizedOpportunityRows,
     hasGap: Boolean(hasGap),
     sawHello: Boolean(sawHello),
+    marketStats: normalizeMarketStats(marketStats),
   };
 }
 
@@ -94,8 +155,11 @@ export function isStreamBatchMessage(message) {
     message?.type === 'stream:batch'
     && Number.isFinite(message?.latestSeqId)
     && Array.isArray(message?.transactions)
+    && Array.isArray(message?.featureRows)
+    && Array.isArray(message?.opportunityRows)
     && typeof message?.hasGap === 'boolean'
     && typeof message?.sawHello === 'boolean'
+    && (message?.marketStats == null || typeof message?.marketStats === 'object')
   );
 }
 
@@ -109,10 +173,30 @@ export function resolveSequenceGap(previousSeqId, nextSeqId) {
 }
 
 export function resolveDeltaBatchGap(previousSeqId, seqStart, hasGapFlag = false) {
-  if (Boolean(hasGapFlag)) {
-    return true;
+  void previousSeqId;
+  void seqStart;
+  return Boolean(hasGapFlag);
+}
+
+export function appendTransactionsWithCap(existingQueue, incomingTransactions, maxItems) {
+  const queue = Array.isArray(existingQueue) ? [...existingQueue] : [];
+  const incoming = Array.isArray(incomingTransactions) ? incomingTransactions : [];
+  for (const row of incoming) {
+    const primaryKey = String(row?.hash ?? row?.tx_hash ?? '');
+    if (!primaryKey) {
+      continue;
+    }
+    queue.push(row);
   }
-  return resolveSequenceGap(previousSeqId, seqStart);
+
+  const cap = Number.isFinite(maxItems) ? Math.max(1, Math.floor(maxItems)) : queue.length;
+  if (queue.length <= cap) {
+    return { queue, dropped: false };
+  }
+  return {
+    queue: queue.slice(queue.length - cap),
+    dropped: true,
+  };
 }
 
 export function shouldResyncFromBatch(previousSeqId, latestSeqId, hasGap = false) {
@@ -122,6 +206,33 @@ export function shouldResyncFromBatch(previousSeqId, latestSeqId, hasGap = false
     return false;
   }
   return Boolean(hasGap);
+}
+
+export function shouldApplyStreamBatch({
+  previousSeqId,
+  latestSeqId,
+  transactionCount = 0,
+  featureCount = 0,
+  opportunityCount = 0,
+} = {}) {
+  const previous = normalizeSeqId(previousSeqId);
+  const latest = normalizeSeqId(latestSeqId);
+  const count = Number.isFinite(transactionCount)
+    ? Math.max(0, Math.floor(transactionCount))
+    : 0;
+  const features = Number.isFinite(featureCount)
+    ? Math.max(0, Math.floor(featureCount))
+    : 0;
+  const opportunities = Number.isFinite(opportunityCount)
+    ? Math.max(0, Math.floor(opportunityCount))
+    : 0;
+  if (latest > previous) {
+    return true;
+  }
+  if (latest === previous && (count > 0 || features > 0 || opportunities > 0)) {
+    return true;
+  }
+  return false;
 }
 
 export function shouldScheduleGapResync({

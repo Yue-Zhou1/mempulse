@@ -2,17 +2,19 @@ const DEFAULT_CONFIG = Object.freeze({
   snapshotTxLimit: 120,
   detailCacheLimit: 96,
   maxTransactionHistory: 500,
-  maxFeatureHistory: 1_500,
-  maxOpportunityHistory: 1_500,
+  maxFeatureHistory: 500,
+  maxOpportunityHistory: 500,
   maxRenderedTransactions: 500,
   streamBatchMs: 1_000,
   samplingLagThresholdMs: 30,
   samplingStride: 5,
   samplingFlushIdleMs: 500,
   heapEmergencyPurgeMb: 400,
+  devPerformanceEntryCleanupIntervalMs: 15_000,
   transactionRetentionMs: 5 * 60 * 1000,
   workerEnabled: true,
   virtualizedTickerEnabled: true,
+  devPerformanceEntryCleanupEnabled: true,
 });
 
 const LIMITS = Object.freeze({
@@ -27,6 +29,7 @@ const LIMITS = Object.freeze({
   samplingStride: Object.freeze({ min: 1, max: 20 }),
   samplingFlushIdleMs: Object.freeze({ min: 100, max: 2_000 }),
   heapEmergencyPurgeMb: Object.freeze({ min: 128, max: 1_024 }),
+  devPerformanceEntryCleanupIntervalMs: Object.freeze({ min: 5_000, max: 120_000 }),
   transactionRetentionMs: Object.freeze({ min: 30_000, max: 3_600_000 }),
 });
 
@@ -98,6 +101,12 @@ const CONFIG_RESOLVERS = Object.freeze([
     limitsKey: 'heapEmergencyPurgeMb',
   }),
   Object.freeze({
+    configKey: 'devPerformanceEntryCleanupIntervalMs',
+    runtimeKey: 'devPerformanceEntryCleanupIntervalMs',
+    envKey: 'VITE_UI_DEV_PERF_ENTRY_CLEANUP_INTERVAL_MS',
+    limitsKey: 'devPerformanceEntryCleanupIntervalMs',
+  }),
+  Object.freeze({
     configKey: 'transactionRetentionMs',
     runtimeKey: 'txRetentionMs',
     envKey: 'VITE_UI_TX_RETENTION_MS',
@@ -115,6 +124,11 @@ const BOOLEAN_CONFIG_RESOLVERS = Object.freeze([
     configKey: 'virtualizedTickerEnabled',
     runtimeKey: 'virtualizedTickerEnabled',
     envKey: 'VITE_UI_VIRTUALIZED_TICKER_ENABLED',
+  }),
+  Object.freeze({
+    configKey: 'devPerformanceEntryCleanupEnabled',
+    runtimeKey: 'devPerformanceEntryCleanupEnabled',
+    envKey: 'VITE_UI_DEV_PERF_ENTRY_CLEANUP',
   }),
 ]);
 
@@ -251,9 +265,11 @@ export function resolveUiRuntimeConfig({ runtime, env } = {}) {
     samplingStride: resolved.samplingStride,
     samplingFlushIdleMs: resolved.samplingFlushIdleMs,
     heapEmergencyPurgeMb: resolved.heapEmergencyPurgeMb,
+    devPerformanceEntryCleanupIntervalMs: resolved.devPerformanceEntryCleanupIntervalMs,
     transactionRetentionMs: resolved.transactionRetentionMs,
     transactionRetentionMinutes,
     workerEnabled: resolved.workerEnabled,
     virtualizedTickerEnabled: resolved.virtualizedTickerEnabled,
+    devPerformanceEntryCleanupEnabled: resolved.devPerformanceEntryCleanupEnabled,
   };
 }

@@ -102,7 +102,7 @@ const TickerRowCells = memo(function TickerRowCells({ row, feature, isActive }) 
   && left.isActive === right.isActive
 ));
 
-export function RadarVirtualizedTable({ rowModels, featureByHash, selectedHash }) {
+function RadarVirtualizedTableImpl({ rowModels, featureByHash, selectedHash }) {
   return (
     <div className="news-list-scroll h-full border-b-2 border-zinc-900">
       <table className="news-tx-table news-mono min-w-[1360px] w-full table-fixed border-collapse">
@@ -162,3 +162,12 @@ export function RadarVirtualizedTable({ rowModels, featureByHash, selectedHash }
     </div>
   );
 }
+
+export const RadarVirtualizedTable = memo(
+  RadarVirtualizedTableImpl,
+  (left, right) => (
+    left.rowModels === right.rowModels
+    && left.featureByHash === right.featureByHash
+    && left.selectedHash === right.selectedHash
+  ),
+);

@@ -50,6 +50,8 @@ export function useDashboardController() {
     samplingStride,
     samplingFlushIdleMs,
     heapEmergencyPurgeMb,
+    devPerformanceEntryCleanupEnabled,
+    devPerformanceEntryCleanupIntervalMs,
     transactionRetentionMs,
     transactionRetentionMinutes,
     workerEnabled,
@@ -105,6 +107,7 @@ export function useDashboardController() {
   const selectedDetail = useSelectedTransactionDetail(selectedHash);
 
   const derived = useDashboardDerivedState({
+    activeScreen,
     transactionRows,
     liveMainnetFilter,
     query,
@@ -152,6 +155,8 @@ export function useDashboardController() {
     samplingStride,
     samplingFlushIdleMs,
     heapEmergencyPurgeMb,
+    devPerformanceEntryCleanupEnabled,
+    devPerformanceEntryCleanupIntervalMs,
     workerEnabled,
     transactionRetentionMs,
     transactionRetentionMinutes,
