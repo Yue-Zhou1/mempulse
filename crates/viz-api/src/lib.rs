@@ -4,7 +4,7 @@ pub mod live_rpc;
 use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -1907,15 +1907,103 @@ async fn stream_v2(
 }
 
 async fn events_v1(
-    State(_state): State<AppState>,
-    Query(_query): Query<StreamQuery>,
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>>> {
-    let stream = stream::empty::<Result<SseEvent, Infallible>>();
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
+    let after_seq_id = resolve_dashboard_events_v1_after(
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok()),
+        query.after,
+    );
+    let page_limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
+
+    #[derive(Clone)]
+    struct EventsV1LoopState {
+        provider: Arc<dyn VizDataProvider>,
+        after_seq_id: u64,
+        page_limit: usize,
+        interval: Duration,
+        first_poll: bool,
+    }
+
+    let stream = stream::unfold(
+        EventsV1LoopState {
+            provider: state.provider.clone(),
+            after_seq_id,
+            page_limit,
+            interval: Duration::from_millis(interval_ms),
+            first_poll: true,
+        },
+        |mut loop_state| async move {
+            if loop_state.first_poll {
+                loop_state.first_poll = false;
+            } else {
+                tokio::time::sleep(loop_state.interval).await;
+            }
+
+            if let Some(dispatch) = build_dashboard_events_v1_dispatch(
+                loop_state.provider.as_ref(),
+                loop_state.after_seq_id,
+                loop_state.page_limit,
+            ) {
+                loop_state.after_seq_id = dispatch.seq;
+                if let Some(frame) = build_dashboard_events_v1_delta_frame(&dispatch) {
+                    let event = dashboard_events_v1_frame_to_event(frame);
+                    return Some((Ok(event), loop_state));
+                }
+            }
+
+            let latest_seq_id = loop_state
+                .provider
+                .latest_seq_id()
+                .unwrap_or(loop_state.after_seq_id);
+            loop_state.after_seq_id = loop_state.after_seq_id.max(latest_seq_id);
+            let keepalive = SseEvent::default()
+                .id(loop_state.after_seq_id.to_string())
+                .event("keepalive")
+                .data(
+                    serde_json::json!({
+                        "op": "HEARTBEAT",
+                        "latestSeqId": loop_state.after_seq_id,
+                    })
+                    .to_string(),
+                );
+            Some((Ok(keepalive), loop_state))
+        },
+    );
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+fn resolve_dashboard_events_v1_after(last_event_id: Option<&str>, query_after: Option<u64>) -> u64 {
+    last_event_id
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(query_after)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DashboardEventsV1Frame {
+    id: String,
+    event: String,
+    data: String,
+}
+
+fn build_dashboard_events_v1_delta_frame(dispatch: &StreamV2Dispatch) -> Option<DashboardEventsV1Frame> {
+    Some(DashboardEventsV1Frame {
+        id: dispatch.seq.to_string(),
+        event: "delta".to_owned(),
+        data: serde_json::to_string(dispatch).ok()?,
+    })
+}
+
+fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent {
+    SseEvent::default()
+        .id(frame.id)
+        .event(frame.event)
+        .data(frame.data)
 }
 
 fn now_unix_ms() -> i64 {
@@ -2044,6 +2132,76 @@ fn push_stream_opportunity_with_cap(
     }
     opportunities.push(detail);
     dropped
+}
+
+fn build_dashboard_events_v1_dispatch(
+    provider: &dyn VizDataProvider,
+    after_seq_id: u64,
+    page_limit: usize,
+) -> Option<StreamV2Dispatch> {
+    let max_scan_events_per_tick = page_limit.saturating_mul(64).max(64);
+    let events = provider.events(after_seq_id, &[], max_scan_events_per_tick);
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut seq_start = 0_u64;
+    let mut seq_end = after_seq_id;
+    let mut has_gap = false;
+    let mut transactions = Vec::new();
+    let mut feature_upsert = Vec::new();
+    let mut opportunity_upsert = Vec::new();
+
+    for event in events {
+        if event.seq_id <= after_seq_id {
+            continue;
+        }
+        if seq_start == 0 {
+            seq_start = event.seq_id;
+            if after_seq_id > 0 && seq_start > after_seq_id.saturating_add(1) {
+                has_gap = true;
+            }
+        }
+        seq_end = event.seq_id;
+        if let Some(summary) = transaction_summary_from_event(&event) {
+            let hash = summary.hash.clone();
+            let dropped = push_stream_summary_with_cap(&mut transactions, summary, page_limit);
+            has_gap = has_gap || dropped;
+            if let Some(feature) = feature_detail_for_hash(provider, &hash) {
+                let dropped = push_stream_feature_with_cap(&mut feature_upsert, feature, page_limit);
+                has_gap = has_gap || dropped;
+            }
+        }
+        if let Some(opportunity) = opportunity_detail_from_event(provider, &event) {
+            let dropped =
+                push_stream_opportunity_with_cap(&mut opportunity_upsert, opportunity, page_limit);
+            has_gap = has_gap || dropped;
+        }
+    }
+
+    if seq_start == 0
+        || (transactions.is_empty() && feature_upsert.is_empty() && opportunity_upsert.is_empty())
+    {
+        return None;
+    }
+
+    Some(StreamV2Dispatch {
+        op: "DISPATCH".to_owned(),
+        event_type: "DELTA_BATCH".to_owned(),
+        seq: seq_end,
+        channel: "tx.main".to_owned(),
+        has_gap,
+        patch: StreamV2Patch {
+            upsert: transactions,
+            remove: Vec::new(),
+            feature_upsert,
+            opportunity_upsert,
+        },
+        watermark: StreamV2Watermark {
+            latest_ingest_seq: seq_end,
+        },
+        market_stats: provider.market_stats(),
+    })
 }
 
 fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
@@ -3628,5 +3786,67 @@ mod tests {
             serialized["patch"]["opportunity_upsert"][0]["strategy"],
             serde_json::json!("SandwichCandidate")
         );
+    }
+
+    #[test]
+    fn dashboard_events_v1_delta_frame_uses_seq_id_and_dispatch_schema() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 84,
+            channel: "tx.main".to_owned(),
+            has_gap: false,
+            patch: StreamV2Patch {
+                upsert: vec![TransactionSummary {
+                    hash: "0xabc".to_owned(),
+                    sender: "0xdef".to_owned(),
+                    nonce: 1,
+                    tx_type: 2,
+                    seen_unix_ms: 1_700_000_000_000,
+                    source_id: "mock".to_owned(),
+                }],
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 84,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        assert_eq!(frame.id, "84");
+        assert_eq!(frame.event, "delta");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["op"], serde_json::json!("DISPATCH"));
+        assert_eq!(payload["type"], serde_json::json!("DELTA_BATCH"));
+        assert_eq!(payload["seq"], serde_json::json!(84));
+        assert_eq!(
+            payload["watermark"]["latest_ingest_seq"],
+            serde_json::json!(84)
+        );
+        assert!(payload["patch"]["upsert"].is_array());
+        assert!(payload["patch"]["remove"].is_array());
+        assert!(payload["patch"]["feature_upsert"].is_array());
+        assert!(payload["patch"]["opportunity_upsert"].is_array());
+    }
+
+    #[test]
+    fn dashboard_events_v1_resume_after_prefers_last_event_id_header() {
+        assert_eq!(resolve_dashboard_events_v1_after(Some("42"), Some(9)), 42);
+    }
+
+    #[test]
+    fn dashboard_events_v1_resume_after_uses_query_after_when_header_missing() {
+        assert_eq!(resolve_dashboard_events_v1_after(None, Some(9)), 9);
+        assert_eq!(resolve_dashboard_events_v1_after(Some("invalid"), Some(9)), 9);
     }
 }
