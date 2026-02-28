@@ -7,12 +7,14 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum::{middleware, response::Response};
 use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
+use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
     live_rpc_drop_metrics_snapshot,
@@ -22,6 +24,7 @@ use replay::{
     replay_from_checkpoint,
 };
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, RwLock};
@@ -998,6 +1001,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/dashboard/stream-v2", get(stream_v2))
+        .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -1900,6 +1904,18 @@ async fn stream_v2(
             initial_credit,
         )
     })
+}
+
+async fn events_v1(
+    State(_state): State<AppState>,
+    Query(_query): Query<StreamQuery>,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>>> {
+    let stream = stream::empty::<Result<SseEvent, Infallible>>();
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 fn now_unix_ms() -> i64 {
@@ -2883,6 +2899,23 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/dashboard/stream-v2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_events_v1_route_is_registered() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/events-v1")
                     .body(Body::empty())
                     .unwrap(),
             )
