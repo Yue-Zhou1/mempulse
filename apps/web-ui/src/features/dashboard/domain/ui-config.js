@@ -12,6 +12,7 @@ const DEFAULT_CONFIG = Object.freeze({
   heapEmergencyPurgeMb: 400,
   devPerformanceEntryCleanupIntervalMs: 15_000,
   transactionRetentionMs: 5 * 60 * 1000,
+  streamTransport: 'sse',
   workerEnabled: true,
   virtualizedTickerEnabled: true,
   devPerformanceEntryCleanupEnabled: true,
@@ -194,6 +195,29 @@ function resolveBoolean(runtime, runtimeKey, env, envKey, fallback) {
   return fallback;
 }
 
+function parseStreamTransportValue(raw) {
+  if (raw == null) {
+    return null;
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === 'sse' || normalized === 'ws') {
+    return normalized;
+  }
+  return null;
+}
+
+function resolveStreamTransport(runtime, env, fallback) {
+  const runtimeValue = parseStreamTransportValue(runtime?.streamTransport);
+  if (runtimeValue != null) {
+    return runtimeValue;
+  }
+  const envValue = parseStreamTransportValue(env?.VITE_UI_STREAM_TRANSPORT);
+  if (envValue != null) {
+    return envValue;
+  }
+  return fallback;
+}
+
 function resolveEnvInput(env) {
   if (env) {
     return env;
@@ -243,6 +267,11 @@ export function resolveUiRuntimeConfig({ runtime, env } = {}) {
       DEFAULT_CONFIG[resolver.configKey],
     );
   }
+  resolved.streamTransport = resolveStreamTransport(
+    sourceRuntime,
+    sourceEnv,
+    DEFAULT_CONFIG.streamTransport,
+  );
 
   const maxRenderedTransactions = Math.min(
     resolved.maxRenderedTransactions,
@@ -268,6 +297,7 @@ export function resolveUiRuntimeConfig({ runtime, env } = {}) {
     devPerformanceEntryCleanupIntervalMs: resolved.devPerformanceEntryCleanupIntervalMs,
     transactionRetentionMs: resolved.transactionRetentionMs,
     transactionRetentionMinutes,
+    streamTransport: resolved.streamTransport,
     workerEnabled: resolved.workerEnabled,
     virtualizedTickerEnabled: resolved.virtualizedTickerEnabled,
     devPerformanceEntryCleanupEnabled: resolved.devPerformanceEntryCleanupEnabled,

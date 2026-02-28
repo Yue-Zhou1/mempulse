@@ -59,6 +59,7 @@ window.__MEMPULSE_UI_CONFIG__ = {
   opportunityHistoryLimit: 1500,
   txRenderLimit: 80,
   streamBatchMs: 1000,
+  streamTransport: 'sse', // 'sse' (default) or 'ws'
   workerEnabled: true,
   virtualizedTickerEnabled: true,
   samplingLagThresholdMs: 30,
@@ -85,6 +86,7 @@ VITE_UI_FEATURE_HISTORY_LIMIT=1500
 VITE_UI_OPPORTUNITY_HISTORY_LIMIT=1500
 VITE_UI_TX_RENDER_LIMIT=80
 VITE_UI_STREAM_BATCH_MS=1000
+VITE_UI_STREAM_TRANSPORT=sse
 VITE_UI_WORKER_ENABLED=true
 VITE_UI_VIRTUALIZED_TICKER_ENABLED=true
 VITE_UI_SAMPLING_LAG_THRESHOLD_MS=30
