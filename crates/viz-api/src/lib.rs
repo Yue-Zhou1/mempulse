@@ -5,9 +5,9 @@ pub mod stream_broadcast;
 use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
@@ -31,11 +31,11 @@ use std::convert::Infallible;
 use std::env;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
     NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
 };
+use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -1885,8 +1885,8 @@ const DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY: usize = 256;
 const DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT: usize = 20;
 const DASHBOARD_STREAM_BROADCAST_INTERVAL_MS: u64 = 1_000;
 
-fn dashboard_stream_broadcaster_registry(
-) -> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
+fn dashboard_stream_broadcaster_registry()
+-> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1928,8 +1928,9 @@ fn spawn_dashboard_stream_broadcaster_producer(
 ) {
     tokio::spawn(async move {
         let mut after_seq_id = 0_u64;
-        let mut ticker =
-            tokio::time::interval(Duration::from_millis(DASHBOARD_STREAM_BROADCAST_INTERVAL_MS));
+        let mut ticker = tokio::time::interval(Duration::from_millis(
+            DASHBOARD_STREAM_BROADCAST_INTERVAL_MS,
+        ));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -2013,11 +2014,15 @@ async fn events_v1(
         |mut loop_state| async move {
             if let Some(event) = loop_state.pending.pop_front() {
                 let frame = build_dashboard_events_v1_frame(&event);
-                return Some((Ok::<SseEvent, Infallible>(dashboard_events_v1_frame_to_event(frame)), loop_state));
+                return Some((
+                    Ok::<SseEvent, Infallible>(dashboard_events_v1_frame_to_event(frame)),
+                    loop_state,
+                ));
             }
 
-            let next = tokio::time::timeout(loop_state.heartbeat_interval, loop_state.receiver.recv())
-                .await;
+            let next =
+                tokio::time::timeout(loop_state.heartbeat_interval, loop_state.receiver.recv())
+                    .await;
             let sse_event = match next {
                 Ok(Ok(event)) => {
                     let frame = build_dashboard_events_v1_frame(&event);
@@ -2061,7 +2066,9 @@ struct DashboardEventsV1Frame {
     data: String,
 }
 
-fn build_dashboard_events_v1_delta_frame(dispatch: &StreamV2Dispatch) -> Option<DashboardEventsV1Frame> {
+fn build_dashboard_events_v1_delta_frame(
+    dispatch: &StreamV2Dispatch,
+) -> Option<DashboardEventsV1Frame> {
     if dispatch.has_gap {
         let latest_seq_id = dispatch.seq.max(dispatch.watermark.latest_ingest_seq);
         return Some(build_dashboard_events_v1_reset_frame(latest_seq_id, "gap"));
@@ -2105,10 +2112,14 @@ fn dashboard_events_v1_keepalive_event(latest_seq_id: u64) -> SseEvent {
     dashboard_events_v1_frame_to_event(build_dashboard_events_v1_keepalive_frame(latest_seq_id))
 }
 
-fn build_dashboard_events_v1_frame(event: &DashboardStreamBroadcastEvent) -> DashboardEventsV1Frame {
+fn build_dashboard_events_v1_frame(
+    event: &DashboardStreamBroadcastEvent,
+) -> DashboardEventsV1Frame {
     match event {
-        DashboardStreamBroadcastEvent::Delta(dispatch) => build_dashboard_events_v1_delta_frame(dispatch)
-            .unwrap_or_else(|| build_dashboard_events_v1_keepalive_frame(event.seq_id())),
+        DashboardStreamBroadcastEvent::Delta(dispatch) => {
+            build_dashboard_events_v1_delta_frame(dispatch)
+                .unwrap_or_else(|| build_dashboard_events_v1_keepalive_frame(event.seq_id()))
+        }
         DashboardStreamBroadcastEvent::Reset {
             reason,
             latest_seq_id,
@@ -2286,7 +2297,8 @@ fn build_dashboard_events_v1_dispatch(
             let dropped = push_stream_summary_with_cap(&mut transactions, summary, page_limit);
             has_gap = has_gap || dropped;
             if let Some(feature) = feature_detail_for_hash(provider, &hash) {
-                let dropped = push_stream_feature_with_cap(&mut feature_upsert, feature, page_limit);
+                let dropped =
+                    push_stream_feature_with_cap(&mut feature_upsert, feature, page_limit);
                 has_gap = has_gap || dropped;
             }
         }
@@ -4004,7 +4016,10 @@ mod tests {
     #[test]
     fn dashboard_events_v1_resume_after_uses_query_after_when_header_missing() {
         assert_eq!(resolve_dashboard_events_v1_after(None, Some(9)), 9);
-        assert_eq!(resolve_dashboard_events_v1_after(Some("invalid"), Some(9)), 9);
+        assert_eq!(
+            resolve_dashboard_events_v1_after(Some("invalid"), Some(9)),
+            9
+        );
     }
 
     #[test]
