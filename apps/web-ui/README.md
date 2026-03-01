@@ -101,6 +101,28 @@ Notes:
 - These are build-time frontend variables (`VITE_*`), so changing them requires rebuilding/restarting the UI.
 - They are not secrets; never put credentials in frontend env vars.
 
+### Stream transport rollout and rollback
+
+Dashboard live stream transport now supports:
+- `streamTransport: 'sse'` as the default rollout mode.
+- `streamTransport: 'ws'` as the rollback mode.
+
+Runtime toggle example (`apps/web-ui/public/runtime-config.js`):
+
+```js
+window.__MEMPULSE_UI_CONFIG__ = {
+  streamTransport: 'sse', // default rollout
+  // streamTransport: 'ws', // rollback
+};
+```
+
+Build-time toggle example (`apps/web-ui/.env.local`):
+
+```bash
+VITE_UI_STREAM_TRANSPORT=sse
+# VITE_UI_STREAM_TRANSPORT=ws
+```
+
 ## UI performance profiling
 
 The dashboard exposes a lightweight debug surface at runtime:

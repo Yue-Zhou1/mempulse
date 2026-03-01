@@ -91,5 +91,8 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Run SSE transport regression tests
+        run: node --import ./src/test/setup-browser-apis.mjs --test src/features/dashboard/hooks/use-dashboard-event-stream.test.mjs
+
       - name: Build app
         run: npm run build

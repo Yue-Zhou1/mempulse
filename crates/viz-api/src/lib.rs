@@ -6,6 +6,7 @@ use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -1982,7 +1983,7 @@ async fn events_v1(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
     headers: HeaderMap,
-) -> Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>>> {
+) -> impl IntoResponse {
     let after_seq_id = resolve_dashboard_events_v1_after(
         headers
             .get("last-event-id")
@@ -2010,7 +2011,7 @@ async fn events_v1(
         |mut loop_state| async move {
             if let Some(event) = loop_state.pending.pop_front() {
                 let frame = build_dashboard_events_v1_frame(&event);
-                return Some((Ok(dashboard_events_v1_frame_to_event(frame)), loop_state));
+                return Some((Ok::<SseEvent, Infallible>(dashboard_events_v1_frame_to_event(frame)), loop_state));
             }
 
             let next = tokio::time::timeout(loop_state.heartbeat_interval, loop_state.receiver.recv())
@@ -2029,10 +2030,19 @@ async fn events_v1(
                     dashboard_events_v1_keepalive_event(loop_state.broadcaster.latest_seq_id())
                 }
             };
-            Some((Ok(sse_event), loop_state))
+            Some((Ok::<SseEvent, Infallible>(sse_event), loop_state))
         },
     );
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    let sse = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+    let mut response = sse.into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
 }
 
 fn resolve_dashboard_events_v1_after(last_event_id: Option<&str>, query_after: Option<u64>) -> u64 {
@@ -3186,6 +3196,43 @@ mod tests {
             .unwrap();
 
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_events_v1_route_sets_sse_contract_headers() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/events-v1?after=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/event-stream"));
+
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(cache_control.contains("no-cache"));
+
+        let buffering = response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(buffering, "no");
     }
 
     #[tokio::test]

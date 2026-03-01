@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { createStreamStopMessage } from '../workers/stream-protocol.js';
 import {
   disconnectDashboardStreamWorker,
+  resolveDashboardStreamTransport,
+  shouldUseDashboardStreamWorker,
   shouldHandleDashboardWorkerEvent,
 } from './use-dashboard-stream-worker.js';
 
@@ -36,4 +38,16 @@ test('shouldHandleDashboardWorkerEvent ignores stale worker instances', () => {
 
   assert.equal(shouldHandleDashboardWorkerEvent(workerRef, currentWorker), true);
   assert.equal(shouldHandleDashboardWorkerEvent(workerRef, staleWorker), false);
+});
+
+test('resolveDashboardStreamTransport defaults to sse and preserves ws override', () => {
+  assert.equal(resolveDashboardStreamTransport(undefined), 'sse');
+  assert.equal(resolveDashboardStreamTransport('unknown'), 'sse');
+  assert.equal(resolveDashboardStreamTransport('ws'), 'ws');
+  assert.equal(resolveDashboardStreamTransport('WS'), 'ws');
+});
+
+test('shouldUseDashboardStreamWorker returns true only for ws transport', () => {
+  assert.equal(shouldUseDashboardStreamWorker('sse'), false);
+  assert.equal(shouldUseDashboardStreamWorker('ws'), true);
 });
