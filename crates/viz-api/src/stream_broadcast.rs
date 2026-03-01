@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DashboardStreamBroadcastEvent {
-    Delta(StreamV2Dispatch),
+    Delta(Box<StreamV2Dispatch>),
     Reset { reason: String, latest_seq_id: u64 },
 }
 
@@ -47,7 +47,7 @@ impl DashboardStreamBroadcaster {
     }
 
     pub fn publish_delta(&self, dispatch: StreamV2Dispatch) {
-        let event = DashboardStreamBroadcastEvent::Delta(dispatch);
+        let event = DashboardStreamBroadcastEvent::Delta(Box::new(dispatch));
         self.publish_event(event);
     }
 

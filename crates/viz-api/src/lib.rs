@@ -740,59 +740,34 @@ impl VizDataProvider for InMemoryVizProvider {
             .read()
             .ok()
             .map(|storage| {
-                let feature_summary = storage
-                    .dashboard_feature_summary(summary_limit)
+                let feature_summary = build_feature_summary(&storage)
                     .into_iter()
-                    .map(|row| FeatureSummary {
-                        protocol: row.protocol,
-                        category: row.category,
-                        count: row.count,
-                    })
+                    .take(summary_limit)
                     .collect::<Vec<_>>();
 
-                let feature_details = storage
-                    .dashboard_feature_details_recent(feature_scan_limit)
+                let feature_details = build_feature_details(&storage)
                     .into_iter()
+                    .take(feature_scan_limit)
                     .filter(|row| chain_matches_filter(row.chain_id, chain_id))
                     .take(feature_limit)
-                    .map(|row| FeatureDetail {
-                        hash: format_bytes(&row.hash),
-                        protocol: row.protocol,
-                        category: row.category,
-                        chain_id: row.chain_id,
-                        mev_score: row.mev_score,
-                        urgency_score: row.urgency_score,
-                        method_selector: format_method_selector(row.method_selector),
-                        feature_engine_version: row.feature_engine_version,
-                    })
                     .collect::<Vec<_>>();
 
-                let opportunities = storage
-                    .dashboard_opportunities_recent(opp_scan_limit, min_score)
+                let opportunities = build_opportunities(&storage)
                     .into_iter()
+                    .filter(|row| row.score >= min_score)
+                    .take(opp_scan_limit)
                     .filter(|row| chain_matches_filter(row.chain_id, chain_id))
                     .take(opp_limit)
-                    .map(|row| OpportunityDetail {
-                        tx_hash: format_bytes(&row.tx_hash),
-                        status: "detected".to_owned(),
-                        strategy: row.strategy,
-                        score: row.score,
-                        protocol: row.protocol,
-                        category: row.category,
-                        chain_id: row.chain_id,
-                        feature_engine_version: row.feature_engine_version,
-                        scorer_version: row.scorer_version,
-                        strategy_version: row.strategy_version,
-                        reasons: row.reasons,
-                        detected_unix_ms: row.detected_unix_ms,
-                    })
                     .collect::<Vec<_>>();
+
+                let mut chain_id_by_hash = HashMap::new();
+                for row in storage.tx_full() {
+                    chain_id_by_hash.insert(row.hash, row.chain_id);
+                }
 
                 let mut transactions = Vec::with_capacity(tx_limit);
                 for row in storage.recent_transactions(tx_scan_limit) {
-                    let row_chain_id = storage
-                        .tx_full_by_hash(&row.hash)
-                        .and_then(|tx| tx.chain_id);
+                    let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
                     if !chain_matches_filter(row_chain_id, chain_id) {
                         continue;
                     }
@@ -903,10 +878,22 @@ impl VizDataProvider for InMemoryVizProvider {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
         let hash = parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
-            let seen = storage.tx_seen_by_hash(&hash)?;
-            let full = storage.tx_full_by_hash(&hash);
-            let feature = storage.tx_features_by_hash(&hash);
-            let lifecycle = storage.tx_lifecycle_by_hash(&hash);
+            let seen = storage
+                .tx_seen()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash)?;
+            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+            let feature = storage
+                .tx_features()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
+            let lifecycle = storage
+                .tx_lifecycle()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
             let fallback_lifecycle = lifecycle
                 .is_none()
                 .then(|| current_lifecycle(&storage.list_events(), hash));
