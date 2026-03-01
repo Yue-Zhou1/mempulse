@@ -1003,7 +1003,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
-        .route("/dashboard/stream-v2", get(stream_v2))
         .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1863,6 +1862,7 @@ fn sim_id_for_result(result: &RelayDryRunResult) -> String {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct StreamQuery {
     after: Option<u64>,
     limit: Option<usize>,
@@ -1871,6 +1871,7 @@ struct StreamQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[allow(dead_code)]
 struct StreamV2ClientMessage {
     op: String,
     amount: Option<u32>,
@@ -1949,6 +1950,7 @@ fn spawn_dashboard_stream_broadcaster_producer(
     });
 }
 
+#[allow(dead_code)]
 async fn stream_v2(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
@@ -2121,6 +2123,7 @@ fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent
         .data(frame.data)
 }
 
+#[allow(dead_code)]
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2319,6 +2322,7 @@ fn build_dashboard_events_v1_dispatch(
     })
 }
 
+#[allow(dead_code)]
 fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
     if let Some(amount) = message.amount {
         return amount.clamp(1, 256);
@@ -2331,6 +2335,7 @@ fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
     1
 }
 
+#[allow(dead_code)]
 async fn handle_socket_v2(
     mut socket: WebSocket,
     hello: StreamV2Hello,
@@ -3165,7 +3170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_stream_v2_route_is_registered() {
+    async fn dashboard_stream_v2_route_is_not_registered() {
         let app = build_router(test_state(100));
 
         let response = app
@@ -3178,7 +3183,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

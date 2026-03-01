@@ -30,7 +30,7 @@ test('resolveUiRuntimeConfig defaults streamTransport to sse', () => {
   assert.equal(config.streamTransport, 'sse');
 });
 
-test('resolveUiRuntimeConfig accepts ws/sse overrides', () => {
+test('resolveUiRuntimeConfig accepts sse override and coerces ws to sse', () => {
   const sse = resolveUiRuntimeConfig({
     env: { VITE_UI_STREAM_TRANSPORT: 'sse' },
   });
@@ -39,7 +39,7 @@ test('resolveUiRuntimeConfig accepts ws/sse overrides', () => {
   });
 
   assert.equal(sse.streamTransport, 'sse');
-  assert.equal(ws.streamTransport, 'ws');
+  assert.equal(ws.streamTransport, 'sse');
 });
 
 test('resolveUiRuntimeConfig accepts valid env overrides', () => {

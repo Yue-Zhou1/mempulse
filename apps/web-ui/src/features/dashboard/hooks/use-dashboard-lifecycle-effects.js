@@ -19,10 +19,6 @@ import {
 import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
 import { createSystemHealthMonitor } from '../lib/system-health.js';
 import { useDashboardEventStream } from './use-dashboard-event-stream.js';
-import {
-  shouldUseDashboardStreamWorker,
-  useDashboardStreamWorker,
-} from './use-dashboard-stream-worker.js';
 import { shouldApplyStreamBatch, shouldScheduleGapResync } from '../workers/stream-protocol.js';
 
 const snapshotThrottleMs = 1200;
@@ -253,9 +249,8 @@ export function resolveDashboardStreamConnector({
   connectEventSource,
   connectWorker,
 }) {
-  if (shouldUseDashboardStreamWorker(streamTransport)) {
-    return connectWorker;
-  }
+  void streamTransport;
+  void connectWorker;
   return connectEventSource;
 }
 
@@ -335,7 +330,6 @@ export function useDashboardLifecycleEffects({
   setDialogLoading,
   setDialogError,
 }) {
-  const { connectWorker, disconnectWorker, sendCredit } = useDashboardStreamWorker();
   const { connectEventSource, disconnectEventSource } = useDashboardEventStream();
 
   useEffect(() => {
@@ -384,7 +378,6 @@ export function useDashboardLifecycleEffects({
       ? Math.max(100, Math.floor(streamBatchMs))
       : 500;
     const runtimePolicy = resolveDashboardRuntimePolicy(activeScreen);
-    const useWorkerTransport = shouldUseDashboardStreamWorker(streamTransport);
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
     let steadySnapshotTimer = null;
@@ -402,7 +395,6 @@ export function useDashboardLifecycleEffects({
     let pendingDeltaLatestSeqId = null;
 
     const cleanupStreamConnections = () => {
-      disconnectWorker();
       disconnectEventSource();
     };
 
@@ -1006,9 +998,6 @@ export function useDashboardLifecycleEffects({
       })) {
         pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
         schedulePendingStreamDeltaFlush();
-        if (useWorkerTransport) {
-          sendCredit(1);
-        }
         return;
       }
 
@@ -1033,12 +1022,9 @@ export function useDashboardLifecycleEffects({
         cooldownMs: steadySnapshotRefreshMs,
       })) {
         lastGapSnapshotAtRef.current = Date.now();
-        scheduleSnapshot('ws-gap-resync', true, {
+        scheduleSnapshot('stream-gap-resync', true, {
           forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
         });
-      }
-      if (useWorkerTransport) {
-        sendCredit(1);
       }
     };
 
@@ -1097,45 +1083,12 @@ export function useDashboardLifecycleEffects({
             },
           });
         },
-        connectWorker: () => {
-          connectWorker({
-            apiBase,
-            afterSeqId: latestSeqIdRef.current,
-            batchWindowMs: resolvedStreamBatchMs,
-            streamBatchLimit,
-            streamIntervalMs,
-            initialCredit: 1,
-            onOpen: () => {
-              handleStreamOpen('ws-open');
-            },
-            onBatch: handleStreamBatch,
-            onClose: () => {
-              if (cancelled) {
-                return;
-              }
-              scheduleReconnect();
-            },
-            onError: (error) => {
-              if (cancelled) {
-                return;
-              }
-              setHasError(true);
-              setStatusMessage(`Stream worker error: ${error.message}`);
-              scheduleReconnect();
-            },
-          });
-        },
+        connectWorker: () => {},
       });
       connectTransport?.();
     };
 
-    if (useWorkerTransport) {
-      setStatusMessage(
-        `Connecting stream(v2) to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
-      );
-    } else {
-      setStatusMessage(`Connecting events(v1/sse) to ${apiBase}`);
-    }
+    setStatusMessage(`Connecting events(v1/sse) to ${apiBase}`);
     setHasError(false);
     if (!runtimePolicy.shouldProcessTxStream) {
       clearTransactionBuffers();
@@ -1181,12 +1134,10 @@ export function useDashboardLifecycleEffects({
     apiBase,
     activeScreen,
     connectEventSource,
-    connectWorker,
     enqueueTickerCommit,
     flushTickerCommit,
     cancelTickerCommit,
     disconnectEventSource,
-    disconnectWorker,
     followLatestRef,
     latestSeqIdRef,
     lastGapSnapshotAtRef,
@@ -1218,7 +1169,6 @@ export function useDashboardLifecycleEffects({
     snapshotInFlightRef,
     snapshotTimerRef,
     snapshotTxLimit,
-    sendCredit,
     transactionStoreRef,
     transactionRetentionMinutes,
     transactionRetentionMs,

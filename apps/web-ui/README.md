@@ -59,7 +59,7 @@ window.__MEMPULSE_UI_CONFIG__ = {
   opportunityHistoryLimit: 1500,
   txRenderLimit: 80,
   streamBatchMs: 1000,
-  streamTransport: 'sse', // 'sse' (default) or 'ws'
+  streamTransport: 'sse', // required transport
   workerEnabled: true,
   virtualizedTickerEnabled: true,
   samplingLagThresholdMs: 30,
@@ -104,15 +104,13 @@ Notes:
 ### Stream transport rollout and rollback
 
 Dashboard live stream transport now supports:
-- `streamTransport: 'sse'` as the default rollout mode.
-- `streamTransport: 'ws'` as the rollback mode.
+- `streamTransport: 'sse'` only.
 
 Runtime toggle example (`apps/web-ui/public/runtime-config.js`):
 
 ```js
 window.__MEMPULSE_UI_CONFIG__ = {
-  streamTransport: 'sse', // default rollout
-  // streamTransport: 'ws', // rollback
+  streamTransport: 'sse',
 };
 ```
 
@@ -120,7 +118,6 @@ Build-time toggle example (`apps/web-ui/.env.local`):
 
 ```bash
 VITE_UI_STREAM_TRANSPORT=sse
-# VITE_UI_STREAM_TRANSPORT=ws
 ```
 
 ## UI performance profiling

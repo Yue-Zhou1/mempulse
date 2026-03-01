@@ -201,7 +201,7 @@ function parseStreamTransportValue(raw) {
   }
   const normalized = String(raw).trim().toLowerCase();
   if (normalized === 'sse' || normalized === 'ws') {
-    return normalized;
+    return 'sse';
   }
   return null;
 }

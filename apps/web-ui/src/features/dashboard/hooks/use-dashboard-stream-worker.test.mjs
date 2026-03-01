@@ -40,14 +40,14 @@ test('shouldHandleDashboardWorkerEvent ignores stale worker instances', () => {
   assert.equal(shouldHandleDashboardWorkerEvent(workerRef, staleWorker), false);
 });
 
-test('resolveDashboardStreamTransport defaults to sse and preserves ws override', () => {
+test('resolveDashboardStreamTransport always resolves to sse', () => {
   assert.equal(resolveDashboardStreamTransport(undefined), 'sse');
   assert.equal(resolveDashboardStreamTransport('unknown'), 'sse');
-  assert.equal(resolveDashboardStreamTransport('ws'), 'ws');
-  assert.equal(resolveDashboardStreamTransport('WS'), 'ws');
+  assert.equal(resolveDashboardStreamTransport('ws'), 'sse');
+  assert.equal(resolveDashboardStreamTransport('WS'), 'sse');
 });
 
-test('shouldUseDashboardStreamWorker returns true only for ws transport', () => {
+test('shouldUseDashboardStreamWorker is disabled for all transports', () => {
   assert.equal(shouldUseDashboardStreamWorker('sse'), false);
-  assert.equal(shouldUseDashboardStreamWorker('ws'), true);
+  assert.equal(shouldUseDashboardStreamWorker('ws'), false);
 });

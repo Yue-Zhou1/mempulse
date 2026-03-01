@@ -1,22 +1,17 @@
 import { useCallback, useEffect, useRef } from 'react';
 import {
-  createStreamCreditMessage,
-  createStreamInitMessage,
   createStreamStopMessage,
-  isStreamBatchMessage,
   normalizeWorkerError,
 } from '../workers/stream-protocol.js';
 
 export function resolveDashboardStreamTransport(streamTransport) {
-  const normalized = String(streamTransport ?? '').trim().toLowerCase();
-  if (normalized === 'ws') {
-    return 'ws';
-  }
+  void streamTransport;
   return 'sse';
 }
 
 export function shouldUseDashboardStreamWorker(streamTransport) {
-  return resolveDashboardStreamTransport(streamTransport) === 'ws';
+  void streamTransport;
+  return false;
 }
 
 export function disconnectDashboardStreamWorker(worker) {
@@ -47,76 +42,24 @@ export function useDashboardStreamWorker() {
   }, []);
 
   const connectWorker = useCallback(({
-    apiBase,
-    afterSeqId,
-    batchWindowMs,
-    streamBatchLimit,
-    streamIntervalMs,
-    initialCredit,
     onOpen,
-    onBatch,
-    onClose,
     onError,
   }) => {
     disconnectWorker();
-    if (typeof Worker !== 'function') {
-      onError?.(normalizeWorkerError({ message: 'Web Worker is not available in this runtime' }));
-      return;
-    }
-
-    const worker = new Worker(
-      new URL('../workers/dashboard-stream.worker.js', import.meta.url),
-      { type: 'module' },
-    );
-    workerRef.current = worker;
-
-    worker.onmessage = (event) => {
-      if (!shouldHandleDashboardWorkerEvent(workerRef, worker)) {
-        return;
-      }
-      const message = event.data;
-      if (message?.type === 'stream:open') {
-        onOpen?.();
-        return;
-      }
-      if (isStreamBatchMessage(message)) {
-        onBatch?.(message);
-        return;
-      }
-      if (message?.type === 'stream:close') {
-        onClose?.(message);
-        return;
-      }
-      if (message?.type === 'stream:error') {
-        onError?.(message);
-      }
-    };
-
-    worker.onerror = (errorEvent) => {
-      if (!shouldHandleDashboardWorkerEvent(workerRef, worker)) {
-        return;
-      }
-      onError?.(normalizeWorkerError(errorEvent));
-    };
-
-    worker.postMessage(
-      createStreamInitMessage({
-        apiBase,
-        afterSeqId,
-        batchWindowMs,
-        streamBatchLimit,
-        streamIntervalMs,
-        initialCredit,
+    onOpen?.();
+    onError?.(
+      normalizeWorkerError({
+        message: 'Dashboard WebSocket worker transport is deprecated. SSE is now the only supported transport.',
       }),
     );
   }, [disconnectWorker]);
 
   const sendCredit = useCallback((amount = 1) => {
+    void amount;
     const worker = workerRef.current;
     if (!worker) {
       return;
     }
-    worker.postMessage(createStreamCreditMessage(amount));
   }, []);
 
   useEffect(() => () => {

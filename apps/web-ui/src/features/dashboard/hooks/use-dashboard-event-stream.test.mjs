@@ -137,7 +137,7 @@ test('resolveDashboardStreamConnector selects SSE connector when transport is ss
   assert.deepEqual(calls, ['sse']);
 });
 
-test('resolveDashboardStreamConnector selects WS connector when transport is ws', () => {
+test('resolveDashboardStreamConnector selects SSE connector when transport is ws', () => {
   const calls = [];
   const connector = resolveDashboardStreamConnector({
     streamTransport: 'ws',
@@ -151,7 +151,7 @@ test('resolveDashboardStreamConnector selects WS connector when transport is ws'
 
   connector();
 
-  assert.deepEqual(calls, ['ws']);
+  assert.deepEqual(calls, ['sse']);
 });
 
 test('applyDashboardSseResetResync updates seq cursor and schedules immediate snapshot', () => {
