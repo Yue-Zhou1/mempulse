@@ -259,6 +259,28 @@ export function resolveDashboardStreamConnector({
   return connectEventSource;
 }
 
+export function applyDashboardSseResetResync({
+  cancelled = false,
+  reset,
+  latestSeqIdRef,
+  scheduleSnapshot,
+  forceTxWindowSnapshot = false,
+}) {
+  if (cancelled) {
+    return;
+  }
+  const latestSeqId = Number(reset?.latestSeqId);
+  if (Number.isFinite(latestSeqId) && latestSeqIdRef) {
+    latestSeqIdRef.current = Math.max(
+      Number(latestSeqIdRef.current) || 0,
+      Math.floor(latestSeqId),
+    );
+  }
+  scheduleSnapshot?.('sse-reset-resync', true, {
+    forceTxWindow: Boolean(forceTxWindowSnapshot),
+  });
+}
+
 export function useDashboardLifecycleEffects({
   apiBase,
   snapshotTxLimit,
@@ -1058,13 +1080,13 @@ export function useDashboardLifecycleEffects({
             },
             onBatch: handleStreamBatch,
             onReset: (reset) => {
-              if (cancelled) {
-                return;
-              }
-              const latestSeqId = Number(reset?.latestSeqId);
-              if (Number.isFinite(latestSeqId)) {
-                latestSeqIdRef.current = Math.max(latestSeqIdRef.current, Math.floor(latestSeqId));
-              }
+              applyDashboardSseResetResync({
+                cancelled,
+                reset,
+                latestSeqIdRef,
+                scheduleSnapshot,
+                forceTxWindowSnapshot: runtimePolicy.shouldForceTxWindowSnapshot,
+              });
             },
             onError: (error) => {
               if (cancelled) {

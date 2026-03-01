@@ -5,7 +5,10 @@ import {
   connectDashboardEventSource,
   disconnectDashboardEventSource,
 } from './use-dashboard-event-stream.js';
-import { resolveDashboardStreamConnector } from './use-dashboard-lifecycle-effects.js';
+import {
+  applyDashboardSseResetResync,
+  resolveDashboardStreamConnector,
+} from './use-dashboard-lifecycle-effects.js';
 
 function buildDeltaPayload(seq = 41) {
   return {
@@ -149,4 +152,27 @@ test('resolveDashboardStreamConnector selects WS connector when transport is ws'
   connector();
 
   assert.deepEqual(calls, ['ws']);
+});
+
+test('applyDashboardSseResetResync updates seq cursor and schedules immediate snapshot', () => {
+  const latestSeqIdRef = { current: 100 };
+  const calls = [];
+  const scheduleSnapshot = (sourceLabel, immediate, options) => {
+    calls.push({ sourceLabel, immediate, options });
+  };
+
+  applyDashboardSseResetResync({
+    cancelled: false,
+    reset: { reason: 'gap', latestSeqId: 120 },
+    latestSeqIdRef,
+    scheduleSnapshot,
+    forceTxWindowSnapshot: true,
+  });
+
+  assert.equal(latestSeqIdRef.current, 120);
+  assert.deepEqual(calls, [{
+    sourceLabel: 'sse-reset-resync',
+    immediate: true,
+    options: { forceTxWindow: true },
+  }]);
 });
