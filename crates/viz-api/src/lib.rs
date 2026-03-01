@@ -1992,6 +1992,19 @@ struct DashboardEventsV1Frame {
 }
 
 fn build_dashboard_events_v1_delta_frame(dispatch: &StreamV2Dispatch) -> Option<DashboardEventsV1Frame> {
+    if dispatch.has_gap {
+        let latest_seq_id = dispatch.seq.max(dispatch.watermark.latest_ingest_seq);
+        return Some(DashboardEventsV1Frame {
+            id: latest_seq_id.to_string(),
+            event: "reset".to_owned(),
+            data: serde_json::json!({
+                "reason": "gap",
+                "latestSeqId": latest_seq_id,
+            })
+            .to_string(),
+        });
+    }
+
     Some(DashboardEventsV1Frame {
         id: dispatch.seq.to_string(),
         event: "delta".to_owned(),
@@ -3848,5 +3861,72 @@ mod tests {
     fn dashboard_events_v1_resume_after_uses_query_after_when_header_missing() {
         assert_eq!(resolve_dashboard_events_v1_after(None, Some(9)), 9);
         assert_eq!(resolve_dashboard_events_v1_after(Some("invalid"), Some(9)), 9);
+    }
+
+    #[test]
+    fn dashboard_events_v1_reset_emits_reset_event_when_gap_detected() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 99,
+            channel: "tx.main".to_owned(),
+            has_gap: true,
+            patch: StreamV2Patch {
+                upsert: Vec::new(),
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 99,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        assert_eq!(frame.id, "99");
+        assert_eq!(frame.event, "reset");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["reason"], serde_json::json!("gap"));
+        assert_eq!(payload["latestSeqId"], serde_json::json!(99));
+    }
+
+    #[test]
+    fn dashboard_events_v1_reset_uses_latest_seq_id_in_payload() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 321,
+            channel: "tx.main".to_owned(),
+            has_gap: true,
+            patch: StreamV2Patch {
+                upsert: Vec::new(),
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 321,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["latestSeqId"], serde_json::json!(321));
     }
 }
