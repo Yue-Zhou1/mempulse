@@ -7,6 +7,18 @@ import {
   normalizeWorkerError,
 } from '../workers/stream-protocol.js';
 
+export function resolveDashboardStreamTransport(streamTransport) {
+  const normalized = String(streamTransport ?? '').trim().toLowerCase();
+  if (normalized === 'ws') {
+    return 'ws';
+  }
+  return 'sse';
+}
+
+export function shouldUseDashboardStreamWorker(streamTransport) {
+  return resolveDashboardStreamTransport(streamTransport) === 'ws';
+}
+
 export function disconnectDashboardStreamWorker(worker) {
   if (!worker) {
     return;

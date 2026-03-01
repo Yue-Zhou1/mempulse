@@ -18,7 +18,11 @@ import {
 } from '../domain/dashboard-stream-store.js';
 import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
 import { createSystemHealthMonitor } from '../lib/system-health.js';
-import { useDashboardStreamWorker } from './use-dashboard-stream-worker.js';
+import { useDashboardEventStream } from './use-dashboard-event-stream.js';
+import {
+  shouldUseDashboardStreamWorker,
+  useDashboardStreamWorker,
+} from './use-dashboard-stream-worker.js';
 import { shouldApplyStreamBatch, shouldScheduleGapResync } from '../workers/stream-protocol.js';
 
 const snapshotThrottleMs = 1200;
@@ -244,6 +248,17 @@ function opportunityEquivalent(left, right) {
   );
 }
 
+export function resolveDashboardStreamConnector({
+  streamTransport,
+  connectEventSource,
+  connectWorker,
+}) {
+  if (shouldUseDashboardStreamWorker(streamTransport)) {
+    return connectWorker;
+  }
+  return connectEventSource;
+}
+
 export function useDashboardLifecycleEffects({
   apiBase,
   snapshotTxLimit,
@@ -251,6 +266,7 @@ export function useDashboardLifecycleEffects({
   maxFeatureHistory,
   maxOpportunityHistory,
   streamBatchMs,
+  streamTransport,
   samplingLagThresholdMs,
   samplingStride,
   samplingFlushIdleMs,
@@ -298,6 +314,7 @@ export function useDashboardLifecycleEffects({
   setDialogError,
 }) {
   const { connectWorker, disconnectWorker, sendCredit } = useDashboardStreamWorker();
+  const { connectEventSource, disconnectEventSource } = useDashboardEventStream();
 
   useEffect(() => {
     recentTxRowsRef.current = recentTxRows;
@@ -345,6 +362,7 @@ export function useDashboardLifecycleEffects({
       ? Math.max(100, Math.floor(streamBatchMs))
       : 500;
     const runtimePolicy = resolveDashboardRuntimePolicy(activeScreen);
+    const useWorkerTransport = shouldUseDashboardStreamWorker(streamTransport);
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
     let steadySnapshotTimer = null;
@@ -361,8 +379,9 @@ export function useDashboardLifecycleEffects({
     let pendingDeltaMarketStats = null;
     let pendingDeltaLatestSeqId = null;
 
-    const cleanupStreamWorker = () => {
+    const cleanupStreamConnections = () => {
       disconnectWorker();
+      disconnectEventSource();
     };
 
     const clearReconnectTimer = () => {
@@ -934,12 +953,79 @@ export function useDashboardLifecycleEffects({
       }, delay);
     };
 
+    const handleStreamOpen = (sourceLabel) => {
+      if (cancelled) {
+        return;
+      }
+      reconnectAttemptsRef.current = 0;
+      setHasError(false);
+      scheduleSnapshot(sourceLabel, true, {
+        forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+      });
+    };
+
+    const handleStreamBatch = (batch) => {
+      if (cancelled) {
+        return;
+      }
+
+      const previousSeqId = Number.isFinite(pendingDeltaLatestSeqId)
+        ? Math.max(latestSeqIdRef.current, pendingDeltaLatestSeqId)
+        : latestSeqIdRef.current;
+      const seqId = batch.latestSeqId;
+      if (!shouldApplyStreamBatch({
+        previousSeqId,
+        latestSeqId: seqId,
+        transactionCount: Array.isArray(batch.transactions) ? batch.transactions.length : 0,
+        featureCount: Array.isArray(batch.featureRows) ? batch.featureRows.length : 0,
+        opportunityCount: Array.isArray(batch.opportunityRows)
+          ? batch.opportunityRows.length
+          : 0,
+      })) {
+        pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
+        schedulePendingStreamDeltaFlush();
+        if (useWorkerTransport) {
+          sendCredit(1);
+        }
+        return;
+      }
+
+      pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
+      appendPendingRows(pendingDeltaOpportunityRows, batch.opportunityRows);
+      if (runtimePolicy.shouldProcessTxStream) {
+        appendPendingRows(pendingDeltaFeatureRows, batch.featureRows);
+        appendPendingRows(pendingDeltaTransactions, batch.transactions);
+      }
+      if (Number.isFinite(seqId)) {
+        pendingDeltaLatestSeqId = Number.isFinite(pendingDeltaLatestSeqId)
+          ? Math.max(pendingDeltaLatestSeqId, seqId)
+          : seqId;
+      }
+      schedulePendingStreamDeltaFlush();
+      if (shouldScheduleGapResync({
+        previousSeqId,
+        latestSeqId: seqId,
+        hasGap: batch.hasGap,
+        nowUnixMs: Date.now(),
+        lastResyncUnixMs: lastGapSnapshotAtRef.current,
+        cooldownMs: steadySnapshotRefreshMs,
+      })) {
+        lastGapSnapshotAtRef.current = Date.now();
+        scheduleSnapshot('ws-gap-resync', true, {
+          forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+        });
+      }
+      if (useWorkerTransport) {
+        sendCredit(1);
+      }
+    };
+
     const connectStream = () => {
       if (cancelled) {
         return;
       }
       resetPendingStreamDelta();
-      cleanupStreamWorker();
+      cleanupStreamConnections();
       clearFallbackSnapshotPollTimer();
       clearSteadySnapshotTimer();
       if (!workerEnabled) {
@@ -960,94 +1046,74 @@ export function useDashboardLifecycleEffects({
         }, fallbackSnapshotRefreshMs);
         return;
       }
-      connectWorker({
-        apiBase,
-        afterSeqId: latestSeqIdRef.current,
-        batchWindowMs: resolvedStreamBatchMs,
-        streamBatchLimit,
-        streamIntervalMs,
-        initialCredit: 1,
-        onOpen: () => {
-          if (cancelled) {
-            return;
-          }
-          reconnectAttemptsRef.current = 0;
-          setHasError(false);
-          scheduleSnapshot('ws-open', true, {
-            forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
+
+      const connectTransport = resolveDashboardStreamConnector({
+        streamTransport,
+        connectEventSource: () => {
+          connectEventSource({
+            apiBase,
+            afterSeqId: latestSeqIdRef.current,
+            onOpen: () => {
+              handleStreamOpen('sse-open');
+            },
+            onBatch: handleStreamBatch,
+            onReset: (reset) => {
+              if (cancelled) {
+                return;
+              }
+              const latestSeqId = Number(reset?.latestSeqId);
+              if (Number.isFinite(latestSeqId)) {
+                latestSeqIdRef.current = Math.max(latestSeqIdRef.current, Math.floor(latestSeqId));
+              }
+            },
+            onError: (error) => {
+              if (cancelled) {
+                return;
+              }
+              setHasError(true);
+              setStatusMessage(`SSE stream error: ${error.message}`);
+            },
           });
         },
-        onBatch: (batch) => {
-          if (cancelled) {
-            return;
-          }
-
-          const previousSeqId = Number.isFinite(pendingDeltaLatestSeqId)
-            ? Math.max(latestSeqIdRef.current, pendingDeltaLatestSeqId)
-            : latestSeqIdRef.current;
-          const seqId = batch.latestSeqId;
-          if (!shouldApplyStreamBatch({
-            previousSeqId,
-            latestSeqId: seqId,
-            transactionCount: Array.isArray(batch.transactions) ? batch.transactions.length : 0,
-            featureCount: Array.isArray(batch.featureRows) ? batch.featureRows.length : 0,
-            opportunityCount: Array.isArray(batch.opportunityRows)
-              ? batch.opportunityRows.length
-              : 0,
-          })) {
-            pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
-            schedulePendingStreamDeltaFlush();
-            sendCredit(1);
-            return;
-          }
-
-          pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
-          appendPendingRows(pendingDeltaOpportunityRows, batch.opportunityRows);
-          if (runtimePolicy.shouldProcessTxStream) {
-            appendPendingRows(pendingDeltaFeatureRows, batch.featureRows);
-            appendPendingRows(pendingDeltaTransactions, batch.transactions);
-          }
-          if (Number.isFinite(seqId)) {
-            pendingDeltaLatestSeqId = Number.isFinite(pendingDeltaLatestSeqId)
-              ? Math.max(pendingDeltaLatestSeqId, seqId)
-              : seqId;
-          }
-          schedulePendingStreamDeltaFlush();
-          if (shouldScheduleGapResync({
-            previousSeqId,
-            latestSeqId: seqId,
-            hasGap: batch.hasGap,
-            nowUnixMs: Date.now(),
-            lastResyncUnixMs: lastGapSnapshotAtRef.current,
-            cooldownMs: steadySnapshotRefreshMs,
-          })) {
-            lastGapSnapshotAtRef.current = Date.now();
-            scheduleSnapshot('ws-gap-resync', true, {
-              forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
-            });
-          }
-          sendCredit(1);
-        },
-        onClose: () => {
-          if (cancelled) {
-            return;
-          }
-          scheduleReconnect();
-        },
-        onError: (error) => {
-          if (cancelled) {
-            return;
-          }
-          setHasError(true);
-          setStatusMessage(`Stream worker error: ${error.message}`);
-          scheduleReconnect();
+        connectWorker: () => {
+          connectWorker({
+            apiBase,
+            afterSeqId: latestSeqIdRef.current,
+            batchWindowMs: resolvedStreamBatchMs,
+            streamBatchLimit,
+            streamIntervalMs,
+            initialCredit: 1,
+            onOpen: () => {
+              handleStreamOpen('ws-open');
+            },
+            onBatch: handleStreamBatch,
+            onClose: () => {
+              if (cancelled) {
+                return;
+              }
+              scheduleReconnect();
+            },
+            onError: (error) => {
+              if (cancelled) {
+                return;
+              }
+              setHasError(true);
+              setStatusMessage(`Stream worker error: ${error.message}`);
+              scheduleReconnect();
+            },
+          });
         },
       });
+      connectTransport?.();
     };
 
-    setStatusMessage(
-      `Connecting stream(v2) to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
-    );
+    if (useWorkerTransport) {
+      setStatusMessage(
+        `Connecting stream(v2) to ${apiBase} · cadence=${resolvedStreamBatchMs}ms · batch<=${streamBatchLimit}`,
+      );
+    } else {
+      setStatusMessage(`Connecting events(v1/sse) to ${apiBase}`);
+    }
     setHasError(false);
     if (!runtimePolicy.shouldProcessTxStream) {
       clearTransactionBuffers();
@@ -1087,15 +1153,17 @@ export function useDashboardLifecycleEffects({
       clearSteadySnapshotTimer();
       clearFrameProbe();
       clearPerformanceEntryCleanupTimer();
-      cleanupStreamWorker();
+      cleanupStreamConnections();
     };
   }, [
     apiBase,
     activeScreen,
+    connectEventSource,
     connectWorker,
     enqueueTickerCommit,
     flushTickerCommit,
     cancelTickerCommit,
+    disconnectEventSource,
     disconnectWorker,
     followLatestRef,
     latestSeqIdRef,
@@ -1104,6 +1172,7 @@ export function useDashboardLifecycleEffects({
     maxOpportunityHistory,
     maxTransactionHistory,
     streamBatchMs,
+    streamTransport,
     samplingLagThresholdMs,
     samplingStride,
     samplingFlushIdleMs,

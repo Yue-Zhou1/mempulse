@@ -54,6 +54,7 @@ export function useDashboardController() {
     devPerformanceEntryCleanupIntervalMs,
     transactionRetentionMs,
     transactionRetentionMinutes,
+    streamTransport,
     workerEnabled,
     virtualizedTickerEnabled,
   } = uiConfig;
@@ -151,6 +152,7 @@ export function useDashboardController() {
     maxFeatureHistory,
     maxOpportunityHistory,
     streamBatchMs,
+    streamTransport,
     samplingLagThresholdMs,
     samplingStride,
     samplingFlushIdleMs,
