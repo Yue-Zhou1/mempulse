@@ -7,6 +7,8 @@ import {
 } from './use-dashboard-event-stream.js';
 import {
   applyDashboardSseResetResync,
+  resolveDashboardStatusMessageUpdate,
+  resolveIncomingTransactionRows,
   resolveDashboardStreamConnector,
 } from './use-dashboard-lifecycle-effects.js';
 
@@ -175,4 +177,53 @@ test('applyDashboardSseResetResync updates seq cursor and schedules immediate sn
     immediate: true,
     options: { forceTxWindow: true },
   }]);
+});
+
+test('resolveDashboardStatusMessageUpdate throttles repeated stream status updates', () => {
+  assert.deepEqual(
+    resolveDashboardStatusMessageUpdate({
+      nextMessage: 'Streaming(sse) · tx=10/500',
+      lastMessage: '',
+      nowUnixMs: 1_000,
+      lastUpdatedUnixMs: 0,
+      throttleMs: 1_500,
+      force: false,
+    }),
+    { shouldUpdate: true, nextUpdatedUnixMs: 1_000 },
+  );
+
+  assert.deepEqual(
+    resolveDashboardStatusMessageUpdate({
+      nextMessage: 'Streaming(sse) · tx=11/500',
+      lastMessage: 'Streaming(sse) · tx=10/500',
+      nowUnixMs: 1_900,
+      lastUpdatedUnixMs: 1_000,
+      throttleMs: 1_500,
+      force: false,
+    }),
+    { shouldUpdate: false, nextUpdatedUnixMs: 1_000 },
+  );
+
+  assert.deepEqual(
+    resolveDashboardStatusMessageUpdate({
+      nextMessage: 'SSE stream error: boom',
+      lastMessage: 'Streaming(sse) · tx=10/500',
+      nowUnixMs: 1_900,
+      lastUpdatedUnixMs: 1_000,
+      throttleMs: 1_500,
+      force: true,
+    }),
+    { shouldUpdate: true, nextUpdatedUnixMs: 1_900 },
+  );
+});
+
+test('resolveIncomingTransactionRows preserves array reference and ordering', () => {
+  const rows = [
+    { hash: '0x1', seen_unix_ms: 100 },
+    { hash: '0x2', seen_unix_ms: 200 },
+  ];
+
+  const resolved = resolveIncomingTransactionRows(rows);
+  assert.equal(resolved, rows);
+  assert.deepEqual(resolved.map((row) => row.hash), ['0x1', '0x2']);
 });

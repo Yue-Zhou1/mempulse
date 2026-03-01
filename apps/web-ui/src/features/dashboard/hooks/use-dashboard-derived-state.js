@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import { filterRowsByMainnet } from '../domain/mainnet-filter.js';
 import { resolveDashboardRuntimePolicy } from '../domain/screen-runtime-policy.js';
 import {
+  buildIncrementalRowIndex,
   chainStatusTone,
   formatChainStatusChainKey,
   formatDurationToken,
@@ -44,6 +45,10 @@ export function useDashboardDerivedState({
   setSelectedOpportunityKey,
 }) {
   const previousVirtualizedTickerRowsRef = useRef(null);
+  const featureByHashRef = useRef(EMPTY_FEATURE_MAP);
+  const transactionByHashRef = useRef(new Map());
+  const recentTxByHashRef = useRef(new Map());
+  const filteredOpportunityByKeyRef = useRef(new Map());
   const runtimePolicy = useMemo(
     () => resolveDashboardRuntimePolicy(activeScreen),
     [activeScreen],
@@ -52,14 +57,36 @@ export function useDashboardDerivedState({
 
   const featureByHash = useMemo(() => {
     if (!shouldComputeRadarDerived && !dialogHash) {
+      featureByHashRef.current = EMPTY_FEATURE_MAP;
       return EMPTY_FEATURE_MAP;
     }
-    const map = new Map();
-    for (const row of featureDetailRows) {
-      map.set(row.hash, row);
-    }
-    return map;
+    const previous = featureByHashRef.current === EMPTY_FEATURE_MAP
+      ? null
+      : featureByHashRef.current;
+    const next = buildIncrementalRowIndex(previous, featureDetailRows, (row) => row?.hash);
+    featureByHashRef.current = next;
+    return next;
   }, [dialogHash, featureDetailRows, shouldComputeRadarDerived]);
+
+  const transactionByHash = useMemo(() => {
+    const next = buildIncrementalRowIndex(
+      transactionByHashRef.current,
+      transactionRows,
+      (row) => row?.hash,
+    );
+    transactionByHashRef.current = next;
+    return next;
+  }, [transactionRows]);
+
+  const recentTxByHash = useMemo(() => {
+    const next = buildIncrementalRowIndex(
+      recentTxByHashRef.current,
+      recentTxRows,
+      (row) => row?.hash,
+    );
+    recentTxByHashRef.current = next;
+    return next;
+  }, [recentTxRows]);
 
   const filteredTransactions = useMemo(() => {
     if (!shouldComputeRadarDerived) {
@@ -106,11 +133,21 @@ export function useDashboardDerivedState({
     [liveMainnetFilter, opportunityRows],
   );
 
+  const filteredOpportunityByKey = useMemo(() => {
+    const next = buildIncrementalRowIndex(
+      filteredOpportunityByKeyRef.current,
+      filteredOpportunityRows,
+      opportunityRowKey,
+    );
+    filteredOpportunityByKeyRef.current = next;
+    return next;
+  }, [filteredOpportunityRows]);
+
   const selectedTransaction = useMemo(
     () => (shouldComputeRadarDerived
-      ? transactionRows.find((row) => row.hash === selectedHash) ?? null
+      ? transactionByHash.get(selectedHash) ?? null
       : null),
-    [selectedHash, shouldComputeRadarDerived, transactionRows],
+    [selectedHash, shouldComputeRadarDerived, transactionByHash],
   );
 
   const selectedDetail = useMemo(() => {
@@ -131,12 +168,12 @@ export function useDashboardDerivedState({
     if (!selectedTransaction) {
       return null;
     }
-    return recentTxRows.find((row) => row.hash === selectedTransaction.hash) ?? null;
-  }, [recentTxRows, selectedTransaction]);
+    return recentTxByHash.get(selectedTransaction.hash) ?? null;
+  }, [recentTxByHash, selectedTransaction]);
 
   const selectedOpportunity = useMemo(
-    () => filteredOpportunityRows.find((row) => opportunityRowKey(row) === selectedOpportunityKey) ?? null,
-    [filteredOpportunityRows, selectedOpportunityKey],
+    () => filteredOpportunityByKey.get(selectedOpportunityKey) ?? null,
+    [filteredOpportunityByKey, selectedOpportunityKey],
   );
 
   const selectedTransactionMainnet = selectedTransaction
@@ -150,8 +187,8 @@ export function useDashboardDerivedState({
     if (!dialogHash) {
       return null;
     }
-    return transactionRows.find((row) => row.hash === dialogHash) ?? null;
-  }, [dialogHash, transactionRows]);
+    return transactionByHash.get(dialogHash) ?? null;
+  }, [dialogHash, transactionByHash]);
 
   const dialogDetail = useMemo(() => {
     if (!dialogHash) {
@@ -239,12 +276,12 @@ export function useDashboardDerivedState({
 
   useEffect(() => {
     setSelectedOpportunityKey((current) => {
-      if (current && filteredOpportunityRows.some((row) => opportunityRowKey(row) === current)) {
+      if (current && filteredOpportunityByKey.has(current)) {
         return current;
       }
       return filteredOpportunityRows[0] ? opportunityRowKey(filteredOpportunityRows[0]) : null;
     });
-  }, [filteredOpportunityRows, setSelectedOpportunityKey]);
+  }, [filteredOpportunityByKey, filteredOpportunityRows, setSelectedOpportunityKey]);
 
   const {
     totalSignalVolume,

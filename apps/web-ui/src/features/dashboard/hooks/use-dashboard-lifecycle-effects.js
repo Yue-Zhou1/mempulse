@@ -27,6 +27,7 @@ const streamIntervalMs = 1000;
 const streamInitialReconnectMs = 1000;
 const streamMaxReconnectMs = 30000;
 const steadySnapshotRefreshMs = 15000;
+const statusMessageThrottleMs = 1500;
 
 function resolvePerfNow() {
   if (typeof globalThis?.performance?.now === 'function') {
@@ -244,6 +245,48 @@ function opportunityEquivalent(left, right) {
   );
 }
 
+export function resolveIncomingTransactionRows(transactions) {
+  return Array.isArray(transactions) ? transactions : [];
+}
+
+export function resolveDashboardStatusMessageUpdate({
+  nextMessage,
+  lastMessage,
+  nowUnixMs = Date.now(),
+  lastUpdatedUnixMs = 0,
+  throttleMs = statusMessageThrottleMs,
+  force = false,
+} = {}) {
+  const normalizedNext = String(nextMessage ?? '');
+  const normalizedLast = String(lastMessage ?? '');
+  if (force) {
+    return {
+      shouldUpdate: normalizedNext !== normalizedLast,
+      nextUpdatedUnixMs: nowUnixMs,
+    };
+  }
+  if (!normalizedNext || normalizedNext === normalizedLast) {
+    return {
+      shouldUpdate: false,
+      nextUpdatedUnixMs: lastUpdatedUnixMs,
+    };
+  }
+
+  const now = Number.isFinite(nowUnixMs) ? Math.floor(nowUnixMs) : Date.now();
+  const lastUpdated = Number.isFinite(lastUpdatedUnixMs) ? Math.floor(lastUpdatedUnixMs) : 0;
+  const throttle = Number.isFinite(throttleMs) ? Math.max(0, Math.floor(throttleMs)) : 0;
+  if (lastUpdated > 0 && now - lastUpdated < throttle) {
+    return {
+      shouldUpdate: false,
+      nextUpdatedUnixMs: lastUpdated,
+    };
+  }
+  return {
+    shouldUpdate: true,
+    nextUpdatedUnixMs: now,
+  };
+}
+
 export function resolveDashboardStreamConnector({
   streamTransport,
   connectEventSource,
@@ -374,9 +417,7 @@ export function useDashboardLifecycleEffects({
   useEffect(() => {
     let cancelled = false;
     const perfMonitor = createDashboardPerfMonitor(globalThis?.window);
-    const resolvedStreamBatchMs = Number.isFinite(streamBatchMs)
-      ? Math.max(100, Math.floor(streamBatchMs))
-      : 500;
+    void streamBatchMs;
     const runtimePolicy = resolveDashboardRuntimePolicy(activeScreen);
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
@@ -393,6 +434,26 @@ export function useDashboardLifecycleEffects({
     let pendingDeltaOpportunityRows = [];
     let pendingDeltaMarketStats = null;
     let pendingDeltaLatestSeqId = null;
+    let lastStatusMessage = '';
+    let lastStatusMessageUpdatedAt = 0;
+
+    const publishStatusMessage = (nextMessage, options = {}) => {
+      const update = resolveDashboardStatusMessageUpdate({
+        nextMessage,
+        lastMessage: lastStatusMessage,
+        nowUnixMs: options.nowUnixMs,
+        lastUpdatedUnixMs: lastStatusMessageUpdatedAt,
+        throttleMs: options.throttleMs ?? statusMessageThrottleMs,
+        force: Boolean(options.force),
+      });
+      if (!update.shouldUpdate) {
+        return false;
+      }
+      lastStatusMessage = String(nextMessage ?? '');
+      lastStatusMessageUpdatedAt = update.nextUpdatedUnixMs;
+      setStatusMessage(lastStatusMessage);
+      return true;
+    };
 
     const cleanupStreamConnections = () => {
       disconnectEventSource();
@@ -551,8 +612,9 @@ export function useDashboardLifecycleEffects({
       latestSeqIdRef.current = 0;
 
       const heapMb = Math.round(usedHeapBytes / (1024 * 1024));
-      setStatusMessage(
+      publishStatusMessage(
         `Memory pressure detected (${heapMb}MB). Purging buffers and forcing snapshot sync...`,
+        { force: true },
       );
       setHasError(true);
     };
@@ -663,21 +725,18 @@ export function useDashboardLifecycleEffects({
     };
 
     const applyDeltaTransactions = (transactions, sourceLabel, latestSeqId) => {
-      const incoming = Array.isArray(transactions) ? transactions : [];
+      const incoming = resolveIncomingTransactionRows(transactions);
       if (!incoming.length) {
         if (Number.isFinite(latestSeqId)) {
           latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
         }
-        setStatusMessage(
+        publishStatusMessage(
           `Streaming(${sourceLabel}) · tx=${transactionRowsRef.current.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m`,
         );
         return;
       }
 
-      const orderedIncoming = [...incoming].sort(
-        (left, right) => Number(right?.seen_unix_ms ?? 0) - Number(left?.seen_unix_ms ?? 0),
-      );
-      const txSnapshot = transactionStoreRef.current.snapshot(orderedIncoming, {
+      const txSnapshot = transactionStoreRef.current.snapshot(incoming, {
         maxItems: maxTransactionHistory,
         nowUnixMs: Date.now(),
         maxAgeMs: transactionRetentionMs,
@@ -708,7 +767,7 @@ export function useDashboardLifecycleEffects({
       if (Number.isFinite(latestSeqId)) {
         latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
       }
-      setStatusMessage(
+      publishStatusMessage(
         `Streaming(${sourceLabel}) · tx=${stabilizedTransactions.length}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m`,
       );
     };
@@ -754,7 +813,7 @@ export function useDashboardLifecycleEffects({
       if (runtimePolicy.shouldProcessTxStream) {
         applyDeltaFeatureDetails(nextFeatureRows);
         if (nextTransactions.length || Number.isFinite(nextLatestSeqId)) {
-          applyDeltaTransactions(nextTransactions, 'ws-delta', nextLatestSeqId);
+          applyDeltaTransactions(nextTransactions, 'sse-delta', nextLatestSeqId);
         }
       } else if (Number.isFinite(nextLatestSeqId)) {
         latestSeqIdRef.current = Math.max(latestSeqIdRef.current, nextLatestSeqId);
@@ -763,20 +822,6 @@ export function useDashboardLifecycleEffects({
 
     const schedulePendingStreamDeltaFlush = () => {
       if (pendingDeltaFlushCancel || cancelled) {
-        return;
-      }
-
-      if (
-        typeof window.requestAnimationFrame === 'function'
-        && typeof window.cancelAnimationFrame === 'function'
-      ) {
-        const rafId = window.requestAnimationFrame(() => {
-          pendingDeltaFlushCancel = null;
-          flushPendingStreamDelta();
-        });
-        pendingDeltaFlushCancel = () => {
-          window.cancelAnimationFrame(rafId);
-        };
         return;
       }
 
@@ -874,7 +919,7 @@ export function useDashboardLifecycleEffects({
       latestSeqIdRef.current = Math.max(latestSeqIdRef.current, latestSeqId);
 
       const lastUpdated = new Date().toLocaleTimeString();
-      setStatusMessage(
+      publishStatusMessage(
         `Connected(${sourceLabel}) · opps=${opportunities.length} · features=${featureDetails.length} · tx=${transactionCount}/${maxTransactionHistory} · window=${transactionRetentionMinutes}m · ${lastUpdated}`,
       );
       perfMonitor.recordSnapshotApply(resolvePerfNow() - applyStartedAt);
@@ -922,7 +967,7 @@ export function useDashboardLifecycleEffects({
         }
         requestStatus = 'failed';
         setHasError(true);
-        setStatusMessage(`Snapshot sync failed: ${error.message}`);
+        publishStatusMessage(`Snapshot sync failed: ${error.message}`, { force: true });
       } finally {
         if (snapshotRequestAbortController === requestAbortController) {
           snapshotRequestAbortController = null;
@@ -1041,8 +1086,9 @@ export function useDashboardLifecycleEffects({
         const fallbackSnapshotRefreshMs = runtimePolicy.shouldProcessTxStream
           ? snapshotThrottleMs
           : steadySnapshotRefreshMs;
-        setStatusMessage(
+        publishStatusMessage(
           `Worker pipeline disabled · polling snapshots every ${fallbackSnapshotRefreshMs}ms`,
+          { force: true },
         );
         scheduleSnapshot('snapshot-poll-bootstrap', true, {
           forceTxWindow: runtimePolicy.shouldForceTxWindowSnapshot,
@@ -1079,7 +1125,7 @@ export function useDashboardLifecycleEffects({
                 return;
               }
               setHasError(true);
-              setStatusMessage(`SSE stream error: ${error.message}`);
+              publishStatusMessage(`SSE stream error: ${error.message}`, { force: true });
             },
           });
         },
@@ -1088,7 +1134,7 @@ export function useDashboardLifecycleEffects({
       connectTransport?.();
     };
 
-    setStatusMessage(`Connecting events(v1/sse) to ${apiBase}`);
+    publishStatusMessage(`Connecting events(v1/sse) to ${apiBase}`, { force: true });
     setHasError(false);
     if (!runtimePolicy.shouldProcessTxStream) {
       clearTransactionBuffers();

@@ -74,6 +74,59 @@ function resolveOpportunityPalette(strategy, category) {
   return DEFAULT_OPPORTUNITY_PALETTE;
 }
 
+export function buildIncrementalRowIndex(previousIndex, rows, keyOf) {
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  const resolveKey = typeof keyOf === 'function'
+    ? keyOf
+    : (row) => row?.hash;
+
+  if (!(previousIndex instanceof Map)) {
+    const next = new Map();
+    for (const row of sourceRows) {
+      const key = resolveKey(row);
+      if (key == null || key === '') {
+        continue;
+      }
+      next.set(key, row);
+    }
+    return next;
+  }
+
+  let nextIndex = previousIndex;
+  let changed = false;
+  const seenKeys = new Set();
+
+  for (const row of sourceRows) {
+    const key = resolveKey(row);
+    if (key == null || key === '') {
+      continue;
+    }
+    seenKeys.add(key);
+    if (previousIndex.get(key) === row) {
+      continue;
+    }
+    if (!changed) {
+      nextIndex = new Map(previousIndex);
+      changed = true;
+    }
+    nextIndex.set(key, row);
+  }
+
+  const keysToCheck = changed ? Array.from(nextIndex.keys()) : Array.from(previousIndex.keys());
+  for (const key of keysToCheck) {
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    if (!changed) {
+      nextIndex = new Map(previousIndex);
+      changed = true;
+    }
+    nextIndex.delete(key);
+  }
+
+  return changed ? nextIndex : previousIndex;
+}
+
 export function getStoredApiBase() {
   try {
     return window.localStorage.getItem(storageKey);

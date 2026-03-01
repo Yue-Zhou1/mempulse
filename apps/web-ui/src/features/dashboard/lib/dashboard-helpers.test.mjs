@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildIncrementalRowIndex,
   classifyRisk,
   fetchJson,
   formatDurationToken,
@@ -146,4 +147,31 @@ test('isAbortError detects abort-style exceptions and ignores regular failures',
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('buildIncrementalRowIndex reuses map when row references are unchanged', () => {
+  const rows = [
+    { hash: '0x1', value: 1 },
+    { hash: '0x2', value: 2 },
+  ];
+  const previous = buildIncrementalRowIndex(null, rows, (row) => row.hash);
+  const next = buildIncrementalRowIndex(previous, rows, (row) => row.hash);
+
+  assert.equal(next, previous);
+  assert.equal(next.get('0x1'), rows[0]);
+  assert.equal(next.get('0x2'), rows[1]);
+});
+
+test('buildIncrementalRowIndex updates changed rows and removes stale rows', () => {
+  const initialRows = [
+    { hash: '0x1', value: 1 },
+    { hash: '0x2', value: 2 },
+  ];
+  const previous = buildIncrementalRowIndex(null, initialRows, (row) => row.hash);
+  const updatedRow = { hash: '0x1', value: 10 };
+  const next = buildIncrementalRowIndex(previous, [updatedRow], (row) => row.hash);
+
+  assert.notEqual(next, previous);
+  assert.equal(next.get('0x1'), updatedRow);
+  assert.equal(next.has('0x2'), false);
 });
