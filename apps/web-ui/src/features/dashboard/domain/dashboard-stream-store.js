@@ -2,11 +2,14 @@ import { create } from 'zustand';
 import { subscribeWithSelector } from 'zustand/middleware';
 
 const DEFAULT_DETAIL_CACHE_LIMIT = 96;
+const DETAIL_CACHE_PRUNE_DEBOUNCE_MS = 1000;
 
 const transactionDetailCache = new Map();
 let pendingTickerCommit = null;
 let rafHandle = null;
 let rafCancel = null;
+let detailCachePruneTimer = null;
+let pendingDetailCachePruneRows = null;
 
 function normalizeRows(rows) {
   return Array.isArray(rows) ? rows : [];
@@ -20,6 +23,47 @@ function resolveNextSelectedHash(currentSelectedHash, transactionRows) {
     return currentSelectedHash;
   }
   return transactionRows[0]?.hash ?? null;
+}
+
+function clearPendingDetailCachePrune() {
+  if (
+    detailCachePruneTimer != null
+    && typeof globalThis?.clearTimeout === 'function'
+  ) {
+    globalThis.clearTimeout(detailCachePruneTimer);
+  }
+  detailCachePruneTimer = null;
+  pendingDetailCachePruneRows = null;
+}
+
+function scheduleTransactionDetailCachePrune(get, transactionRows) {
+  if (transactionDetailCache.size === 0) {
+    return;
+  }
+
+  pendingDetailCachePruneRows = normalizeRows(transactionRows);
+  if (detailCachePruneTimer != null) {
+    return;
+  }
+
+  if (typeof globalThis?.setTimeout !== 'function') {
+    const liveHashes = new Set((pendingDetailCachePruneRows ?? []).map((row) => row.hash));
+    pendingDetailCachePruneRows = null;
+    if (pruneTransactionDetailCache(liveHashes)) {
+      get().bumpDetailVersion();
+    }
+    return;
+  }
+
+  detailCachePruneTimer = globalThis.setTimeout(() => {
+    detailCachePruneTimer = null;
+    const rows = pendingDetailCachePruneRows;
+    pendingDetailCachePruneRows = null;
+    const liveHashes = new Set(normalizeRows(rows).map((row) => row.hash));
+    if (pruneTransactionDetailCache(liveHashes)) {
+      get().bumpDetailVersion();
+    }
+  }, DETAIL_CACHE_PRUNE_DEBOUNCE_MS);
 }
 
 function commitTickerRows(set, get, commit) {
@@ -55,10 +99,7 @@ function commitTickerRows(set, get, commit) {
     rafCancel = null;
   }
 
-  const liveHashes = new Set(transactionRows.map((row) => row.hash));
-  if (pruneTransactionDetailCache(liveHashes)) {
-    get().bumpDetailVersion();
-  }
+  scheduleTransactionDetailCachePrune(get, transactionRows);
 }
 
 function resolveRequestFrame(options) {
@@ -157,6 +198,7 @@ export const useDashboardStreamStore = create(
       if (rafHandle != null && typeof rafCancel === 'function') {
         rafCancel(rafHandle);
       }
+      clearPendingDetailCachePrune();
       rafHandle = null;
       rafCancel = null;
       set({
@@ -223,6 +265,7 @@ export function __resetDashboardStreamStoreForTests() {
   if (rafHandle != null && typeof rafCancel === 'function') {
     rafCancel(rafHandle);
   }
+  clearPendingDetailCachePrune();
   rafHandle = null;
   rafCancel = null;
   transactionDetailCache.clear();

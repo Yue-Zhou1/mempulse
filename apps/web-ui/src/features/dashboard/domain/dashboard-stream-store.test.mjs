@@ -139,3 +139,40 @@ test('activeSelectedTxId resolves detail from non-reactive cache', () => {
     false,
   );
 });
+
+test('detail cache pruning is deferred outside commit path and uses latest rows', () => {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const timeoutCallbacks = [];
+
+  globalThis.setTimeout = (callback) => {
+    timeoutCallbacks.push(callback);
+    return timeoutCallbacks.length;
+  };
+  globalThis.clearTimeout = () => {};
+
+  try {
+    setTransactionDetailByHash('0xkeep', { nonce: 1 }, 10);
+    setTransactionDetailByHash('0xdrop', { nonce: 2 }, 10);
+
+    useDashboardStreamStore.getState().commitTickerRows({
+      recentTxRows: [{ hash: '0xkeep' }],
+      transactionRows: [{ hash: '0xkeep' }],
+    });
+    useDashboardStreamStore.getState().commitTickerRows({
+      recentTxRows: [{ hash: '0xkeep' }],
+      transactionRows: [{ hash: '0xkeep' }],
+    });
+
+    assert.equal(timeoutCallbacks.length, 1);
+    assert.deepEqual(getTransactionDetailByHash('0xdrop'), { nonce: 2 });
+
+    timeoutCallbacks[0]();
+
+    assert.equal(getTransactionDetailByHash('0xkeep').nonce, 1);
+    assert.equal(getTransactionDetailByHash('0xdrop'), null);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});

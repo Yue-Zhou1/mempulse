@@ -59,6 +59,7 @@ window.__MEMPULSE_UI_CONFIG__ = {
   opportunityHistoryLimit: 1500,
   txRenderLimit: 80,
   streamBatchMs: 1000,
+  streamTransport: 'sse', // required transport
   workerEnabled: true,
   virtualizedTickerEnabled: true,
   samplingLagThresholdMs: 30,
@@ -85,6 +86,7 @@ VITE_UI_FEATURE_HISTORY_LIMIT=1500
 VITE_UI_OPPORTUNITY_HISTORY_LIMIT=1500
 VITE_UI_TX_RENDER_LIMIT=80
 VITE_UI_STREAM_BATCH_MS=1000
+VITE_UI_STREAM_TRANSPORT=sse
 VITE_UI_WORKER_ENABLED=true
 VITE_UI_VIRTUALIZED_TICKER_ENABLED=true
 VITE_UI_SAMPLING_LAG_THRESHOLD_MS=30
@@ -98,6 +100,25 @@ VITE_UI_DETAIL_CACHE_LIMIT=96
 Notes:
 - These are build-time frontend variables (`VITE_*`), so changing them requires rebuilding/restarting the UI.
 - They are not secrets; never put credentials in frontend env vars.
+
+### Stream transport rollout and rollback
+
+Dashboard live stream transport now supports:
+- `streamTransport: 'sse'` only.
+
+Runtime toggle example (`apps/web-ui/public/runtime-config.js`):
+
+```js
+window.__MEMPULSE_UI_CONFIG__ = {
+  streamTransport: 'sse',
+};
+```
+
+Build-time toggle example (`apps/web-ui/.env.local`):
+
+```bash
+VITE_UI_STREAM_TRANSPORT=sse
+```
 
 ## UI performance profiling
 

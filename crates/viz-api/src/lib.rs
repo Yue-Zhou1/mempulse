@@ -1,18 +1,22 @@
 pub mod auth;
 pub mod live_rpc;
+pub mod stream_broadcast;
 
 use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum::{middleware, response::Response};
 use builder::{RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
+use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
     live_rpc_drop_metrics_snapshot,
@@ -22,14 +26,16 @@ use replay::{
     replay_from_checkpoint,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::env;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
     NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
 };
+use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -734,59 +740,34 @@ impl VizDataProvider for InMemoryVizProvider {
             .read()
             .ok()
             .map(|storage| {
-                let feature_summary = storage
-                    .dashboard_feature_summary(summary_limit)
+                let feature_summary = build_feature_summary(&storage)
                     .into_iter()
-                    .map(|row| FeatureSummary {
-                        protocol: row.protocol,
-                        category: row.category,
-                        count: row.count,
-                    })
+                    .take(summary_limit)
                     .collect::<Vec<_>>();
 
-                let feature_details = storage
-                    .dashboard_feature_details_recent(feature_scan_limit)
+                let feature_details = build_feature_details(&storage)
                     .into_iter()
+                    .take(feature_scan_limit)
                     .filter(|row| chain_matches_filter(row.chain_id, chain_id))
                     .take(feature_limit)
-                    .map(|row| FeatureDetail {
-                        hash: format_bytes(&row.hash),
-                        protocol: row.protocol,
-                        category: row.category,
-                        chain_id: row.chain_id,
-                        mev_score: row.mev_score,
-                        urgency_score: row.urgency_score,
-                        method_selector: format_method_selector(row.method_selector),
-                        feature_engine_version: row.feature_engine_version,
-                    })
                     .collect::<Vec<_>>();
 
-                let opportunities = storage
-                    .dashboard_opportunities_recent(opp_scan_limit, min_score)
+                let opportunities = build_opportunities(&storage)
                     .into_iter()
+                    .filter(|row| row.score >= min_score)
+                    .take(opp_scan_limit)
                     .filter(|row| chain_matches_filter(row.chain_id, chain_id))
                     .take(opp_limit)
-                    .map(|row| OpportunityDetail {
-                        tx_hash: format_bytes(&row.tx_hash),
-                        status: "detected".to_owned(),
-                        strategy: row.strategy,
-                        score: row.score,
-                        protocol: row.protocol,
-                        category: row.category,
-                        chain_id: row.chain_id,
-                        feature_engine_version: row.feature_engine_version,
-                        scorer_version: row.scorer_version,
-                        strategy_version: row.strategy_version,
-                        reasons: row.reasons,
-                        detected_unix_ms: row.detected_unix_ms,
-                    })
                     .collect::<Vec<_>>();
+
+                let mut chain_id_by_hash = HashMap::new();
+                for row in storage.tx_full() {
+                    chain_id_by_hash.insert(row.hash, row.chain_id);
+                }
 
                 let mut transactions = Vec::with_capacity(tx_limit);
                 for row in storage.recent_transactions(tx_scan_limit) {
-                    let row_chain_id = storage
-                        .tx_full_by_hash(&row.hash)
-                        .and_then(|tx| tx.chain_id);
+                    let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
                     if !chain_matches_filter(row_chain_id, chain_id) {
                         continue;
                     }
@@ -897,10 +878,22 @@ impl VizDataProvider for InMemoryVizProvider {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
         let hash = parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
-            let seen = storage.tx_seen_by_hash(&hash)?;
-            let full = storage.tx_full_by_hash(&hash);
-            let feature = storage.tx_features_by_hash(&hash);
-            let lifecycle = storage.tx_lifecycle_by_hash(&hash);
+            let seen = storage
+                .tx_seen()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash)?;
+            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+            let feature = storage
+                .tx_features()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
+            let lifecycle = storage
+                .tx_lifecycle()
+                .iter()
+                .rev()
+                .find(|row| row.hash == hash);
             let fallback_lifecycle = lifecycle
                 .is_none()
                 .then(|| current_lifecycle(&storage.list_events(), hash));
@@ -997,7 +990,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
-        .route("/dashboard/stream-v2", get(stream_v2))
+        .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -1856,6 +1849,7 @@ fn sim_id_for_result(result: &RelayDryRunResult) -> String {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct StreamQuery {
     after: Option<u64>,
     limit: Option<usize>,
@@ -1864,6 +1858,7 @@ struct StreamQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[allow(dead_code)]
 struct StreamV2ClientMessage {
     op: String,
     amount: Option<u32>,
@@ -1872,6 +1867,78 @@ struct StreamV2ClientMessage {
     last_seq: Option<u64>,
 }
 
+const DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY: usize = 256;
+const DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY: usize = 256;
+const DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT: usize = 20;
+const DASHBOARD_STREAM_BROADCAST_INTERVAL_MS: u64 = 1_000;
+
+fn dashboard_stream_broadcaster_registry()
+-> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dashboard_stream_provider_key(provider: &Arc<dyn VizDataProvider>) -> usize {
+    Arc::as_ptr(provider) as *const () as usize
+}
+
+fn resolve_dashboard_stream_broadcaster(
+    provider: Arc<dyn VizDataProvider>,
+) -> Arc<DashboardStreamBroadcaster> {
+    let key = dashboard_stream_provider_key(&provider);
+    let registry = dashboard_stream_broadcaster_registry();
+    if let Ok(guard) = registry.lock()
+        && let Some(existing) = guard.get(&key)
+    {
+        return existing.clone();
+    }
+
+    let broadcaster = Arc::new(DashboardStreamBroadcaster::new(
+        DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY,
+        DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY,
+    ));
+    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
+
+    if let Ok(mut guard) = registry.lock() {
+        guard.entry(key).or_insert_with(|| broadcaster.clone());
+        if let Some(existing) = guard.get(&key) {
+            return existing.clone();
+        }
+    }
+    broadcaster
+}
+
+fn spawn_dashboard_stream_broadcaster_producer(
+    provider: Arc<dyn VizDataProvider>,
+    broadcaster: Arc<DashboardStreamBroadcaster>,
+) {
+    tokio::spawn(async move {
+        let mut after_seq_id = 0_u64;
+        let mut ticker = tokio::time::interval(Duration::from_millis(
+            DASHBOARD_STREAM_BROADCAST_INTERVAL_MS,
+        ));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            if let Some(dispatch) = build_dashboard_events_v1_dispatch(
+                provider.as_ref(),
+                after_seq_id,
+                DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT,
+            ) {
+                after_seq_id = dispatch.seq;
+                broadcaster.publish_delta(dispatch);
+                continue;
+            }
+
+            let latest_seq_id = provider.latest_seq_id().unwrap_or(after_seq_id);
+            after_seq_id = after_seq_id.max(latest_seq_id);
+        }
+    });
+}
+
+#[allow(dead_code)]
 async fn stream_v2(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
@@ -1902,6 +1969,159 @@ async fn stream_v2(
     })
 }
 
+async fn events_v1(
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let after_seq_id = resolve_dashboard_events_v1_after(
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok()),
+        query.after,
+    );
+    let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
+    let broadcaster = resolve_dashboard_stream_broadcaster(state.provider.clone());
+    let (initial_events, receiver) = broadcaster.subscribe_from(after_seq_id);
+
+    struct EventsV1LoopState {
+        broadcaster: Arc<DashboardStreamBroadcaster>,
+        receiver: tokio::sync::broadcast::Receiver<DashboardStreamBroadcastEvent>,
+        pending: VecDeque<DashboardStreamBroadcastEvent>,
+        heartbeat_interval: Duration,
+    }
+
+    let stream = stream::unfold(
+        EventsV1LoopState {
+            broadcaster,
+            receiver,
+            pending: VecDeque::from(initial_events),
+            heartbeat_interval: Duration::from_millis(interval_ms),
+        },
+        |mut loop_state| async move {
+            if let Some(event) = loop_state.pending.pop_front() {
+                let frame = build_dashboard_events_v1_frame(&event);
+                return Some((
+                    Ok::<SseEvent, Infallible>(dashboard_events_v1_frame_to_event(frame)),
+                    loop_state,
+                ));
+            }
+
+            let next =
+                tokio::time::timeout(loop_state.heartbeat_interval, loop_state.receiver.recv())
+                    .await;
+            let sse_event = match next {
+                Ok(Ok(event)) => {
+                    let frame = build_dashboard_events_v1_frame(&event);
+                    dashboard_events_v1_frame_to_event(frame)
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_skipped))) => {
+                    let latest_seq_id = loop_state.broadcaster.latest_seq_id();
+                    let frame = build_dashboard_events_v1_reset_frame(latest_seq_id, "lag");
+                    dashboard_events_v1_frame_to_event(frame)
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {
+                    dashboard_events_v1_keepalive_event(loop_state.broadcaster.latest_seq_id())
+                }
+            };
+            Some((Ok::<SseEvent, Infallible>(sse_event), loop_state))
+        },
+    );
+    let sse = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+    let mut response = sse.into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+fn resolve_dashboard_events_v1_after(last_event_id: Option<&str>, query_after: Option<u64>) -> u64 {
+    last_event_id
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(query_after)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DashboardEventsV1Frame {
+    id: String,
+    event: String,
+    data: String,
+}
+
+fn build_dashboard_events_v1_delta_frame(
+    dispatch: &StreamV2Dispatch,
+) -> Option<DashboardEventsV1Frame> {
+    if dispatch.has_gap {
+        let latest_seq_id = dispatch.seq.max(dispatch.watermark.latest_ingest_seq);
+        return Some(build_dashboard_events_v1_reset_frame(latest_seq_id, "gap"));
+    }
+
+    Some(DashboardEventsV1Frame {
+        id: dispatch.seq.to_string(),
+        event: "delta".to_owned(),
+        data: serde_json::to_string(dispatch).ok()?,
+    })
+}
+
+fn build_dashboard_events_v1_reset_frame(
+    latest_seq_id: u64,
+    reason: &str,
+) -> DashboardEventsV1Frame {
+    DashboardEventsV1Frame {
+        id: latest_seq_id.to_string(),
+        event: "reset".to_owned(),
+        data: serde_json::json!({
+            "reason": reason,
+            "latestSeqId": latest_seq_id,
+        })
+        .to_string(),
+    }
+}
+
+fn build_dashboard_events_v1_keepalive_frame(latest_seq_id: u64) -> DashboardEventsV1Frame {
+    DashboardEventsV1Frame {
+        id: latest_seq_id.to_string(),
+        event: "keepalive".to_owned(),
+        data: serde_json::json!({
+            "op": "HEARTBEAT",
+            "latestSeqId": latest_seq_id,
+        })
+        .to_string(),
+    }
+}
+
+fn dashboard_events_v1_keepalive_event(latest_seq_id: u64) -> SseEvent {
+    dashboard_events_v1_frame_to_event(build_dashboard_events_v1_keepalive_frame(latest_seq_id))
+}
+
+fn build_dashboard_events_v1_frame(
+    event: &DashboardStreamBroadcastEvent,
+) -> DashboardEventsV1Frame {
+    match event {
+        DashboardStreamBroadcastEvent::Delta(dispatch) => {
+            build_dashboard_events_v1_delta_frame(dispatch)
+                .unwrap_or_else(|| build_dashboard_events_v1_keepalive_frame(event.seq_id()))
+        }
+        DashboardStreamBroadcastEvent::Reset {
+            reason,
+            latest_seq_id,
+        } => build_dashboard_events_v1_reset_frame(*latest_seq_id, reason),
+    }
+}
+
+fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent {
+    SseEvent::default()
+        .id(frame.id)
+        .event(frame.event)
+        .data(frame.data)
+}
+
+#[allow(dead_code)]
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2030,6 +2250,78 @@ fn push_stream_opportunity_with_cap(
     dropped
 }
 
+fn build_dashboard_events_v1_dispatch(
+    provider: &dyn VizDataProvider,
+    after_seq_id: u64,
+    page_limit: usize,
+) -> Option<StreamV2Dispatch> {
+    let max_scan_events_per_tick = page_limit.saturating_mul(64).max(64);
+    let events = provider.events(after_seq_id, &[], max_scan_events_per_tick);
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut seq_start = 0_u64;
+    let mut seq_end = after_seq_id;
+    let mut has_gap = false;
+    let mut transactions = Vec::new();
+    let mut feature_upsert = Vec::new();
+    let mut opportunity_upsert = Vec::new();
+
+    for event in events {
+        if event.seq_id <= after_seq_id {
+            continue;
+        }
+        if seq_start == 0 {
+            seq_start = event.seq_id;
+            if after_seq_id > 0 && seq_start > after_seq_id.saturating_add(1) {
+                has_gap = true;
+            }
+        }
+        seq_end = event.seq_id;
+        if let Some(summary) = transaction_summary_from_event(&event) {
+            let hash = summary.hash.clone();
+            let dropped = push_stream_summary_with_cap(&mut transactions, summary, page_limit);
+            has_gap = has_gap || dropped;
+            if let Some(feature) = feature_detail_for_hash(provider, &hash) {
+                let dropped =
+                    push_stream_feature_with_cap(&mut feature_upsert, feature, page_limit);
+                has_gap = has_gap || dropped;
+            }
+        }
+        if let Some(opportunity) = opportunity_detail_from_event(provider, &event) {
+            let dropped =
+                push_stream_opportunity_with_cap(&mut opportunity_upsert, opportunity, page_limit);
+            has_gap = has_gap || dropped;
+        }
+    }
+
+    if seq_start == 0
+        || (transactions.is_empty() && feature_upsert.is_empty() && opportunity_upsert.is_empty())
+    {
+        return None;
+    }
+
+    Some(StreamV2Dispatch {
+        op: "DISPATCH".to_owned(),
+        event_type: "DELTA_BATCH".to_owned(),
+        seq: seq_end,
+        channel: "tx.main".to_owned(),
+        has_gap,
+        patch: StreamV2Patch {
+            upsert: transactions,
+            remove: Vec::new(),
+            feature_upsert,
+            opportunity_upsert,
+        },
+        watermark: StreamV2Watermark {
+            latest_ingest_seq: seq_end,
+        },
+        market_stats: provider.market_stats(),
+    })
+}
+
+#[allow(dead_code)]
 fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
     if let Some(amount) = message.amount {
         return amount.clamp(1, 256);
@@ -2042,6 +2334,7 @@ fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
     1
 }
 
+#[allow(dead_code)]
 async fn handle_socket_v2(
     mut socket: WebSocket,
     hello: StreamV2Hello,
@@ -2876,7 +3169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_stream_v2_route_is_registered() {
+    async fn dashboard_stream_v2_route_is_not_registered() {
         let app = build_router(test_state(100));
 
         let response = app
@@ -2889,7 +3182,61 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_events_v1_route_is_registered() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/events-v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_events_v1_route_sets_sse_contract_headers() {
+        let app = build_router(test_state(100));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard/events-v1?after=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/event-stream"));
+
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(cache_control.contains("no-cache"));
+
+        let buffering = response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(buffering, "no");
     }
 
     #[tokio::test]
@@ -3595,5 +3942,137 @@ mod tests {
             serialized["patch"]["opportunity_upsert"][0]["strategy"],
             serde_json::json!("SandwichCandidate")
         );
+    }
+
+    #[test]
+    fn dashboard_events_v1_delta_frame_uses_seq_id_and_dispatch_schema() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 84,
+            channel: "tx.main".to_owned(),
+            has_gap: false,
+            patch: StreamV2Patch {
+                upsert: vec![TransactionSummary {
+                    hash: "0xabc".to_owned(),
+                    sender: "0xdef".to_owned(),
+                    nonce: 1,
+                    tx_type: 2,
+                    seen_unix_ms: 1_700_000_000_000,
+                    source_id: "mock".to_owned(),
+                }],
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 84,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        assert_eq!(frame.id, "84");
+        assert_eq!(frame.event, "delta");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["op"], serde_json::json!("DISPATCH"));
+        assert_eq!(payload["type"], serde_json::json!("DELTA_BATCH"));
+        assert_eq!(payload["seq"], serde_json::json!(84));
+        assert_eq!(
+            payload["watermark"]["latest_ingest_seq"],
+            serde_json::json!(84)
+        );
+        assert!(payload["patch"]["upsert"].is_array());
+        assert!(payload["patch"]["remove"].is_array());
+        assert!(payload["patch"]["feature_upsert"].is_array());
+        assert!(payload["patch"]["opportunity_upsert"].is_array());
+    }
+
+    #[test]
+    fn dashboard_events_v1_resume_after_prefers_last_event_id_header() {
+        assert_eq!(resolve_dashboard_events_v1_after(Some("42"), Some(9)), 42);
+    }
+
+    #[test]
+    fn dashboard_events_v1_resume_after_uses_query_after_when_header_missing() {
+        assert_eq!(resolve_dashboard_events_v1_after(None, Some(9)), 9);
+        assert_eq!(
+            resolve_dashboard_events_v1_after(Some("invalid"), Some(9)),
+            9
+        );
+    }
+
+    #[test]
+    fn dashboard_events_v1_reset_emits_reset_event_when_gap_detected() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 99,
+            channel: "tx.main".to_owned(),
+            has_gap: true,
+            patch: StreamV2Patch {
+                upsert: Vec::new(),
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 99,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        assert_eq!(frame.id, "99");
+        assert_eq!(frame.event, "reset");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["reason"], serde_json::json!("gap"));
+        assert_eq!(payload["latestSeqId"], serde_json::json!(99));
+    }
+
+    #[test]
+    fn dashboard_events_v1_reset_uses_latest_seq_id_in_payload() {
+        let dispatch = StreamV2Dispatch {
+            op: "DISPATCH".to_owned(),
+            event_type: "DELTA_BATCH".to_owned(),
+            seq: 321,
+            channel: "tx.main".to_owned(),
+            has_gap: true,
+            patch: StreamV2Patch {
+                upsert: Vec::new(),
+                remove: Vec::new(),
+                feature_upsert: Vec::new(),
+                opportunity_upsert: Vec::new(),
+            },
+            watermark: StreamV2Watermark {
+                latest_ingest_seq: 321,
+            },
+            market_stats: MarketStats {
+                total_signal_volume: 100,
+                total_tx_count: 100,
+                low_risk_count: 90,
+                medium_risk_count: 8,
+                high_risk_count: 2,
+                success_rate_bps: 9_800,
+            },
+        };
+
+        let frame = build_dashboard_events_v1_delta_frame(&dispatch).expect("frame");
+        let payload: serde_json::Value = serde_json::from_str(&frame.data).expect("json payload");
+        assert_eq!(payload["latestSeqId"], serde_json::json!(321));
     }
 }

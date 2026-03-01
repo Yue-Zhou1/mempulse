@@ -115,3 +115,85 @@ if (!globalObject.Worker) {
 
   globalObject.Worker = MockWorker;
 }
+
+if (!globalObject.EventSource) {
+  class MockEventSource {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = String(url ?? '');
+      this.options = options;
+      this.onopen = null;
+      this.onerror = null;
+      this.readyState = 0;
+      this.closed = false;
+      this.#listeners = new Map();
+      MockEventSource.instances.push(this);
+    }
+
+    #listeners;
+
+    addEventListener(type, callback) {
+      if (!this.#listeners.has(type)) {
+        this.#listeners.set(type, new Set());
+      }
+      this.#listeners.get(type).add(callback);
+    }
+
+    removeEventListener(type, callback) {
+      const listeners = this.#listeners.get(type);
+      if (!listeners) {
+        return;
+      }
+      listeners.delete(callback);
+    }
+
+    close() {
+      this.closed = true;
+      this.readyState = 2;
+    }
+
+    emitOpen() {
+      if (this.closed) {
+        return;
+      }
+      this.readyState = 1;
+      const event = { type: 'open', target: this };
+      if (typeof this.onopen === 'function') {
+        this.onopen(event);
+      }
+      this.#emitToListeners('open', event);
+    }
+
+    emitEvent(type, data) {
+      if (this.closed) {
+        return;
+      }
+      const event = { type, data, target: this };
+      this.#emitToListeners(type, event);
+    }
+
+    emitError(errorLike = {}) {
+      const event = {
+        ...(typeof errorLike === 'object' && errorLike ? errorLike : { message: String(errorLike ?? '') }),
+        target: this,
+      };
+      if (typeof this.onerror === 'function') {
+        this.onerror(event);
+      }
+      this.#emitToListeners('error', event);
+    }
+
+    #emitToListeners(type, event) {
+      const listeners = this.#listeners.get(type);
+      if (!listeners) {
+        return;
+      }
+      for (const callback of listeners) {
+        callback(event);
+      }
+    }
+  }
+
+  globalObject.EventSource = MockEventSource;
+}

@@ -22,6 +22,24 @@ test('resolveUiRuntimeConfig returns defaults when env is empty', () => {
   assert.equal(config.heapEmergencyPurgeMb, 400);
   assert.equal(config.devPerformanceEntryCleanupEnabled, true);
   assert.equal(config.devPerformanceEntryCleanupIntervalMs, 15000);
+  assert.equal(config.streamTransport, 'sse');
+});
+
+test('resolveUiRuntimeConfig defaults streamTransport to sse', () => {
+  const config = resolveUiRuntimeConfig({ env: {} });
+  assert.equal(config.streamTransport, 'sse');
+});
+
+test('resolveUiRuntimeConfig accepts sse override and coerces ws to sse', () => {
+  const sse = resolveUiRuntimeConfig({
+    env: { VITE_UI_STREAM_TRANSPORT: 'sse' },
+  });
+  const ws = resolveUiRuntimeConfig({
+    env: { VITE_UI_STREAM_TRANSPORT: 'ws' },
+  });
+
+  assert.equal(sse.streamTransport, 'sse');
+  assert.equal(ws.streamTransport, 'sse');
 });
 
 test('resolveUiRuntimeConfig accepts valid env overrides', () => {

@@ -6,6 +6,7 @@ window.__MEMPULSE_UI_CONFIG__ = {
   // opportunityHistoryLimit: 1500,
   // txRenderLimit: 80,
   // streamBatchMs: 1000,
+  // streamTransport: 'sse', // only supported transport
   // workerEnabled: true,
   // virtualizedTickerEnabled: true,
   // samplingLagThresholdMs: 30,
