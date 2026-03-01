@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod live_rpc;
+pub mod stream_broadcast;
 
 use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -24,11 +25,12 @@ use replay::{
     replay_from_checkpoint,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
     NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
@@ -1876,6 +1878,76 @@ struct StreamV2ClientMessage {
     last_seq: Option<u64>,
 }
 
+const DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY: usize = 256;
+const DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY: usize = 256;
+const DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT: usize = 20;
+const DASHBOARD_STREAM_BROADCAST_INTERVAL_MS: u64 = 1_000;
+
+fn dashboard_stream_broadcaster_registry(
+) -> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dashboard_stream_provider_key(provider: &Arc<dyn VizDataProvider>) -> usize {
+    Arc::as_ptr(provider) as *const () as usize
+}
+
+fn resolve_dashboard_stream_broadcaster(
+    provider: Arc<dyn VizDataProvider>,
+) -> Arc<DashboardStreamBroadcaster> {
+    let key = dashboard_stream_provider_key(&provider);
+    let registry = dashboard_stream_broadcaster_registry();
+    if let Ok(guard) = registry.lock()
+        && let Some(existing) = guard.get(&key)
+    {
+        return existing.clone();
+    }
+
+    let broadcaster = Arc::new(DashboardStreamBroadcaster::new(
+        DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY,
+        DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY,
+    ));
+    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
+
+    if let Ok(mut guard) = registry.lock() {
+        guard.entry(key).or_insert_with(|| broadcaster.clone());
+        if let Some(existing) = guard.get(&key) {
+            return existing.clone();
+        }
+    }
+    broadcaster
+}
+
+fn spawn_dashboard_stream_broadcaster_producer(
+    provider: Arc<dyn VizDataProvider>,
+    broadcaster: Arc<DashboardStreamBroadcaster>,
+) {
+    tokio::spawn(async move {
+        let mut after_seq_id = 0_u64;
+        let mut ticker =
+            tokio::time::interval(Duration::from_millis(DASHBOARD_STREAM_BROADCAST_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            if let Some(dispatch) = build_dashboard_events_v1_dispatch(
+                provider.as_ref(),
+                after_seq_id,
+                DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT,
+            ) {
+                after_seq_id = dispatch.seq;
+                broadcaster.publish_delta(dispatch);
+                continue;
+            }
+
+            let latest_seq_id = provider.latest_seq_id().unwrap_or(after_seq_id);
+            after_seq_id = after_seq_id.max(latest_seq_id);
+        }
+    });
+}
+
 async fn stream_v2(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
@@ -1917,61 +1989,47 @@ async fn events_v1(
             .and_then(|value| value.to_str().ok()),
         query.after,
     );
-    let page_limit = query.limit.unwrap_or(20).clamp(1, 200);
     let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
+    let broadcaster = resolve_dashboard_stream_broadcaster(state.provider.clone());
+    let (initial_events, receiver) = broadcaster.subscribe_from(after_seq_id);
 
-    #[derive(Clone)]
     struct EventsV1LoopState {
-        provider: Arc<dyn VizDataProvider>,
-        after_seq_id: u64,
-        page_limit: usize,
-        interval: Duration,
-        first_poll: bool,
+        broadcaster: Arc<DashboardStreamBroadcaster>,
+        receiver: tokio::sync::broadcast::Receiver<DashboardStreamBroadcastEvent>,
+        pending: VecDeque<DashboardStreamBroadcastEvent>,
+        heartbeat_interval: Duration,
     }
 
     let stream = stream::unfold(
         EventsV1LoopState {
-            provider: state.provider.clone(),
-            after_seq_id,
-            page_limit,
-            interval: Duration::from_millis(interval_ms),
-            first_poll: true,
+            broadcaster,
+            receiver,
+            pending: VecDeque::from(initial_events),
+            heartbeat_interval: Duration::from_millis(interval_ms),
         },
         |mut loop_state| async move {
-            if loop_state.first_poll {
-                loop_state.first_poll = false;
-            } else {
-                tokio::time::sleep(loop_state.interval).await;
+            if let Some(event) = loop_state.pending.pop_front() {
+                let frame = build_dashboard_events_v1_frame(&event);
+                return Some((Ok(dashboard_events_v1_frame_to_event(frame)), loop_state));
             }
 
-            if let Some(dispatch) = build_dashboard_events_v1_dispatch(
-                loop_state.provider.as_ref(),
-                loop_state.after_seq_id,
-                loop_state.page_limit,
-            ) {
-                loop_state.after_seq_id = dispatch.seq;
-                if let Some(frame) = build_dashboard_events_v1_delta_frame(&dispatch) {
-                    let event = dashboard_events_v1_frame_to_event(frame);
-                    return Some((Ok(event), loop_state));
+            let next = tokio::time::timeout(loop_state.heartbeat_interval, loop_state.receiver.recv())
+                .await;
+            let sse_event = match next {
+                Ok(Ok(event)) => {
+                    let frame = build_dashboard_events_v1_frame(&event);
+                    dashboard_events_v1_frame_to_event(frame)
                 }
-            }
-
-            let latest_seq_id = loop_state
-                .provider
-                .latest_seq_id()
-                .unwrap_or(loop_state.after_seq_id);
-            loop_state.after_seq_id = loop_state.after_seq_id.max(latest_seq_id);
-            let keepalive = SseEvent::default()
-                .id(loop_state.after_seq_id.to_string())
-                .event("keepalive")
-                .data(
-                    serde_json::json!({
-                        "op": "HEARTBEAT",
-                        "latestSeqId": loop_state.after_seq_id,
-                    })
-                    .to_string(),
-                );
-            Some((Ok(keepalive), loop_state))
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_skipped))) => {
+                    let latest_seq_id = loop_state.broadcaster.latest_seq_id();
+                    let frame = build_dashboard_events_v1_reset_frame(latest_seq_id, "lag");
+                    dashboard_events_v1_frame_to_event(frame)
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {
+                    dashboard_events_v1_keepalive_event(loop_state.broadcaster.latest_seq_id())
+                }
+            };
+            Some((Ok(sse_event), loop_state))
         },
     );
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1994,15 +2052,7 @@ struct DashboardEventsV1Frame {
 fn build_dashboard_events_v1_delta_frame(dispatch: &StreamV2Dispatch) -> Option<DashboardEventsV1Frame> {
     if dispatch.has_gap {
         let latest_seq_id = dispatch.seq.max(dispatch.watermark.latest_ingest_seq);
-        return Some(DashboardEventsV1Frame {
-            id: latest_seq_id.to_string(),
-            event: "reset".to_owned(),
-            data: serde_json::json!({
-                "reason": "gap",
-                "latestSeqId": latest_seq_id,
-            })
-            .to_string(),
-        });
+        return Some(build_dashboard_events_v1_reset_frame(latest_seq_id, "gap"));
     }
 
     Some(DashboardEventsV1Frame {
@@ -2010,6 +2060,48 @@ fn build_dashboard_events_v1_delta_frame(dispatch: &StreamV2Dispatch) -> Option<
         event: "delta".to_owned(),
         data: serde_json::to_string(dispatch).ok()?,
     })
+}
+
+fn build_dashboard_events_v1_reset_frame(
+    latest_seq_id: u64,
+    reason: &str,
+) -> DashboardEventsV1Frame {
+    DashboardEventsV1Frame {
+        id: latest_seq_id.to_string(),
+        event: "reset".to_owned(),
+        data: serde_json::json!({
+            "reason": reason,
+            "latestSeqId": latest_seq_id,
+        })
+        .to_string(),
+    }
+}
+
+fn build_dashboard_events_v1_keepalive_frame(latest_seq_id: u64) -> DashboardEventsV1Frame {
+    DashboardEventsV1Frame {
+        id: latest_seq_id.to_string(),
+        event: "keepalive".to_owned(),
+        data: serde_json::json!({
+            "op": "HEARTBEAT",
+            "latestSeqId": latest_seq_id,
+        })
+        .to_string(),
+    }
+}
+
+fn dashboard_events_v1_keepalive_event(latest_seq_id: u64) -> SseEvent {
+    dashboard_events_v1_frame_to_event(build_dashboard_events_v1_keepalive_frame(latest_seq_id))
+}
+
+fn build_dashboard_events_v1_frame(event: &DashboardStreamBroadcastEvent) -> DashboardEventsV1Frame {
+    match event {
+        DashboardStreamBroadcastEvent::Delta(dispatch) => build_dashboard_events_v1_delta_frame(dispatch)
+            .unwrap_or_else(|| build_dashboard_events_v1_keepalive_frame(event.seq_id())),
+        DashboardStreamBroadcastEvent::Reset {
+            reason,
+            latest_seq_id,
+        } => build_dashboard_events_v1_reset_frame(*latest_seq_id, reason),
+    }
 }
 
 fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent {
