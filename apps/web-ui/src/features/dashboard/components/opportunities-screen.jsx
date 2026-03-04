@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MAINNET_FILTER_OPTIONS } from '../domain/mainnet-filter.js';
 import {
   formatRelativeTime,
@@ -14,7 +14,14 @@ import { cn } from '../../../shared/lib/utils.js';
 const OPPORTUNITY_ROW_HEIGHT_PX = 96;
 const OPPORTUNITY_OVERSCAN_ROWS = 4;
 
-export function OpportunitiesScreen({ model, actions }) {
+function resolvePerfNow() {
+  if (typeof globalThis?.performance?.now === 'function') {
+    return globalThis.performance.now();
+  }
+  return Date.now();
+}
+
+function OpportunitiesScreenImpl({ model, actions }) {
   const {
     liveMainnetFilter,
     filteredOpportunityRows,
@@ -29,12 +36,56 @@ export function OpportunitiesScreen({ model, actions }) {
   } = actions;
 
   const listViewportRef = useRef(null);
+  const scrollFrameRef = useRef(null);
+  const pendingScrollTopRef = useRef(0);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(480);
 
   const onListScroll = useCallback((event) => {
+    const handlerStartedAtMs = resolvePerfNow();
     const nextScrollTop = Number(event.currentTarget?.scrollTop ?? 0);
-    setScrollTop((current) => (current === nextScrollTop ? current : nextScrollTop));
+    pendingScrollTopRef.current = nextScrollTop;
+    const perfApi = globalThis?.window?.__MEMPULSE_PERF__;
+    const recordScrollHandler = (durationMs) => {
+      if (typeof perfApi?.recordScrollHandler === 'function') {
+        perfApi.recordScrollHandler(durationMs);
+      }
+    };
+    const recordScrollCommitLatency = (durationMs) => {
+      if (typeof perfApi?.recordScrollCommitLatency === 'function') {
+        perfApi.recordScrollCommitLatency(durationMs);
+      }
+    };
+
+    if (scrollFrameRef.current != null) {
+      recordScrollHandler(resolvePerfNow() - handlerStartedAtMs);
+      return;
+    }
+    if (typeof window?.requestAnimationFrame !== 'function') {
+      setScrollTop((current) => (current === nextScrollTop ? current : nextScrollTop));
+      recordScrollCommitLatency(0);
+      recordScrollHandler(resolvePerfNow() - handlerStartedAtMs);
+      return;
+    }
+
+    const queuedAtMs = resolvePerfNow();
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const sampledScrollTop = pendingScrollTopRef.current;
+      setScrollTop((current) => (current === sampledScrollTop ? current : sampledScrollTop));
+      recordScrollCommitLatency(resolvePerfNow() - queuedAtMs);
+    });
+    recordScrollHandler(resolvePerfNow() - handlerStartedAtMs);
+  }, []);
+
+  useEffect(() => () => {
+    if (
+      scrollFrameRef.current != null
+      && typeof window?.cancelAnimationFrame === 'function'
+    ) {
+      window.cancelAnimationFrame(scrollFrameRef.current);
+    }
+    scrollFrameRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -118,13 +169,15 @@ export function OpportunitiesScreen({ model, actions }) {
                         data-opportunity-key={rowKey}
                         className="absolute left-0 right-0 list-none pb-2"
                         style={{
-                          top: `${rowTop}px`,
+                          top: '0px',
+                          transform: `translateY(${rowTop}px)`,
                           height: `${OPPORTUNITY_ROW_HEIGHT_PX}px`,
                         }}
                       >
-                        <div
+                        <button
+                          type="button"
                           className={cn(
-                            'h-full w-full cursor-pointer border p-3 text-left transition-colors',
+                            'news-row-button h-full w-full border p-3 text-left transition-colors',
                             tone.container,
                           )}
                         >
@@ -140,7 +193,7 @@ export function OpportunitiesScreen({ model, actions }) {
                           <div className={cn('news-mono mt-1 text-[11px] uppercase tracking-[0.1em]', tone.subtle)}>
                             tx {shortHex(opportunity.tx_hash, 14, 10)} · {formatRelativeTime(opportunity.detected_unix_ms)}
                           </div>
-                        </div>
+                        </button>
                       </li>
                     );
                   })}
@@ -221,3 +274,16 @@ export function OpportunitiesScreen({ model, actions }) {
           </div>
   );
 }
+
+export const OpportunitiesScreen = memo(
+  OpportunitiesScreenImpl,
+  (left, right) => (
+    left.model.liveMainnetFilter === right.model.liveMainnetFilter
+    && left.model.filteredOpportunityRows === right.model.filteredOpportunityRows
+    && left.model.selectedOpportunityKey === right.model.selectedOpportunityKey
+    && left.model.selectedOpportunity === right.model.selectedOpportunity
+    && left.model.selectedOpportunityMainnet === right.model.selectedOpportunityMainnet
+    && left.actions.onLiveMainnetFilterChange === right.actions.onLiveMainnetFilterChange
+    && left.actions.onOpportunityListClick === right.actions.onOpportunityListClick
+  ),
+);

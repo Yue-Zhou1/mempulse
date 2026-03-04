@@ -7,6 +7,7 @@ import {
 } from '../domain/snapshot-profile.js';
 import { resolveDashboardRuntimePolicy } from '../domain/screen-runtime-policy.js';
 import {
+  appendBoundedRows,
   fetchJson,
   isAbortError,
   normalizeChainStatusRows,
@@ -14,6 +15,7 @@ import {
 } from '../lib/dashboard-helpers.js';
 import {
   clearTransactionDetailCache,
+  getTransactionDetailCacheSize,
   setTransactionDetailByHash,
 } from '../domain/dashboard-stream-store.js';
 import { createDashboardPerfMonitor } from '../lib/perf-metrics.js';
@@ -42,6 +44,35 @@ function resolveUsedHeapSize() {
     return null;
   }
   return heapBytes;
+}
+
+async function resolveTotalPageMemorySize() {
+  const performanceApi = globalThis?.performance;
+  if (
+    !performanceApi
+    || typeof performanceApi.measureUserAgentSpecificMemory !== 'function'
+  ) {
+    return null;
+  }
+  try {
+    const measurement = await performanceApi.measureUserAgentSpecificMemory();
+    const bytes = Number(measurement?.bytes);
+    return Number.isFinite(bytes) ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveDomNodeCount() {
+  const doc = globalThis?.document;
+  if (!doc || typeof doc.getElementsByTagName !== 'function') {
+    return null;
+  }
+  try {
+    return doc.getElementsByTagName('*').length;
+  } catch {
+    return null;
+  }
 }
 
 function rowsReferenceEqual(left, right) {
@@ -436,6 +467,19 @@ export function useDashboardLifecycleEffects({
     let pendingDeltaLatestSeqId = null;
     let lastStatusMessage = '';
     let lastStatusMessageUpdatedAt = 0;
+    let totalMemoryBytesEstimate = null;
+    let totalMemorySampleInFlight = false;
+    let nextTotalMemorySampleAtUnixMs = 0;
+    let lastMemoryLogAtUnixMs = 0;
+    const pendingDeltaTransactionCap = Number.isFinite(maxTransactionHistory)
+      ? Math.max(0, Math.floor(maxTransactionHistory))
+      : Number.POSITIVE_INFINITY;
+    const pendingDeltaFeatureCap = Number.isFinite(maxFeatureHistory)
+      ? Math.max(0, Math.floor(maxFeatureHistory))
+      : Number.POSITIVE_INFINITY;
+    const pendingDeltaOpportunityCap = Number.isFinite(maxOpportunityHistory)
+      ? Math.max(0, Math.floor(maxOpportunityHistory))
+      : Number.POSITIVE_INFINITY;
 
     const publishStatusMessage = (nextMessage, options = {}) => {
       const update = resolveDashboardStatusMessageUpdate({
@@ -538,13 +582,8 @@ export function useDashboardLifecycleEffects({
       }
     };
 
-    const appendPendingRows = (targetRows, incomingRows) => {
-      if (!Array.isArray(incomingRows) || incomingRows.length === 0) {
-        return;
-      }
-      for (const row of incomingRows) {
-        targetRows.push(row);
-      }
+    const appendPendingRows = (targetRows, incomingRows, maxItems) => {
+      appendBoundedRows(targetRows, incomingRows, maxItems);
     };
 
     const cancelPendingDeltaFlush = () => {
@@ -649,6 +688,7 @@ export function useDashboardLifecycleEffects({
     };
 
     const captureHeapSample = () => {
+      const nowUnixMs = Date.now();
       const heapBytes = resolveUsedHeapSize();
       if (heapBytes != null) {
         perfMonitor.recordHeapSample(heapBytes);
@@ -656,6 +696,73 @@ export function useDashboardLifecycleEffects({
           scheduleSnapshot('heap-emergency-purge', true);
         }
       }
+
+      const toMb = (bytes) => (
+        Number.isFinite(bytes)
+          ? Math.round((bytes / (1024 * 1024)) * 10) / 10
+          : null
+      );
+      const recordMemoryDiagnostics = (sampledHeapBytes, sampledAtUnixMs) => {
+        perfMonitor.recordMemorySample({
+          totalMemoryBytes: totalMemoryBytesEstimate,
+          domNodeCount: import.meta.env.DEV ? resolveDomNodeCount() : null,
+          transactionRows: transactionRowsRef.current.length,
+          recentRows: recentTxRowsRef.current.length,
+          pendingTransactions: pendingDeltaTransactions.length,
+          pendingFeatures: pendingDeltaFeatureRows.length,
+          pendingOpportunities: pendingDeltaOpportunityRows.length,
+          detailCacheSize: getTransactionDetailCacheSize(),
+        });
+        if (!import.meta.env.DEV) {
+          return;
+        }
+        if (sampledAtUnixMs - lastMemoryLogAtUnixMs < 15000) {
+          return;
+        }
+        const memory = perfMonitor.snapshot().memory;
+        const level = memory?.analysis?.level ?? 'normal';
+        const reasons = Array.isArray(memory?.analysis?.reasons)
+          ? memory.analysis.reasons
+          : [];
+        const pendingTotal = Number(memory?.analysis?.pendingTotal ?? 0);
+        console.info('[mempulse][memory]', {
+          level,
+          summary: memory?.analysis?.summary ?? '',
+          reasons,
+          jsHeapMb: toMb(sampledHeapBytes),
+          pageMemoryMb: toMb(memory?.page?.latestBytes),
+          pageMemoryDeltaMb: toMb(memory?.page?.deltaBytes),
+          domNodes: Number(memory?.domNodes?.latestBytes ?? 0),
+          txRows: Number(memory?.stream?.transactionRows ?? 0),
+          recentRows: Number(memory?.stream?.recentRows ?? 0),
+          pendingTotal,
+          detailCacheSize: Number(memory?.stream?.detailCacheSize ?? 0),
+        });
+        lastMemoryLogAtUnixMs = sampledAtUnixMs;
+      };
+
+      recordMemoryDiagnostics(heapBytes, nowUnixMs);
+      if (!import.meta.env.DEV) {
+        return;
+      }
+      if (totalMemorySampleInFlight || nowUnixMs < nextTotalMemorySampleAtUnixMs) {
+        return;
+      }
+      totalMemorySampleInFlight = true;
+      nextTotalMemorySampleAtUnixMs = nowUnixMs + 15000;
+      resolveTotalPageMemorySize()
+        .then((measuredBytes) => {
+          if (cancelled) {
+            return;
+          }
+          if (Number.isFinite(measuredBytes)) {
+            totalMemoryBytesEstimate = measuredBytes;
+          }
+          recordMemoryDiagnostics(resolveUsedHeapSize(), Date.now());
+        })
+        .finally(() => {
+          totalMemorySampleInFlight = false;
+        });
     };
 
     const clearTransactionBuffers = () => {
@@ -846,7 +953,7 @@ export function useDashboardLifecycleEffects({
         ? snapshot.feature_details.slice(0, maxFeatureHistory)
         : [];
       const txRecent = runtimePolicy.shouldProcessTxStream && Array.isArray(snapshot?.transactions)
-        ? snapshot.transactions
+        ? snapshot.transactions.slice(0, maxTransactionHistory)
         : [];
       const chainStatus = normalizeChainStatusRows(snapshot?.chain_ingest_status);
 
@@ -866,9 +973,13 @@ export function useDashboardLifecycleEffects({
           : nextTransactions;
         transactionRowsRef.current = stabilizedTransactions;
 
+        const nextRecentTxRows = stabilizedTransactions.slice(
+          0,
+          Math.min(snapshotTxLimit, stabilizedTransactions.length),
+        );
         const stabilizedRecentTxRows = stabilizeRows(
           recentTxRowsRef.current,
-          txRecent,
+          nextRecentTxRows,
           (row) => row.hash,
           txSummaryEquivalent,
         );
@@ -1047,10 +1158,18 @@ export function useDashboardLifecycleEffects({
       }
 
       pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
-      appendPendingRows(pendingDeltaOpportunityRows, batch.opportunityRows);
+      appendPendingRows(
+        pendingDeltaOpportunityRows,
+        batch.opportunityRows,
+        pendingDeltaOpportunityCap,
+      );
       if (runtimePolicy.shouldProcessTxStream) {
-        appendPendingRows(pendingDeltaFeatureRows, batch.featureRows);
-        appendPendingRows(pendingDeltaTransactions, batch.transactions);
+        appendPendingRows(pendingDeltaFeatureRows, batch.featureRows, pendingDeltaFeatureCap);
+        appendPendingRows(
+          pendingDeltaTransactions,
+          batch.transactions,
+          pendingDeltaTransactionCap,
+        );
       }
       if (Number.isFinite(seqId)) {
         pendingDeltaLatestSeqId = Number.isFinite(pendingDeltaLatestSeqId)

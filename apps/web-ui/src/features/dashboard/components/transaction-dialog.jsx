@@ -1,4 +1,6 @@
-export function TransactionDialog({ model, actions }) {
+import { memo } from 'react';
+
+function TransactionDialogImpl({ model, actions }) {
   const {
     dialogHash,
     dialogLoading,
@@ -22,7 +24,7 @@ export function TransactionDialog({ model, actions }) {
 
   return (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4"
           onClick={closeDialog}
         >
           <div
@@ -31,7 +33,7 @@ export function TransactionDialog({ model, actions }) {
             onClick={(event) => event.stopPropagation()}
           >
             {dialogLoading ? (
-              <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#f7f1e6]/55 backdrop-blur-[2px]">
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#f7f1e6]/55">
                 <div className="news-mono border border-zinc-900 bg-[#fffdf7] px-4 py-3 text-[16px] uppercase tracking-[0.08em] text-zinc-700 shadow-sm">
                   Loading on-demand transaction detail...
                 </div>
@@ -46,7 +48,8 @@ export function TransactionDialog({ model, actions }) {
                   </div>
                   <div className="news-mono mt-1 break-all text-[18px] leading-relaxed text-zinc-900">{dialogHash}</div>
                 </div>
-                <div
+                <button
+                  type="button"
                   onClick={closeDialog}
                   aria-label="Close transaction detail"
                   className="news-icon-button"
@@ -54,7 +57,7 @@ export function TransactionDialog({ model, actions }) {
                   <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
                     <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="square" />
                   </svg>
-                </div>
+                </button>
               </div>
               <div className="news-mono mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-900 pt-2 text-[16px] uppercase tracking-[0.1em] text-zinc-700">
                 <div className="flex flex-wrap items-center gap-3">
@@ -144,3 +147,20 @@ export function TransactionDialog({ model, actions }) {
         </div>
   );
 }
+
+export const TransactionDialog = memo(
+  TransactionDialogImpl,
+  (left, right) => (
+    left.model.dialogHash === right.model.dialogHash
+    && left.model.dialogLoading === right.model.dialogLoading
+    && left.model.dialogTransaction === right.model.dialogTransaction
+    && left.model.dialogMainnet === right.model.dialogMainnet
+    && left.model.detailSeenRelative === right.model.detailSeenRelative
+    && left.model.detailSender === right.model.detailSender
+    && left.model.detailSeenAt === right.model.detailSeenAt
+    && left.model.dialogFeature === right.model.dialogFeature
+    && left.model.dialogDetail === right.model.dialogDetail
+    && left.model.dialogError === right.model.dialogError
+    && left.actions.closeDialog === right.actions.closeDialog
+  ),
+);

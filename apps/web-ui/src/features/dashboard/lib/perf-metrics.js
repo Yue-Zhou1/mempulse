@@ -1,5 +1,13 @@
 const DEFAULT_LONG_TASK_THRESHOLD_MS = 50;
+const DEFAULT_SCROLL_HANDLER_LONG_TASK_THRESHOLD_MS = 8;
 const DEFAULT_SAMPLE_LIMIT = 240;
+const MB = 1024 * 1024;
+const HIGH_PAGE_MEMORY_BYTES = 600 * MB;
+const HIGH_HEAP_MEMORY_BYTES = 320 * MB;
+const RAPID_MEMORY_DELTA_BYTES = 96 * MB;
+const STREAM_ROW_BOUNDARY = 550;
+const STREAM_BACKLOG_BOUNDARY = 128;
+const DETAIL_CACHE_LARGE_BOUNDARY = 128;
 
 function clampFiniteNumber(value) {
   const parsed = Number(value);
@@ -7,6 +15,14 @@ function clampFiniteNumber(value) {
     return null;
   }
   return parsed;
+}
+
+function resolveNonNegativeInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
 }
 
 function pushBoundedSample(samples, value, sampleLimit = DEFAULT_SAMPLE_LIMIT) {
@@ -43,6 +59,37 @@ export function aggregateLongTasks(durationsMs, thresholdMs = DEFAULT_LONG_TASK_
     totalMs: Math.round(totalMs),
     maxMs: Math.round(maxMs),
     thresholdMs: threshold,
+  };
+}
+
+function summarizeSamples(samplesMs) {
+  const normalized = [];
+  for (const sample of samplesMs ?? []) {
+    const value = clampFiniteNumber(sample);
+    if (value != null) {
+      normalized.push(value);
+    }
+  }
+  if (!normalized.length) {
+    return {
+      sampleCount: 0,
+      averageMs: 0,
+      maxMs: 0,
+      p95Ms: 0,
+    };
+  }
+  const total = normalized.reduce((sum, value) => sum + value, 0);
+  const max = Math.max(...normalized);
+  const sorted = [...normalized].sort((left, right) => left - right);
+  const p95Index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil(sorted.length * 0.95) - 1),
+  );
+  return {
+    sampleCount: normalized.length,
+    averageMs: Math.round(total / normalized.length),
+    maxMs: Math.round(max),
+    p95Ms: Math.round(sorted[p95Index]),
   };
 }
 
@@ -124,6 +171,73 @@ export function reduceHeapSamples(samplesBytes) {
   };
 }
 
+export function analyzeMemoryProfile({
+  heap = {},
+  page = {},
+  streamState = {},
+} = {}) {
+  const heapLatestBytes = resolveNonNegativeInt(heap.latestBytes, 0);
+  const heapDeltaBytes = resolveNonNegativeInt(heap.deltaBytes, 0);
+  const pageLatestBytes = resolveNonNegativeInt(page.latestBytes, 0);
+  const pageDeltaBytes = resolveNonNegativeInt(page.deltaBytes, 0);
+  const transactionRows = resolveNonNegativeInt(streamState.transactionRows, 0);
+  const pendingTransactions = resolveNonNegativeInt(streamState.pendingTransactions, 0);
+  const pendingFeatures = resolveNonNegativeInt(streamState.pendingFeatures, 0);
+  const pendingOpportunities = resolveNonNegativeInt(streamState.pendingOpportunities, 0);
+  const detailCacheSize = resolveNonNegativeInt(streamState.detailCacheSize, 0);
+  const pendingTotal = pendingTransactions + pendingFeatures + pendingOpportunities;
+
+  const reasons = [];
+  if (pageDeltaBytes >= RAPID_MEMORY_DELTA_BYTES) {
+    reasons.push('page-memory-rising-fast');
+  }
+  if (pageDeltaBytes >= RAPID_MEMORY_DELTA_BYTES && pageDeltaBytes > heapDeltaBytes * 1.5) {
+    reasons.push('non-js-memory-dominant');
+  }
+  if (
+    heapDeltaBytes >= RAPID_MEMORY_DELTA_BYTES
+    && transactionRows <= STREAM_ROW_BOUNDARY
+    && pendingTotal <= 8
+  ) {
+    reasons.push('heap-growth-with-bounded-tx');
+  }
+  if (pendingTotal >= STREAM_BACKLOG_BOUNDARY) {
+    reasons.push('stream-backlog');
+  }
+  if (detailCacheSize >= DETAIL_CACHE_LARGE_BOUNDARY) {
+    reasons.push('detail-cache-large');
+  }
+
+  let level = 'normal';
+  if (pageLatestBytes >= HIGH_PAGE_MEMORY_BYTES || heapLatestBytes >= HIGH_HEAP_MEMORY_BYTES) {
+    level = 'high';
+  } else if (pageDeltaBytes >= RAPID_MEMORY_DELTA_BYTES || heapDeltaBytes >= RAPID_MEMORY_DELTA_BYTES) {
+    level = 'watch';
+  }
+
+  let summary = 'Memory growth appears stable for current sample window.';
+  if (reasons.includes('non-js-memory-dominant')) {
+    summary = 'Page memory is growing faster than JS heap; likely DOM/compositor/GPU/process overhead.';
+  } else if (reasons.includes('stream-backlog')) {
+    summary = 'Pending stream buffers are accumulating faster than flush commits.';
+  } else if (reasons.includes('heap-growth-with-bounded-tx')) {
+    summary = 'JS heap is rising while tx rows stay bounded; inspect retained objects/caches.';
+  } else if (reasons.includes('page-memory-rising-fast')) {
+    summary = 'Page memory is rising quickly and needs continued profiling.';
+  }
+
+  return {
+    level,
+    reasons,
+    summary,
+    heapLatestBytes,
+    heapDeltaBytes,
+    pageLatestBytes,
+    pageDeltaBytes,
+    pendingTotal,
+  };
+}
+
 export function calculateDroppedFrameRatio(frameDurationsMs, frameBudgetMs = 16.67) {
   const budget = Number.isFinite(frameBudgetMs) ? frameBudgetMs : 16.67;
   let totalFrames = 0;
@@ -158,13 +272,28 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
   const frameBudgetMs = Number.isFinite(options.frameBudgetMs)
     ? options.frameBudgetMs
     : 16.67;
+  const scrollHandlerLongTaskThresholdMs = Number.isFinite(options.scrollHandlerLongTaskThresholdMs)
+    ? options.scrollHandlerLongTaskThresholdMs
+    : DEFAULT_SCROLL_HANDLER_LONG_TASK_THRESHOLD_MS;
   const frameFps = createRollingFpsCalculator();
 
   const state = {
     snapshotApplyDurationsMs: [],
     transactionCommitDurationsMs: [],
+    scrollHandlerDurationsMs: [],
+    scrollCommitLatenciesMs: [],
     frameDurationsMs: [],
     heapSamplesBytes: [],
+    pageMemorySamplesBytes: [],
+    domNodeSamples: [],
+    streamState: {
+      transactionRows: 0,
+      recentRows: 0,
+      pendingTransactions: 0,
+      pendingFeatures: 0,
+      pendingOpportunities: 0,
+      detailCacheSize: 0,
+    },
     network: {
       snapshot: {
         started: 0,
@@ -225,6 +354,14 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
       pushBoundedSample(state.transactionCommitDurationsMs, durationMs, sampleLimit);
       state.updatedAtUnixMs = Date.now();
     },
+    recordScrollHandler(durationMs) {
+      pushBoundedSample(state.scrollHandlerDurationsMs, durationMs, sampleLimit);
+      state.updatedAtUnixMs = Date.now();
+    },
+    recordScrollCommitLatency(durationMs) {
+      pushBoundedSample(state.scrollCommitLatenciesMs, durationMs, sampleLimit);
+      state.updatedAtUnixMs = Date.now();
+    },
     recordFrameDuration(durationMs, timestampMs = Date.now()) {
       pushBoundedSample(state.frameDurationsMs, durationMs, sampleLimit);
       frameFps.addFrameTime(timestampMs);
@@ -232,6 +369,38 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
     },
     recordHeapSample(heapBytes) {
       pushBoundedSample(state.heapSamplesBytes, heapBytes, sampleLimit);
+      state.updatedAtUnixMs = Date.now();
+    },
+    recordMemorySample(sample) {
+      const normalized = sample && typeof sample === 'object' ? sample : {};
+      pushBoundedSample(state.pageMemorySamplesBytes, normalized.totalMemoryBytes, sampleLimit);
+      pushBoundedSample(state.domNodeSamples, normalized.domNodeCount, sampleLimit);
+      state.streamState = {
+        transactionRows: resolveNonNegativeInt(
+          normalized.transactionRows,
+          state.streamState.transactionRows,
+        ),
+        recentRows: resolveNonNegativeInt(
+          normalized.recentRows,
+          state.streamState.recentRows,
+        ),
+        pendingTransactions: resolveNonNegativeInt(
+          normalized.pendingTransactions,
+          state.streamState.pendingTransactions,
+        ),
+        pendingFeatures: resolveNonNegativeInt(
+          normalized.pendingFeatures,
+          state.streamState.pendingFeatures,
+        ),
+        pendingOpportunities: resolveNonNegativeInt(
+          normalized.pendingOpportunities,
+          state.streamState.pendingOpportunities,
+        ),
+        detailCacheSize: resolveNonNegativeInt(
+          normalized.detailCacheSize,
+          state.streamState.detailCacheSize,
+        ),
+      };
       state.updatedAtUnixMs = Date.now();
     },
     markSnapshotDeferred() {
@@ -251,21 +420,55 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
       finishNetworkRequest('detail', status);
     },
     snapshot() {
+      const heap = reduceHeapSamples(state.heapSamplesBytes);
+      const page = reduceHeapSamples(state.pageMemorySamplesBytes);
+      const domNodes = reduceHeapSamples(state.domNodeSamples);
+      const memory = {
+        heap,
+        page,
+        domNodes,
+        stream: { ...state.streamState },
+        analysis: analyzeMemoryProfile({
+          heap,
+          page,
+          streamState: state.streamState,
+        }),
+      };
       return {
         updatedAtUnixMs: state.updatedAtUnixMs,
         snapshotApply: aggregateLongTasks(
           state.snapshotApplyDurationsMs,
           longTaskThresholdMs,
         ),
-        transactionCommit: aggregateLongTasks(
-          state.transactionCommitDurationsMs,
-          longTaskThresholdMs,
-        ),
+        transactionCommit: {
+          ...aggregateLongTasks(
+            state.transactionCommitDurationsMs,
+            longTaskThresholdMs,
+          ),
+          samples: summarizeSamples(state.transactionCommitDurationsMs),
+        },
+        scroll: {
+          handler: {
+            ...aggregateLongTasks(
+              state.scrollHandlerDurationsMs,
+              scrollHandlerLongTaskThresholdMs,
+            ),
+            samples: summarizeSamples(state.scrollHandlerDurationsMs),
+          },
+          commitLatency: {
+            ...aggregateLongTasks(
+              state.scrollCommitLatenciesMs,
+              longTaskThresholdMs,
+            ),
+            samples: summarizeSamples(state.scrollCommitLatenciesMs),
+          },
+        },
         frame: {
           ...calculateDroppedFrameRatio(state.frameDurationsMs, frameBudgetMs),
           rollingFps: frameFps.snapshot().fps,
         },
-        heap: reduceHeapSamples(state.heapSamplesBytes),
+        heap,
+        memory,
         network: {
           snapshot: { ...state.network.snapshot },
           detail: { ...state.network.detail },
@@ -282,6 +485,9 @@ export function createDashboardPerfMonitor(globalWindow, options = {}) {
       finishSnapshotRequest: (status) => monitor.finishSnapshotRequest(status),
       beginDetailRequest: () => monitor.beginDetailRequest(),
       finishDetailRequest: (status) => monitor.finishDetailRequest(status),
+      recordScrollHandler: (durationMs) => monitor.recordScrollHandler(durationMs),
+      recordScrollCommitLatency: (durationMs) => monitor.recordScrollCommitLatency(durationMs),
+      recordMemorySample: (sample) => monitor.recordMemorySample(sample),
     };
   }
 

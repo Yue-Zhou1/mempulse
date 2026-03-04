@@ -48,6 +48,30 @@ export function useDashboardActions({
     [openTransactionByHash],
   );
 
+  const onTickerListKeyDown = useCallback(
+    (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') {
+        return;
+      }
+      const node = event.target;
+      const listElement = event.currentTarget;
+      if (!(node instanceof Element) || !(listElement instanceof Element)) {
+        return;
+      }
+      const rowElement = node.closest('[data-tx-hash]');
+      if (!rowElement || !listElement.contains(rowElement)) {
+        return;
+      }
+      const hash = rowElement.getAttribute('data-tx-hash');
+      if (!hash) {
+        return;
+      }
+      event.preventDefault();
+      openTransactionByHash(hash);
+    },
+    [openTransactionByHash],
+  );
+
   const onOpportunityListClick = useCallback((event) => {
     const node = event.target;
     const container = event.currentTarget;
@@ -180,6 +204,7 @@ export function useDashboardActions({
     closeDialog,
     openTransactionByHash,
     onTickerListClick,
+    onTickerListKeyDown,
     onOpportunityListClick,
     onMastheadNavClick,
     onShowRadar,

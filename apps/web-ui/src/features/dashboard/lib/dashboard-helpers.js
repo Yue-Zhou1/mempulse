@@ -441,3 +441,29 @@ export function paginationWindow(currentPage, totalPages, maxButtons = 5) {
   }
   return pages;
 }
+
+export function appendBoundedRows(targetRows, incomingRows, maxItems) {
+  if (!Array.isArray(targetRows)) {
+    return 0;
+  }
+
+  const sourceRows = Array.isArray(incomingRows) ? incomingRows : [];
+  const cap = Number.isFinite(maxItems)
+    ? Math.max(0, Math.floor(maxItems))
+    : Number.POSITIVE_INFINITY;
+
+  for (const row of sourceRows) {
+    targetRows.push(row);
+  }
+
+  if (!Number.isFinite(cap)) {
+    return 0;
+  }
+
+  const overflow = targetRows.length - cap;
+  if (overflow <= 0) {
+    return 0;
+  }
+  targetRows.splice(0, overflow);
+  return overflow;
+}

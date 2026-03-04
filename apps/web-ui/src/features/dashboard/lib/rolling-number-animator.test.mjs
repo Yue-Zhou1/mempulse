@@ -55,7 +55,7 @@ test('rolling number animator converges to target value', () => {
   assert.equal(animator.isRunning(), false);
 });
 
-test('rolling number animator resolves immediately when target is not greater', () => {
+test('rolling number animator supports descending targets', () => {
   const scheduler = createFrameScheduler();
   const updates = [];
   const animator = createRollingNumberAnimator({
@@ -72,8 +72,51 @@ test('rolling number animator resolves immediately when target is not greater', 
     },
   });
 
-  assert.deepEqual(updates, [12]);
-  assert.equal(scheduler.pendingCount(), 0);
+  assert.equal(scheduler.pendingCount(), 1);
+  scheduler.flushFrame(0);
+  scheduler.flushFrame(120);
+  scheduler.flushFrame(240);
+
+  assert.ok(updates.length >= 3);
+  assert.equal(Math.round(updates.at(-1)), 12);
+  assert.equal(animator.isRunning(), false);
+});
+
+test('rolling number animator retargets while running without restarting frame loop', () => {
+  const scheduler = createFrameScheduler();
+  const updates = [];
+  const animator = createRollingNumberAnimator({
+    requestFrame: scheduler.requestFrame.bind(scheduler),
+    cancelFrame: scheduler.cancelFrame.bind(scheduler),
+  });
+
+  animator.start({
+    fromValue: 100,
+    toValue: 200,
+    durationMs: 200,
+    onUpdate(value) {
+      updates.push(Math.round(value));
+    },
+  });
+
+  assert.equal(scheduler.pendingCount(), 1);
+  scheduler.flushFrame(0);
+  scheduler.flushFrame(80);
+  const lastBeforeRetarget = updates.at(-1);
+  assert.ok(Number.isFinite(lastBeforeRetarget));
+
+  animator.retarget({
+    toValue: 320,
+    durationMs: 120,
+  });
+  assert.equal(scheduler.pendingCount(), 1);
+
+  scheduler.flushFrame(120);
+  scheduler.flushFrame(180);
+  scheduler.flushFrame(260);
+
+  assert.equal(Math.round(updates.at(-1)), 320);
+  assert.ok(updates.some((value) => value > lastBeforeRetarget));
   assert.equal(animator.isRunning(), false);
 });
 
