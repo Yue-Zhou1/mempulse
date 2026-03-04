@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  appendBoundedRows,
   buildIncrementalRowIndex,
   classifyRisk,
   fetchJson,
@@ -174,4 +175,27 @@ test('buildIncrementalRowIndex updates changed rows and removes stale rows', () 
   assert.notEqual(next, previous);
   assert.equal(next.get('0x1'), updatedRow);
   assert.equal(next.has('0x2'), false);
+});
+
+test('appendBoundedRows keeps newest rows when limit is exceeded', () => {
+  const target = [{ hash: '0x1' }, { hash: '0x2' }];
+  const dropped = appendBoundedRows(
+    target,
+    [{ hash: '0x3' }, { hash: '0x4' }, { hash: '0x5' }],
+    4,
+  );
+
+  assert.equal(dropped, 1);
+  assert.deepEqual(
+    target.map((row) => row.hash),
+    ['0x2', '0x3', '0x4', '0x5'],
+  );
+});
+
+test('appendBoundedRows clears target when limit is zero', () => {
+  const target = [{ hash: '0x1' }, { hash: '0x2' }];
+  const dropped = appendBoundedRows(target, [{ hash: '0x3' }], 0);
+
+  assert.equal(dropped, 3);
+  assert.deepEqual(target, []);
 });

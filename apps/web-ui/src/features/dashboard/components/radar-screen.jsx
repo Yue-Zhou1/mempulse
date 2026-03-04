@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { MAINNET_FILTER_ALL, MAINNET_FILTER_OPTIONS } from '../domain/mainnet-filter.js';
 import {
   classifyRisk,
@@ -15,7 +16,7 @@ import { RadarVirtualizedTable } from './radar-virtualized-table.jsx';
 import { RollingInt, RollingPercent } from './rolling-number.jsx';
 import { cn } from '../../../shared/lib/utils.js';
 
-export function RadarScreen({ model, actions }) {
+function RadarScreenImpl({ model, actions }) {
   const {
     showTickerFilters,
     liveMainnetFilter,
@@ -53,6 +54,7 @@ export function RadarScreen({ model, actions }) {
     onSearchChange,
     onLiveMainnetFilterChange,
     onTickerListClick,
+    onTickerListKeyDown,
     onTransactionPaginationClick,
   } = actions;
   const nonVirtualizedTickerRows = rowsFromVirtualizedModels(virtualizedTickerRows);
@@ -69,23 +71,25 @@ export function RadarScreen({ model, actions }) {
 
               <div className="mb-1 flex flex-wrap items-center justify-between gap-2 border-b-4 border-zinc-900 pb-2">
                 <div className="news-section-title text-xl font-bold uppercase">Latest Ticker</div>
-                <ul className="flex gap-2" onClick={onTickerToolbarClick}>
-                  <li
+                <div className="flex gap-2" role="group" aria-label="Ticker actions" onClick={onTickerToolbarClick}>
+                  <button
+                    type="button"
                     data-ticker-action="filter"
                     className={cn(
-                      'news-tab news-mono cursor-pointer list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                      'news-tab news-mono px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
                       showTickerFilters || liveMainnetFilter !== MAINNET_FILTER_ALL ? 'news-tab-active' : '',
                     )}
                   >
                     Filter
-                  </li>
-                  <li
+                  </button>
+                  <button
+                    type="button"
                     data-ticker-action="follow"
-                    className="news-tab news-mono cursor-pointer list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors"
+                    className="news-tab news-mono px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors"
                   >
                     Follow
-                  </li>
-                </ul>
+                  </button>
+                </div>
               </div>
 
               <div className="mb-2 flex items-center gap-2">
@@ -118,7 +122,7 @@ export function RadarScreen({ model, actions }) {
               </div>
 
               <div className="news-list-shell min-h-0 flex flex-1 flex-col overflow-hidden">
-                <div onClick={onTickerListClick} className="min-h-0 h-full">
+                <div onClick={onTickerListClick} onKeyDown={onTickerListKeyDown} className="min-h-0 h-full">
                   {virtualizedTickerEnabled ? (
                     <RadarVirtualizedTable
                       rowModels={virtualizedTickerRows}
@@ -158,6 +162,8 @@ export function RadarScreen({ model, actions }) {
                               <tr
                                 key={row.hash}
                                 data-tx-hash={row.hash}
+                                tabIndex={0}
+                                aria-selected={isActive}
                                 className={cn(
                                   'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
                                   isActive
@@ -215,40 +221,45 @@ export function RadarScreen({ model, actions }) {
                   <div className="news-mono mb-2 text-center text-[10px] uppercase tracking-[0.14em] text-zinc-700">
                     Showing {transactionPageStart + 1}-{transactionPageEnd} of {pagedTransactions.length} rows · page {normalizedTransactionPage}/{transactionPageCount}
                   </div>
-                  <ul className="flex items-center justify-center gap-1.5" onClick={onTransactionPaginationClick}>
-                    <li
+                  <div className="flex items-center justify-center gap-1.5" role="group" aria-label="Transaction pagination" onClick={onTransactionPaginationClick}>
+                    <button
+                      type="button"
                       data-page-action="prev"
                       data-disabled={normalizedTransactionPage <= 1 ? 'true' : 'false'}
+                      disabled={normalizedTransactionPage <= 1}
                       className={cn(
-                        'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
-                        normalizedTransactionPage <= 1 ? 'news-tab-disabled' : 'cursor-pointer',
+                        'news-tab news-mono px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                        normalizedTransactionPage <= 1 ? 'news-tab-disabled' : '',
                       )}
                     >
                       Prev
-                    </li>
+                    </button>
                     {paginationPages.map((page) => (
-                      <li
+                      <button
                         key={page}
+                        type="button"
                         data-page={page}
                         className={cn(
-                          'news-tab news-mono cursor-pointer list-none px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                          'news-tab news-mono px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
                           page === normalizedTransactionPage ? 'news-tab-active' : '',
                         )}
                       >
                         {page}
-                      </li>
+                      </button>
                     ))}
-                    <li
+                    <button
+                      type="button"
                       data-page-action="next"
                       data-disabled={normalizedTransactionPage >= transactionPageCount ? 'true' : 'false'}
+                      disabled={normalizedTransactionPage >= transactionPageCount}
                       className={cn(
-                        'news-tab news-mono list-none px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
-                        normalizedTransactionPage >= transactionPageCount ? 'news-tab-disabled' : 'cursor-pointer',
+                        'news-tab news-mono px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors',
+                        normalizedTransactionPage >= transactionPageCount ? 'news-tab-disabled' : '',
                       )}
                     >
                       Next
-                    </li>
-                  </ul>
+                    </button>
+                  </div>
                 </div>
               ) : null}
 
@@ -273,10 +284,15 @@ export function RadarScreen({ model, actions }) {
                   <div className="text-center">
                     <p className="news-kicker mb-1">Total Signal Volume</p>
                     <p className="news-headline text-3xl font-bold">
-                      <RollingInt value={totalSignalVolume} durationMs={650} />
+                      <RollingInt value={totalSignalVolume} durationMs={650} className="news-metric-number" />
                     </p>
                     <p className="news-mono mt-1 inline-block border-t border-zinc-900 px-2 pt-1 text-[11px] uppercase tracking-[0.12em]">
-                      <RollingPercent value={successRate} durationMs={460} suffix="% stable stream" />
+                      <RollingPercent
+                        value={successRate}
+                        durationMs={460}
+                        suffix="% stable stream"
+                        className="news-metric-number"
+                      />
                     </p>
                   </div>
 
@@ -286,7 +302,7 @@ export function RadarScreen({ model, actions }) {
                     <div className="text-center">
                       <p className="news-kicker mb-1">Tx Count</p>
                       <p className="news-headline text-2xl font-bold">
-                        <RollingInt value={totalTxCount} durationMs={500} />
+                        <RollingInt value={totalTxCount} durationMs={500} className="news-metric-number" />
                       </p>
                       <p className="news-mono mt-1 text-[10px] uppercase tracking-[0.12em]">
                         tx stream volume
@@ -295,7 +311,7 @@ export function RadarScreen({ model, actions }) {
                     <div className="border-l border-dashed border-zinc-900 pl-2 text-center">
                       <p className="news-kicker mb-1">Success Rate</p>
                       <p className="news-headline text-2xl font-bold">
-                        <RollingPercent value={successRate} durationMs={460} />
+                        <RollingPercent value={successRate} durationMs={460} className="news-metric-number" />
                       </p>
                       <p className="news-mono mt-1 text-[10px] uppercase tracking-[0.12em]">
                         {highRiskCount} high risk rows
@@ -454,3 +470,44 @@ export function RadarScreen({ model, actions }) {
           </div>
   );
 }
+
+export const RadarScreen = memo(
+  RadarScreenImpl,
+  (left, right) => (
+    left.model.showTickerFilters === right.model.showTickerFilters
+    && left.model.liveMainnetFilter === right.model.liveMainnetFilter
+    && left.model.query === right.model.query
+    && left.model.hasError === right.model.hasError
+    && left.model.statusMessage === right.model.statusMessage
+    && left.model.virtualizedTickerEnabled === right.model.virtualizedTickerEnabled
+    && left.model.virtualizedTickerRows === right.model.virtualizedTickerRows
+    && left.model.featureByHash === right.model.featureByHash
+    && left.model.selectedHash === right.model.selectedHash
+    && left.model.filteredTransactions === right.model.filteredTransactions
+    && left.model.transactionPageStart === right.model.transactionPageStart
+    && left.model.transactionPageEnd === right.model.transactionPageEnd
+    && left.model.pagedTransactions === right.model.pagedTransactions
+    && left.model.normalizedTransactionPage === right.model.normalizedTransactionPage
+    && left.model.transactionPageCount === right.model.transactionPageCount
+    && left.model.paginationPages === right.model.paginationPages
+    && left.model.selectedTransaction === right.model.selectedTransaction
+    && left.model.selectedFeature === right.model.selectedFeature
+    && left.model.selectedRecent === right.model.selectedRecent
+    && left.model.selectedTransactionMainnet === right.model.selectedTransactionMainnet
+    && left.model.totalSignalVolume === right.model.totalSignalVolume
+    && left.model.successRate === right.model.successRate
+    && left.model.totalTxCount === right.model.totalTxCount
+    && left.model.highRiskCount === right.model.highRiskCount
+    && left.model.featureTrendPath === right.model.featureTrendPath
+    && left.model.lowRiskCount === right.model.lowRiskCount
+    && left.model.mediumRiskCount === right.model.mediumRiskCount
+    && left.model.topMixRows === right.model.topMixRows
+    && left.model.mixTotal === right.model.mixTotal
+    && left.actions.onTickerToolbarClick === right.actions.onTickerToolbarClick
+    && left.actions.onSearchChange === right.actions.onSearchChange
+    && left.actions.onLiveMainnetFilterChange === right.actions.onLiveMainnetFilterChange
+    && left.actions.onTickerListClick === right.actions.onTickerListClick
+    && left.actions.onTickerListKeyDown === right.actions.onTickerListKeyDown
+    && left.actions.onTransactionPaginationClick === right.actions.onTransactionPaginationClick
+  ),
+);

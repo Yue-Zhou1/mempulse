@@ -87,7 +87,8 @@ export function NewspaperFilterSelect({
     >
       <span className="news-filter-label news-mono">{label}</span>
       <div className={cn('news-filter-dropdown', isOpen ? 'news-filter-dropdown-active' : '')}>
-        <div
+        <button
+          type="button"
           id={triggerId}
           aria-expanded={isOpen}
           aria-haspopup="listbox"
@@ -103,7 +104,7 @@ export function NewspaperFilterSelect({
           >
             ▼
           </span>
-        </div>
+        </button>
         <div
           id={menuId}
           role="listbox"
@@ -115,7 +116,8 @@ export function NewspaperFilterSelect({
               const isSelected = option.value === value;
               return (
                 <li key={option.value} className="news-filter-item">
-                  <div
+                  <button
+                    type="button"
                     className={cn(
                       'news-filter-option',
                       isSelected ? 'news-filter-option-active' : '',
@@ -126,7 +128,7 @@ export function NewspaperFilterSelect({
                   >
                     <span>{option.label}</span>
                     {isSelected ? <span className="news-filter-option-mark">•</span> : null}
-                  </div>
+                  </button>
                   {index < options.length - 1 ? (
                     <div className="news-filter-separator" aria-hidden="true" />
                   ) : null}

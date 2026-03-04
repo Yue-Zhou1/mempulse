@@ -1,3 +1,4 @@
+import { DashboardPerfPanel } from './dashboard-perf-panel.jsx';
 import { NewsMasthead } from './news-masthead.jsx';
 import { OpportunitiesScreen } from './opportunities-screen.jsx';
 import { RadarScreen } from './radar-screen.jsx';
@@ -7,8 +8,8 @@ export function DashboardView({ model, actions }) {
   const { activeScreen } = model;
 
   return (
-    <div className="news-body min-h-screen text-zinc-900">
-      <div className="newspaper-shell flex h-screen w-screen max-w-none flex-col overflow-hidden">
+    <div className="news-body news-app-shell h-[100dvh] overflow-hidden text-zinc-900">
+      <div className="newspaper-shell flex h-full min-h-0 w-full max-w-none flex-col overflow-hidden">
         <NewsMasthead model={model} actions={actions} />
 
         {activeScreen === 'radar' ? <RadarScreen model={model} actions={actions} /> : null}
@@ -16,6 +17,7 @@ export function DashboardView({ model, actions }) {
       </div>
 
       <TransactionDialog model={model} actions={actions} />
+      {import.meta.env.DEV ? <DashboardPerfPanel /> : null}
     </div>
   );
 }

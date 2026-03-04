@@ -7,6 +7,19 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      (() => {
+        const KEY = 'mempulse_ui_style_mode';
+        try {
+          const styleMode = String(localStorage.getItem(KEY) || '').trim().toLowerCase();
+          if (styleMode === 'newspaper' || styleMode === 'modern-financial') {
+            document.documentElement.setAttribute('data-ui-style', styleMode);
+          }
+        } catch {
+          // Ignore blocked localStorage.
+        }
+      })();
+    </script>
     <script src="/runtime-config.js"></script>
     <script type="module" src="./src/main.jsx"></script>
   </body>

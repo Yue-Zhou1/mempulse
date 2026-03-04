@@ -140,6 +140,8 @@ function RadarVirtualizedTableImpl({ rowModels, featureByHash, selectedHash }) {
               <tr
                 key={rowModel.key}
                 data-tx-hash={row.hash}
+                tabIndex={0}
+                aria-selected={isActive}
                 className={cn(
                   'news-tx-row cursor-pointer border-b border-dashed border-zinc-900 text-[13px]',
                   isActive

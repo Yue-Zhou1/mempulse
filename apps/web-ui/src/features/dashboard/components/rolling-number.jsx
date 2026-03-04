@@ -1,76 +1,65 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
-import { createRollingNumberAnimator } from '../lib/rolling-number-animator.js';
+import TextTransition from 'react-text-transition';
+import {
+  buildRollingDigitSlots,
+  resolveRollingTransitionDirection,
+  resolveRollingTransitionSpringConfig,
+} from '../lib/rolling-number-transition.js';
 
 const INT_NUMBER_FORMATTER = new Intl.NumberFormat();
 
-function useRollingNumber(value, formatValue, options = {}) {
-  const durationMs = Number.isFinite(options.durationMs)
-    ? Math.max(120, Math.floor(options.durationMs))
-    : 520;
+function useRollingNumberTransition(value, formatValue, options = {}) {
+  const durationMs = Number.isFinite(options.durationMs) ? options.durationMs : 520;
   const sanitizedTarget = Number.isFinite(value) ? value : 0;
-  const displayValueRef = useRef(sanitizedTarget);
-  const spanRef = useRef(null);
-  const animatorRef = useRef(null);
-  const stopAnimationRef = useRef(null);
-  const lastRenderedTextRef = useRef(formatValue(sanitizedTarget));
-
-  if (!animatorRef.current) {
-    animatorRef.current = createRollingNumberAnimator();
-  }
-
-  useEffect(() => {
-    const node = spanRef.current;
-    if (!node) {
-      return undefined;
-    }
-
-    const updateDisplay = (nextValue) => {
-      displayValueRef.current = nextValue;
-      const text = formatValue(nextValue);
-      if (text === lastRenderedTextRef.current) {
-        return;
-      }
-      node.textContent = text;
-      lastRenderedTextRef.current = text;
-    };
-
-    const fromValue = displayValueRef.current;
-    if (sanitizedTarget <= fromValue) {
-      if (typeof stopAnimationRef.current === 'function') {
-        stopAnimationRef.current();
-      }
-      updateDisplay(sanitizedTarget);
-      return undefined;
-    }
-
-    if (typeof stopAnimationRef.current === 'function') {
-      stopAnimationRef.current();
-    }
-    stopAnimationRef.current = animatorRef.current.start({
-      fromValue,
-      toValue: sanitizedTarget,
-      durationMs,
-      onUpdate: updateDisplay,
-      onComplete: updateDisplay,
-    });
-
-    return () => {
-      if (typeof stopAnimationRef.current === 'function') {
-        stopAnimationRef.current();
-        stopAnimationRef.current = null;
-      }
-    };
-  }, [durationMs, formatValue, sanitizedTarget]);
-
-  const initialText = useMemo(
+  const text = useMemo(
     () => formatValue(sanitizedTarget),
     [formatValue, sanitizedTarget],
   );
+  const previousTextRef = useRef(text);
+  const previousValueRef = useRef(sanitizedTarget);
+  const previousValue = previousValueRef.current;
+  const direction = resolveRollingTransitionDirection(previousValue, sanitizedTarget);
+  const springConfig = useMemo(
+    () => resolveRollingTransitionSpringConfig(durationMs),
+    [durationMs],
+  );
+  const slots = useMemo(
+    () => buildRollingDigitSlots(previousTextRef.current, text),
+    [text],
+  );
+  useEffect(() => {
+    previousValueRef.current = sanitizedTarget;
+    previousTextRef.current = text;
+  }, [sanitizedTarget, text]);
 
   return {
-    spanRef,
-    initialText,
+    text,
+    slots,
+    direction,
+    springConfig,
   };
+}
+
+function RollingDigitSlots({ slots, direction, springConfig }) {
+  return (
+    <span className="inline-flex items-baseline tabular-nums" aria-hidden="true">
+      {slots.map((slot) => (
+        slot.isDigit
+          ? (
+              <span key={slot.key} className="inline-flex w-[1ch] justify-center overflow-hidden">
+                <TextTransition inline direction={direction} springConfig={springConfig}>
+                  {slot.char}
+                </TextTransition>
+              </span>
+            )
+          : (
+              <span key={slot.key} className="inline-flex min-w-[0.35ch] justify-center">
+                {slot.char}
+              </span>
+            )
+      ))}
+    </span>
+  );
 }
 
 export function RollingInt({ value, durationMs = 520, className }) {
@@ -78,10 +67,12 @@ export function RollingInt({ value, durationMs = 520, className }) {
     (nextValue) => INT_NUMBER_FORMATTER.format(Math.round(Number(nextValue) || 0)),
     [],
   );
-  const { spanRef, initialText } = useRollingNumber(value, formatValue, { durationMs });
+  const { text, slots, direction, springConfig } = useRollingNumberTransition(value, formatValue, {
+    durationMs,
+  });
   return (
-    <span ref={spanRef} className={className}>
-      {initialText}
+    <span className={className} aria-label={text}>
+      <RollingDigitSlots slots={slots} direction={direction} springConfig={springConfig} />
     </span>
   );
 }
@@ -91,10 +82,12 @@ export function RollingPercent({ value, durationMs = 520, className, suffix = '%
     (nextValue) => `${(Number(nextValue) || 0).toFixed(1)}${suffix}`,
     [suffix],
   );
-  const { spanRef, initialText } = useRollingNumber(value, formatValue, { durationMs });
+  const { text, slots, direction, springConfig } = useRollingNumberTransition(value, formatValue, {
+    durationMs,
+  });
   return (
-    <span ref={spanRef} className={className}>
-      {initialText}
+    <span className={className} aria-label={text}>
+      <RollingDigitSlots slots={slots} direction={direction} springConfig={springConfig} />
     </span>
   );
 }

@@ -15,12 +15,24 @@ function normalizeRows(rows) {
   return Array.isArray(rows) ? rows : [];
 }
 
+function buildLiveHashSet(rows) {
+  const liveHashes = new Set();
+  for (const row of normalizeRows(rows)) {
+    const hash = row?.hash;
+    if (hash) {
+      liveHashes.add(hash);
+    }
+  }
+  return liveHashes;
+}
+
 function resolveNextSelectedHash(currentSelectedHash, transactionRows) {
-  if (
-    currentSelectedHash
-    && transactionRows.some((row) => row?.hash === currentSelectedHash)
-  ) {
-    return currentSelectedHash;
+  if (currentSelectedHash) {
+    for (const row of transactionRows) {
+      if (row?.hash === currentSelectedHash) {
+        return currentSelectedHash;
+      }
+    }
   }
   return transactionRows[0]?.hash ?? null;
 }
@@ -47,7 +59,7 @@ function scheduleTransactionDetailCachePrune(get, transactionRows) {
   }
 
   if (typeof globalThis?.setTimeout !== 'function') {
-    const liveHashes = new Set((pendingDetailCachePruneRows ?? []).map((row) => row.hash));
+    const liveHashes = buildLiveHashSet(pendingDetailCachePruneRows);
     pendingDetailCachePruneRows = null;
     if (pruneTransactionDetailCache(liveHashes)) {
       get().bumpDetailVersion();
@@ -59,7 +71,7 @@ function scheduleTransactionDetailCachePrune(get, transactionRows) {
     detailCachePruneTimer = null;
     const rows = pendingDetailCachePruneRows;
     pendingDetailCachePruneRows = null;
-    const liveHashes = new Set(normalizeRows(rows).map((row) => row.hash));
+    const liveHashes = buildLiveHashSet(rows);
     if (pruneTransactionDetailCache(liveHashes)) {
       get().bumpDetailVersion();
     }
@@ -216,6 +228,10 @@ export function getTransactionDetailByHash(hash) {
     return null;
   }
   return transactionDetailCache.get(hash) ?? null;
+}
+
+export function getTransactionDetailCacheSize() {
+  return transactionDetailCache.size;
 }
 
 export function setTransactionDetailByHash(hash, detail, limit = DEFAULT_DETAIL_CACHE_LIMIT) {
