@@ -9,6 +9,7 @@ use feature_engine::{
 };
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
+use scheduler::{SchedulerEnqueueError, SchedulerHandle, ValidatedTransaction};
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
@@ -714,6 +715,7 @@ fn parse_endpoint_urls(chain_key: &str, ws_url: &str, http_url: &str) -> Result<
 pub fn start_live_rpc_feed(
     storage: Arc<RwLock<InMemoryStorage>>,
     writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
     config: LiveRpcConfig,
 ) {
     LIVE_RPC_FEED_START_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -739,9 +741,11 @@ pub fn start_live_rpc_feed(
     for chain in config.chains {
         let writer = writer.clone();
         let next_seq_id = next_seq_id.clone();
+        let scheduler = scheduler.clone();
         handle.spawn(async move {
             run_chain_worker(
                 writer,
+                scheduler,
                 chain,
                 max_seen_hashes,
                 batch_fetch,
@@ -755,6 +759,7 @@ pub fn start_live_rpc_feed(
 
 async fn run_chain_worker(
     writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
     chain: ChainRpcConfig,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
@@ -820,6 +825,7 @@ async fn run_chain_worker(
         let session_result = run_ws_session(
             LiveRpcSessionContext {
                 writer: &writer,
+                scheduler: &scheduler,
                 chain: &chain,
                 endpoint,
                 endpoint_index,
@@ -887,6 +893,7 @@ async fn run_chain_worker(
 
 struct LiveRpcSessionContext<'a> {
     writer: &'a StorageWriteHandle,
+    scheduler: &'a SchedulerHandle,
     chain: &'a ChainRpcConfig,
     endpoint: &'a RpcEndpoint,
     endpoint_index: usize,
@@ -1169,6 +1176,7 @@ async fn process_pending_hash_batch(
     {
         process_pending_hash_with_fetched_tx(
             session.writer,
+            session.scheduler,
             session.chain,
             hash_hex,
             hash,
@@ -1182,6 +1190,7 @@ async fn process_pending_hash_batch(
 
 fn process_pending_hash_with_fetched_tx(
     writer: &StorageWriteHandle,
+    scheduler: &SchedulerHandle,
     chain: &ChainRpcConfig,
     hash_hex: &str,
     hash: TxHash,
@@ -1289,21 +1298,9 @@ fn process_pending_hash_with_fetched_tx(
     if let Some(tx) = fetched_tx {
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         let raw_tx = tx.input.clone();
-        let decoded = TxDecoded {
-            hash: tx.hash,
-            tx_type: tx.tx_type,
-            sender: tx.sender,
-            nonce: tx.nonce,
-            chain_id: resolved_chain_id,
-            to: tx.to,
-            value_wei: tx.value_wei,
-            gas_limit: tx.gas_limit,
-            gas_price_wei: tx.gas_price_wei,
-            max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
-            max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
-            max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
-            calldata_len: Some(raw_tx.len() as u32),
-        };
+        let validated =
+            validated_transaction_from_live_tx(chain, now_unix_ms, tx_seen_mono_ns, &tx);
+        let decoded = validated.decoded.clone();
         if !try_enqueue_storage_write(
             writer,
             chain,
@@ -1351,6 +1348,19 @@ fn process_pending_hash_with_fetched_tx(
         )? {
             return Ok(());
         }
+        if let Err(error) = scheduler.try_admit(validated) {
+            let reason = match error {
+                SchedulerEnqueueError::QueueFull => "queue_full",
+                SchedulerEnqueueError::QueueClosed => "queue_closed",
+            };
+            tracing::warn!(
+                chain_key = %chain.chain_key,
+                source_id = %chain.source_id,
+                hash = %hash_hex,
+                reason,
+                "scheduler shadow admission rejected validated transaction"
+            );
+        }
         for opportunity in
             build_opportunity_records(&decoded, &raw_tx, now_unix_ms, resolved_chain_id)
         {
@@ -1371,6 +1381,34 @@ fn process_pending_hash_with_fetched_tx(
     }
 
     Ok(())
+}
+
+fn validated_transaction_from_live_tx(
+    chain: &ChainRpcConfig,
+    observed_at_unix_ms: i64,
+    observed_at_mono_ns: u64,
+    tx: &LiveTx,
+) -> ValidatedTransaction {
+    ValidatedTransaction {
+        source_id: chain.source_id.clone(),
+        observed_at_unix_ms,
+        observed_at_mono_ns,
+        decoded: TxDecoded {
+            hash: tx.hash,
+            tx_type: tx.tx_type,
+            sender: tx.sender,
+            nonce: tx.nonce,
+            chain_id: tx.chain_id.or(chain.chain_id),
+            to: tx.to,
+            value_wei: tx.value_wei,
+            gas_limit: tx.gas_limit,
+            gas_price_wei: tx.gas_price_wei,
+            max_fee_per_gas_wei: tx.max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei: tx.max_priority_fee_per_gas_wei,
+            max_fee_per_blob_gas_wei: tx.max_fee_per_blob_gas_wei,
+            calldata_len: Some(tx.input.len() as u32),
+        },
+    }
 }
 
 fn append_event(
@@ -2169,5 +2207,43 @@ mod tests {
             }
             other => panic!("expected BundleSubmitted payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validated_transaction_from_live_tx_preserves_scheduler_metadata() {
+        let chain = ChainRpcConfig {
+            chain_key: "eth-mainnet".to_owned(),
+            chain_id: Some(1),
+            source_id: SourceId::new("rpc-live"),
+            endpoints: vec![RpcEndpoint {
+                ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
+                http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
+            }],
+        };
+        let tx = LiveTx {
+            hash: [0x55; 32],
+            sender: [0x22; 20],
+            to: Some([0x33; 20]),
+            nonce: 9,
+            tx_type: 2,
+            value_wei: Some(10),
+            gas_limit: Some(21_000),
+            chain_id: Some(1),
+            gas_price_wei: None,
+            max_fee_per_gas_wei: Some(120),
+            max_priority_fee_per_gas_wei: Some(3),
+            max_fee_per_blob_gas_wei: None,
+            input: vec![0xaa, 0xbb, 0xcc],
+        };
+
+        let validated = validated_transaction_from_live_tx(&chain, 1_700_000_123_456, 999, &tx);
+
+        assert_eq!(validated.source_id, SourceId::new("rpc-live"));
+        assert_eq!(validated.observed_at_unix_ms, 1_700_000_123_456);
+        assert_eq!(validated.observed_at_mono_ns, 999);
+        assert_eq!(validated.decoded.hash, tx.hash);
+        assert_eq!(validated.decoded.sender, tx.sender);
+        assert_eq!(validated.decoded.nonce, tx.nonce);
+        assert_eq!(validated.decoded.calldata_len, Some(3));
     }
 }

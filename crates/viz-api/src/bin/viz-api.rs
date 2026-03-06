@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
                 start_live_rpc_feed(
                     bootstrap.storage,
                     bootstrap.writer,
+                    bootstrap.scheduler,
                     bootstrap.live_rpc_config,
                 );
             } else {

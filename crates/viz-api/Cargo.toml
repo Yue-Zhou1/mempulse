@@ -15,6 +15,7 @@ futures = { workspace = true }
 hashbrown = { workspace = true }
 node-runtime = { path = "../node-runtime" }
 replay = { path = "../replay" }
+scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }
 serde = { workspace = true }
 serde_json = { workspace = true }

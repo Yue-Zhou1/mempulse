@@ -4,6 +4,7 @@ members = [
   "crates/event-log",
   "crates/ingest",
   "crates/feature-engine",
+  "crates/scheduler",
   "crates/storage",
   "crates/viz-api",
   "crates/node-runtime",

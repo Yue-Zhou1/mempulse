@@ -25,6 +25,7 @@ use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
 };
+use scheduler::{SchedulerConfig, SchedulerHandle, spawn_scheduler};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -62,6 +63,7 @@ pub struct AppState {
 pub struct RuntimeBootstrap {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
+    pub scheduler: SchedulerHandle,
     pub live_rpc_config: LiveRpcConfig,
     pub ingest_mode: IngestSourceMode,
 }
@@ -1015,6 +1017,7 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
+    let scheduler = spawn_scheduler(SchedulerConfig::default());
     let live_rpc_config = match LiveRpcConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -1071,6 +1074,7 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         RuntimeBootstrap {
             storage: storage.clone(),
             writer,
+            scheduler,
             live_rpc_config,
             ingest_mode,
         },

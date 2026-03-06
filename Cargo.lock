@@ -2884,6 +2884,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scheduler"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "event-log",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "searcher"
 version = "0.1.0"
 dependencies = [
@@ -3650,6 +3660,7 @@ dependencies = [
  "node-runtime",
  "replay",
  "reqwest",
+ "scheduler",
  "searcher",
  "serde",
  "serde_json",
