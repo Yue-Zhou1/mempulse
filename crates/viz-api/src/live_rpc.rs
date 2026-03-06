@@ -2,14 +2,15 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{
-    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxDecoded, TxFetched, TxSeen,
+    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxDecoded, TxDropped, TxFetched,
+    TxReplaced, TxSeen,
 };
 use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
 };
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
-use scheduler::{SchedulerEnqueueError, SchedulerHandle, ValidatedTransaction};
+use scheduler::{SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, ValidatedTransaction};
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
@@ -114,6 +115,7 @@ impl LiveRpcDropMetrics {
 
 static LIVE_RPC_DROP_METRICS: OnceLock<Arc<LiveRpcDropMetrics>> = OnceLock::new();
 static LIVE_RPC_FEED_START_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_RPC_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn live_rpc_drop_metrics() -> &'static Arc<LiveRpcDropMetrics> {
     LIVE_RPC_DROP_METRICS.get_or_init(|| Arc::new(LiveRpcDropMetrics::default()))
@@ -137,6 +139,14 @@ pub fn live_rpc_feed_start_count() -> u64 {
 
 pub fn reset_live_rpc_feed_start_count() {
     LIVE_RPC_FEED_START_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn current_mono_ns() -> u64 {
+    LIVE_RPC_MONO_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> LiveRpcDropReason {
@@ -904,6 +914,13 @@ struct LiveRpcSessionContext<'a> {
     next_seq_id: &'a Arc<AtomicU64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingHashObservation {
+    hash_hex: String,
+    observed_at_unix_ms: i64,
+    observed_at_mono_ns: u64,
+}
+
 async fn run_ws_session(
     session: LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
@@ -942,7 +959,7 @@ async fn run_ws_session(
 
     let mut subscription_id: Option<String> = None;
     let flush_interval = Duration::from_millis(session.batch_fetch.flush_interval_ms);
-    let mut pending_hashes = VecDeque::new();
+    let mut pending_hashes: VecDeque<PendingHashObservation> = VecDeque::new();
     let in_flight = Arc::new(Semaphore::new(session.batch_fetch.max_in_flight));
     let mut last_pending_unix_ms = current_unix_ms();
     loop {
@@ -952,8 +969,13 @@ async fn run_ws_session(
                 match frame {
                     Message::Text(text) => {
                         if let Some(hash_hex) = parse_pending_hash(&text, &mut subscription_id) {
-                            pending_hashes.push_back(hash_hex.to_owned());
-                            last_pending_unix_ms = current_unix_ms();
+                            let observed_at_unix_ms = current_unix_ms();
+                            pending_hashes.push_back(PendingHashObservation {
+                                hash_hex: hash_hex.to_owned(),
+                                observed_at_unix_ms,
+                                observed_at_mono_ns: current_mono_ns(),
+                            });
+                            last_pending_unix_ms = observed_at_unix_ms;
                             update_live_rpc_chain_status(
                                 session.chain,
                                 session.endpoint,
@@ -1092,7 +1114,7 @@ async fn flush_pending_hash_batches(
     session: &LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
-    pending_hashes: &mut VecDeque<String>,
+    pending_hashes: &mut VecDeque<PendingHashObservation>,
     in_flight: &Arc<Semaphore>,
 ) -> Result<()> {
     let dispatch_count = dispatchable_batch_count(
@@ -1113,20 +1135,20 @@ async fn process_pending_hash_batch(
     session: &LiveRpcSessionContext<'_>,
     seen_hashes: &mut FastSet<TxHash>,
     seen_order: &mut VecDeque<TxHash>,
-    hash_batch: Vec<String>,
+    hash_batch: Vec<PendingHashObservation>,
     in_flight: &Arc<Semaphore>,
 ) -> Result<()> {
-    let mut deduped_hashes = Vec::new();
+    let mut deduped_observations = Vec::new();
     let mut deduped_raw = Vec::new();
-    for hash_hex in hash_batch {
-        let hash = match parse_fixed_hex::<32>(&hash_hex) {
+    for observation in hash_batch {
+        let hash = match parse_fixed_hex::<32>(&observation.hash_hex) {
             Some(hash) => hash,
             None => {
                 observe_live_rpc_drop_reason(LiveRpcDropReason::InvalidPendingHash);
                 tracing::warn!(
                     chain_key = %session.chain.chain_key,
                     source_id = %session.chain.source_id,
-                    hash = %hash_hex,
+                    hash = %observation.hash_hex,
                     reason = LiveRpcDropReason::InvalidPendingHash.as_label(),
                     "dropping pending hash: invalid hex payload"
                 );
@@ -1134,11 +1156,11 @@ async fn process_pending_hash_batch(
             }
         };
         if remember_hash(hash, seen_hashes, seen_order, session.max_seen_hashes) {
-            deduped_hashes.push(hash_hex);
+            deduped_observations.push(observation);
             deduped_raw.push(hash);
         }
     }
-    if deduped_hashes.is_empty() {
+    if deduped_observations.is_empty() {
         return Ok(());
     }
 
@@ -1150,18 +1172,21 @@ async fn process_pending_hash_batch(
     let fetched = fetch_transactions_by_hash_batch_with_retry(
         session.client,
         session.endpoint.http_url.as_str(),
-        &deduped_hashes,
+        &deduped_observations
+            .iter()
+            .map(|observation| observation.hash_hex.clone())
+            .collect::<Vec<_>>(),
         session.batch_fetch,
     )
     .await?;
     let rpc_latency_ms = rpc_started.elapsed().as_secs_f64() * 1_000.0;
     let fetched_count = fetched.iter().filter(|row| row.is_some()).count();
-    let error_count = deduped_hashes.len().saturating_sub(fetched_count);
-    let error_rate = error_count as f64 / deduped_hashes.len() as f64;
+    let error_count = deduped_observations.len().saturating_sub(fetched_count);
+    let error_rate = error_count as f64 / deduped_observations.len() as f64;
     tracing::info!(
         chain_key = %session.chain.chain_key,
         chain_id = ?session.chain.chain_id,
-        batch_size = deduped_hashes.len(),
+        batch_size = deduped_observations.len(),
         fetched_count,
         error_count,
         error_rate,
@@ -1169,7 +1194,7 @@ async fn process_pending_hash_batch(
         "live rpc batch fetch metrics"
     );
 
-    for ((hash_hex, hash), fetched_tx) in deduped_hashes
+    for ((observation, hash), fetched_tx) in deduped_observations
         .iter()
         .zip(deduped_raw.into_iter())
         .zip(fetched.into_iter())
@@ -1178,26 +1203,86 @@ async fn process_pending_hash_batch(
             session.writer,
             session.scheduler,
             session.chain,
-            hash_hex,
+            observation,
             hash,
             fetched_tx,
             session.next_seq_id,
-        )?;
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-fn process_pending_hash_with_fetched_tx(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulerPersistenceDecision {
+    Admitted,
+    Duplicate,
+    Replaced { replaced_hash: TxHash },
+    Dropped { reason: &'static str },
+}
+
+impl SchedulerPersistenceDecision {
+    fn from_admission(admission: SchedulerAdmission) -> Self {
+        match admission {
+            SchedulerAdmission::Admitted => Self::Admitted,
+            SchedulerAdmission::Duplicate => Self::Duplicate,
+            SchedulerAdmission::Replaced { replaced_hash } => Self::Replaced { replaced_hash },
+            SchedulerAdmission::UnderpricedReplacement => Self::Dropped {
+                reason: "underpriced_replacement",
+            },
+            SchedulerAdmission::SenderLimitReached => Self::Dropped {
+                reason: "sender_limit_reached",
+            },
+        }
+    }
+
+    fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted | Self::Replaced { .. })
+    }
+
+    fn emits_decoded(self) -> bool {
+        self.is_admitted()
+    }
+
+    fn generates_opportunities(self) -> bool {
+        self.is_admitted()
+    }
+
+    fn replaced_hash(self) -> Option<TxHash> {
+        match self {
+            Self::Replaced { replaced_hash } => Some(replaced_hash),
+            _ => None,
+        }
+    }
+
+    fn dropped_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Dropped { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Duplicate => "duplicate",
+            Self::Replaced { .. } => "replaced",
+            Self::Dropped { reason } => reason,
+        }
+    }
+}
+
+async fn process_pending_hash_with_fetched_tx(
     writer: &StorageWriteHandle,
     scheduler: &SchedulerHandle,
     chain: &ChainRpcConfig,
-    hash_hex: &str,
+    observation: &PendingHashObservation,
     hash: TxHash,
     fetched_tx: Option<LiveTx>,
     next_seq_id: &Arc<AtomicU64>,
 ) -> Result<()> {
-    let now_unix_ms = current_unix_ms();
+    let processed_at_unix_ms = current_unix_ms();
     let feature_analysis = fetched_tx
         .as_ref()
         .map(|tx| analyze_transaction(feature_input(tx)));
@@ -1218,7 +1303,7 @@ fn process_pending_hash_with_fetched_tx(
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         let method_selector = format_method_selector_hex(analysis.method_selector);
         tracing::info!(
-            hash = hash_hex,
+            hash = %observation.hash_hex,
             chain_key = %chain.chain_key,
             source_id = %chain.source_id,
             sender = %format_fixed_hex(&tx.sender),
@@ -1242,27 +1327,55 @@ fn process_pending_hash_with_fetched_tx(
         );
     } else {
         tracing::info!(
-            hash = hash_hex,
+            hash = %observation.hash_hex,
             chain_key = %chain.chain_key,
             source_id = %chain.source_id,
             "mempool transaction (details unavailable from rpc)"
         );
     }
 
-    let tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
-    let tx_seen_mono_ns = tx_seen_seq_id.saturating_mul(1_000_000);
+    let scheduler_decision = if let Some(tx) = fetched_tx.as_ref() {
+        let validated = validated_transaction_from_live_tx(
+            chain,
+            observation.observed_at_unix_ms,
+            observation.observed_at_mono_ns,
+            tx,
+        );
+        let decision = match scheduler.admit(validated).await {
+            Ok(admission) => SchedulerPersistenceDecision::from_admission(admission),
+            Err(SchedulerEnqueueError::QueueFull) => SchedulerPersistenceDecision::Dropped {
+                reason: "queue_full",
+            },
+            Err(SchedulerEnqueueError::QueueClosed) => {
+                return Err(anyhow!("scheduler admission failed: queue closed"));
+            }
+        };
+        tracing::debug!(
+            chain_key = %chain.chain_key,
+            source_id = %chain.source_id,
+            hash = %observation.hash_hex,
+            admission = decision.label(),
+            admitted = decision.is_admitted(),
+            "scheduler admission applied before legacy persistence"
+        );
+        Some(decision)
+    } else {
+        None
+    };
+
+    let _tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
     if !try_enqueue_storage_write(
         writer,
         chain,
         StorageWriteOp::AppendPayload {
             source_id: chain.source_id.clone(),
-            ingest_ts_unix_ms: now_unix_ms,
-            ingest_ts_mono_ns: tx_seen_mono_ns,
+            ingest_ts_unix_ms: observation.observed_at_unix_ms,
+            ingest_ts_mono_ns: observation.observed_at_mono_ns,
             payload: EventPayload::TxSeen(TxSeen {
                 hash,
                 peer_id: "rpc-ws".to_owned(),
-                seen_at_unix_ms: now_unix_ms,
-                seen_at_mono_ns: tx_seen_mono_ns,
+                seen_at_unix_ms: observation.observed_at_unix_ms,
+                seen_at_mono_ns: observation.observed_at_mono_ns,
             }),
         },
     )? {
@@ -1274,8 +1387,8 @@ fn process_pending_hash_with_fetched_tx(
         StorageWriteOp::UpsertTxSeen(TxSeenRecord {
             hash,
             peer: "rpc-ws".to_owned(),
-            first_seen_unix_ms: now_unix_ms,
-            first_seen_mono_ns: tx_seen_mono_ns,
+            first_seen_unix_ms: observation.observed_at_unix_ms,
+            first_seen_mono_ns: observation.observed_at_mono_ns,
             seen_count: 1,
         }),
     )? {
@@ -1286,10 +1399,10 @@ fn process_pending_hash_with_fetched_tx(
         writer,
         chain,
         next_seq_id,
-        now_unix_ms,
+        processed_at_unix_ms,
         EventPayload::TxFetched(TxFetched {
             hash,
-            fetched_at_unix_ms: now_unix_ms,
+            fetched_at_unix_ms: processed_at_unix_ms,
         }),
     )? {
         return Ok(());
@@ -1298,9 +1411,15 @@ fn process_pending_hash_with_fetched_tx(
     if let Some(tx) = fetched_tx {
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         let raw_tx = tx.input.clone();
-        let validated =
-            validated_transaction_from_live_tx(chain, now_unix_ms, tx_seen_mono_ns, &tx);
-        let decoded = validated.decoded.clone();
+        let decoded = validated_transaction_from_live_tx(
+            chain,
+            observation.observed_at_unix_ms,
+            observation.observed_at_mono_ns,
+            &tx,
+        )
+        .decoded;
+        let scheduler_decision = scheduler_decision.expect("decision exists when tx exists");
+
         if !try_enqueue_storage_write(
             writer,
             chain,
@@ -1339,43 +1458,65 @@ fn process_pending_hash_with_fetched_tx(
         )? {
             return Ok(());
         }
-        if !append_event(
-            writer,
-            chain,
-            next_seq_id,
-            now_unix_ms,
-            EventPayload::TxDecoded(decoded.clone()),
-        )? {
-            return Ok(());
-        }
-        if let Err(error) = scheduler.try_admit(validated) {
-            let reason = match error {
-                SchedulerEnqueueError::QueueFull => "queue_full",
-                SchedulerEnqueueError::QueueClosed => "queue_closed",
-            };
-            tracing::warn!(
-                chain_key = %chain.chain_key,
-                source_id = %chain.source_id,
-                hash = %hash_hex,
-                reason,
-                "scheduler shadow admission rejected validated transaction"
-            );
-        }
-        for opportunity in
-            build_opportunity_records(&decoded, &raw_tx, now_unix_ms, resolved_chain_id)
-        {
-            let payloads = build_rule_versioned_payloads(&opportunity);
-            for payload in payloads {
-                if !append_event(writer, chain, next_seq_id, now_unix_ms, payload)? {
-                    return Ok(());
-                }
-            }
-            if !try_enqueue_storage_write(
+        if let Some(replaced_hash) = scheduler_decision.replaced_hash() {
+            if !append_event(
                 writer,
                 chain,
-                StorageWriteOp::UpsertOpportunity(opportunity),
+                next_seq_id,
+                processed_at_unix_ms,
+                EventPayload::TxReplaced(TxReplaced {
+                    hash: replaced_hash,
+                    replaced_by: tx.hash,
+                }),
             )? {
                 return Ok(());
+            }
+        }
+        if scheduler_decision.emits_decoded()
+            && !append_event(
+                writer,
+                chain,
+                next_seq_id,
+                processed_at_unix_ms,
+                EventPayload::TxDecoded(decoded.clone()),
+            )?
+        {
+            return Ok(());
+        }
+        if let Some(reason) = scheduler_decision.dropped_reason() {
+            if !append_event(
+                writer,
+                chain,
+                next_seq_id,
+                processed_at_unix_ms,
+                EventPayload::TxDropped(TxDropped {
+                    hash: tx.hash,
+                    reason: reason.to_owned(),
+                }),
+            )? {
+                return Ok(());
+            }
+        }
+        if scheduler_decision.generates_opportunities() {
+            for opportunity in build_opportunity_records(
+                &decoded,
+                &raw_tx,
+                processed_at_unix_ms,
+                resolved_chain_id,
+            ) {
+                let payloads = build_rule_versioned_payloads(&opportunity);
+                for payload in payloads {
+                    if !append_event(writer, chain, next_seq_id, processed_at_unix_ms, payload)? {
+                        return Ok(());
+                    }
+                }
+                if !try_enqueue_storage_write(
+                    writer,
+                    chain,
+                    StorageWriteOp::UpsertOpportunity(opportunity),
+                )? {
+                    return Ok(());
+                }
             }
         }
     }
@@ -2037,7 +2178,65 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use event_log::{TxDropped, TxReplaced};
     use serde_json::json;
+
+    fn test_chain() -> ChainRpcConfig {
+        ChainRpcConfig {
+            chain_key: "eth-mainnet".to_owned(),
+            chain_id: Some(1),
+            source_id: SourceId::new("rpc-live"),
+            endpoints: vec![RpcEndpoint {
+                ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
+                http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
+            }],
+        }
+    }
+
+    fn sample_live_tx(
+        hash_seed: u8,
+        sender_seed: u8,
+        nonce: u64,
+        max_fee_per_gas_wei: u128,
+    ) -> LiveTx {
+        LiveTx {
+            hash: [hash_seed; 32],
+            sender: [sender_seed; 20],
+            to: Some([hash_seed.saturating_add(1); 20]),
+            nonce,
+            tx_type: 2,
+            value_wei: Some(10),
+            gas_limit: Some(21_000),
+            chain_id: Some(1),
+            gas_price_wei: None,
+            max_fee_per_gas_wei: Some(max_fee_per_gas_wei),
+            max_priority_fee_per_gas_wei: Some(3),
+            max_fee_per_blob_gas_wei: None,
+            input: vec![0xaa, 0xbb, 0xcc],
+        }
+    }
+
+    fn sample_pending_observation(
+        hash: [u8; 32],
+        observed_at_unix_ms: i64,
+        observed_at_mono_ns: u64,
+    ) -> PendingHashObservation {
+        PendingHashObservation {
+            hash_hex: format_fixed_hex(&hash),
+            observed_at_unix_ms,
+            observed_at_mono_ns,
+        }
+    }
+
+    fn drain_storage_ops(
+        storage_rx: &mut tokio::sync::mpsc::Receiver<StorageWriteOp>,
+    ) -> Vec<StorageWriteOp> {
+        let mut ops = Vec::new();
+        while let Ok(op) = storage_rx.try_recv() {
+            ops.push(op);
+        }
+        ops
+    }
 
     #[test]
     fn default_live_rpc_config_has_primary_and_fallback_public_endpoints() {
@@ -2211,30 +2410,8 @@ mod tests {
 
     #[test]
     fn validated_transaction_from_live_tx_preserves_scheduler_metadata() {
-        let chain = ChainRpcConfig {
-            chain_key: "eth-mainnet".to_owned(),
-            chain_id: Some(1),
-            source_id: SourceId::new("rpc-live"),
-            endpoints: vec![RpcEndpoint {
-                ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
-                http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
-            }],
-        };
-        let tx = LiveTx {
-            hash: [0x55; 32],
-            sender: [0x22; 20],
-            to: Some([0x33; 20]),
-            nonce: 9,
-            tx_type: 2,
-            value_wei: Some(10),
-            gas_limit: Some(21_000),
-            chain_id: Some(1),
-            gas_price_wei: None,
-            max_fee_per_gas_wei: Some(120),
-            max_priority_fee_per_gas_wei: Some(3),
-            max_fee_per_blob_gas_wei: None,
-            input: vec![0xaa, 0xbb, 0xcc],
-        };
+        let chain = test_chain();
+        let tx = sample_live_tx(0x55, 0x22, 9, 120);
 
         let validated = validated_transaction_from_live_tx(&chain, 1_700_000_123_456, 999, &tx);
 
@@ -2245,5 +2422,180 @@ mod tests {
         assert_eq!(validated.decoded.sender, tx.sender);
         assert_eq!(validated.decoded.nonce, tx.nonce);
         assert_eq!(validated.decoded.calldata_len, Some(3));
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_uses_pending_notification_timestamps_for_scheduler_admission()
+     {
+        let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(32);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let tx = sample_live_tx(0x66, 0x44, 12, 125);
+        let observation = sample_pending_observation(tx.hash, 1_700_000_123_001, 555_444_333);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &observation,
+            tx.hash,
+            Some(tx.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process tx");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].decoded.hash, tx.hash);
+        assert_eq!(
+            snapshot.pending[0].observed_at_unix_ms,
+            observation.observed_at_unix_ms
+        );
+        assert_eq!(
+            snapshot.pending[0].observed_at_mono_ns,
+            observation.observed_at_mono_ns
+        );
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_emits_replaced_event_for_scheduler_replacement() {
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let incumbent = sample_live_tx(0x71, 0x31, 8, 100);
+        let replacement = sample_live_tx(0x72, 0x31, 8, 110);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(incumbent.hash, 1_700_000_000_001, 101),
+            incumbent.hash,
+            Some(incumbent.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process incumbent");
+        let _ = drain_storage_ops(&mut storage_rx);
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(replacement.hash, 1_700_000_000_002, 202),
+            replacement.hash,
+            Some(replacement.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process replacement");
+
+        let ops = drain_storage_ops(&mut storage_rx);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxReplaced(TxReplaced { hash, replaced_by }), .. }
+                if *hash == incumbent.hash && *replaced_by == replacement.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxDecoded(decoded), .. }
+                if decoded.hash == replacement.hash
+        )));
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_emits_dropped_event_when_scheduler_queue_is_full_but_still_writes_legacy_records()
+     {
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, _runtime) = scheduler::scheduler_channel(scheduler::SchedulerConfig {
+            handoff_queue_capacity: 1,
+            max_pending_per_sender: 64,
+            replacement_fee_bump_bps: 1_000,
+        });
+
+        let chain = test_chain();
+        let tx = sample_live_tx(0x81, 0x41, 5, 150);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        scheduler
+            .try_admit(validated_transaction_from_live_tx(
+                &chain,
+                1_700_000_000_000,
+                10,
+                &sample_live_tx(0x80, 0x40, 4, 100),
+            ))
+            .expect("fill scheduler handoff queue");
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(tx.hash, 1_700_000_000_003, 303),
+            tx.hash,
+            Some(tx.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("queue full falls back to legacy comparison writes");
+
+        let ops = drain_storage_ops(&mut storage_rx);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertTxFull(record) if record.hash == tx.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxDropped(TxDropped { hash, reason }), .. }
+                if *hash == tx.hash && reason == "queue_full"
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+        )));
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_rejects_before_storage_when_scheduler_is_closed()
+    {
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(8);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        drop(runtime);
+
+        let chain = test_chain();
+        let tx = sample_live_tx(0x71, 0x22, 9, 120);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        let error = process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(tx.hash, 1_700_000_000_010, 404),
+            tx.hash,
+            Some(tx),
+            &next_seq_id,
+        )
+        .await
+        .expect_err("closed scheduler should fail before storage writes");
+
+        assert!(error.to_string().contains("scheduler"));
+        assert!(storage_rx.try_recv().is_err());
     }
 }

@@ -189,26 +189,29 @@ impl MempoolState {
     }
 
     fn apply_dropped(&mut self, dropped: &TxDropped) -> Vec<StateTransition> {
-        let mut transitions = Vec::new();
-        if let Some(entry) = self.txs.get_mut(&dropped.hash) {
-            if let (Some(sender), Some(nonce)) = (entry.sender, entry.nonce)
-                && self
-                    .sender_nonce_index
-                    .get(&(sender, nonce))
-                    .is_some_and(|hash| *hash == dropped.hash)
-            {
-                self.sender_nonce_index.remove(&(sender, nonce));
-            }
-
-            entry.status = TxLifecycleStatus::Dropped {
+        let entry = self.txs.entry(dropped.hash).or_insert(TxEntry {
+            sender: None,
+            nonce: None,
+            status: TxLifecycleStatus::Dropped {
                 reason: dropped.reason.clone(),
-            };
-            transitions.push(StateTransition::Dropped {
-                hash: dropped.hash,
-                reason: dropped.reason.clone(),
-            });
+            },
+        });
+        if let (Some(sender), Some(nonce)) = (entry.sender, entry.nonce)
+            && self
+                .sender_nonce_index
+                .get(&(sender, nonce))
+                .is_some_and(|hash| *hash == dropped.hash)
+        {
+            self.sender_nonce_index.remove(&(sender, nonce));
         }
-        transitions
+
+        entry.status = TxLifecycleStatus::Dropped {
+            reason: dropped.reason.clone(),
+        };
+        vec![StateTransition::Dropped {
+            hash: dropped.hash,
+            reason: dropped.reason.clone(),
+        }]
     }
 
     fn apply_reorg(&mut self, reorged: &TxReorged) -> Vec<StateTransition> {
@@ -353,6 +356,34 @@ mod tests {
             old_hash: hash(7),
             new_hash: hash(8),
         }));
+    }
+
+    #[test]
+    fn dropped_tx_without_prior_decode_still_records_lifecycle() {
+        let mut state = MempoolState::default();
+
+        let transitions = state.apply_event(&envelope(
+            1,
+            EventPayload::TxDropped(TxDropped {
+                hash: hash(12),
+                reason: "queue_full".to_owned(),
+            }),
+        ));
+
+        assert_eq!(
+            transitions,
+            vec![StateTransition::Dropped {
+                hash: hash(12),
+                reason: "queue_full".to_owned(),
+            }]
+        );
+        assert_eq!(
+            state.lifecycle(&hash(12)),
+            Some(&TxLifecycleStatus::Dropped {
+                reason: "queue_full".to_owned(),
+            })
+        );
+        assert!(state.pending_hashes().is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use axum::{body::Body, http::Request};
 use builder::RelayDryRunStatus;
 use common::AlertThresholdConfig;
+use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::sync::{Arc, RwLock};
 use storage::{
     InMemoryStorage, PeerStatsRecord, StorageTryEnqueueError, StorageWriteHandle, StorageWriteOp,
@@ -74,6 +75,8 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(live_rpc_drop_metrics_snapshot)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+        scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+        scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     };
     let app = build_router(state);
 

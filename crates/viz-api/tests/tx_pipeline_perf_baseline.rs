@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode};
 use builder::RelayDryRunStatus;
 use common::{AlertThresholdConfig, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -136,6 +137,8 @@ fn build_seeded_state(seeded_transactions: usize) -> (AppState, SeedSummary) {
         api_auth,
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+        scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     };
 
     (state, seed_summary)

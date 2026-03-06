@@ -2,6 +2,7 @@ use axum::{body::Body, http::Request, http::StatusCode};
 use builder::RelayDryRunStatus;
 use common::AlertThresholdConfig;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
+use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::sync::{Arc, RwLock};
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
@@ -127,6 +128,8 @@ fn build_test_app() -> axum::Router {
         api_rate_limiter: ApiRateLimiter::new(600),
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+        scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     };
     build_router(state)
 }

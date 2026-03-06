@@ -8,4 +8,4 @@ common = { path = "../common" }
 event-log = { path = "../event-log" }
 serde = { workspace = true }
 tokio = { workspace = true }
-
+tracing = { workspace = true }

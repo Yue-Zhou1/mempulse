@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::Request;
 use builder::RelayDryRunStatus;
 use common::{AlertThresholdConfig, MetricSnapshot};
+use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
@@ -108,6 +109,8 @@ fn auth_state() -> AppState {
         api_auth,
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+        scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     }
 }
 

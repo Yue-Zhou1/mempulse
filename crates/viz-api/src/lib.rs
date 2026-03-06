@@ -25,7 +25,9 @@ use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
 };
-use scheduler::{SchedulerConfig, SchedulerHandle, spawn_scheduler};
+use scheduler::{
+    SchedulerConfig, SchedulerHandle, SchedulerMetrics, SchedulerSnapshot, spawn_scheduler,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -43,7 +45,11 @@ use tower_http::cors::{Any, CorsLayer};
 #[cfg(test)]
 use builder::RelayAttemptTrace;
 #[cfg(test)]
+use common::SourceId;
+#[cfg(test)]
 use event_log::{OppDetected, TxConfirmed, TxDecoded, TxFetched, TxReorged, TxSeen};
+#[cfg(test)]
+use scheduler::{ValidatedTransaction, scheduler_channel};
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,6 +63,8 @@ pub struct AppState {
     pub api_rate_limiter: ApiRateLimiter,
     pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
     pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+    pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
+    pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -991,6 +999,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
+        .route("/scheduler/snapshot", get(scheduler_snapshot))
+        .route("/scheduler/metrics", get(scheduler_metrics))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
@@ -1053,6 +1063,12 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
     let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
         as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+    let scheduler_for_snapshot = scheduler.clone();
+    let scheduler_for_metrics = scheduler.clone();
+    let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
+        as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+    let scheduler_metrics_provider = Arc::new(move || scheduler_for_metrics.metrics())
+        as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
 
     let state = AppState {
         provider: Arc::new(InMemoryVizProvider::new(
@@ -1067,6 +1083,8 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         api_rate_limiter,
         live_rpc_chain_status_provider,
         live_rpc_drop_metrics_provider,
+        scheduler_snapshot_provider,
+        scheduler_metrics_provider,
     };
 
     (
@@ -1264,6 +1282,14 @@ async fn health() -> (StatusCode, Json<HealthResponse>) {
 
 async fn metrics_snapshot(State(state): State<AppState>) -> Json<MetricSnapshot> {
     Json(state.provider.metric_snapshot())
+}
+
+async fn scheduler_snapshot(State(state): State<AppState>) -> Json<SchedulerSnapshot> {
+    Json((state.scheduler_snapshot_provider)())
+}
+
+async fn scheduler_metrics(State(state): State<AppState>) -> Json<SchedulerMetrics> {
+    Json((state.scheduler_metrics_provider)())
 }
 
 async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
@@ -1739,6 +1765,67 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {}\n",
         drop_metrics.invalid_pending_hash
+    ));
+    let scheduler_metrics = (state.scheduler_metrics_provider)();
+    out.push_str("# TYPE mempulse_scheduler_admitted_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_admitted_total {}\n",
+        scheduler_metrics.admitted_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_duplicate_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_duplicate_total {}\n",
+        scheduler_metrics.duplicate_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_replacement_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_replacement_total {}\n",
+        scheduler_metrics.replacement_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_underpriced_replacement_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_underpriced_replacement_total {}\n",
+        scheduler_metrics.underpriced_replacement_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_sender_limit_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_sender_limit_drop_total {}\n",
+        scheduler_metrics.sender_limit_drop_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_queue_full_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_full_drop_total {}\n",
+        scheduler_metrics.queue_full_drop_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_pending_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_pending_total {}\n",
+        scheduler_metrics.pending_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_ready_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_ready_total {}\n",
+        scheduler_metrics.ready_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_blocked_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_blocked_total {}\n",
+        scheduler_metrics.blocked_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_sender_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_sender_total {}\n",
+        scheduler_metrics.sender_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_queue_depth gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_depth {}\n",
+        scheduler_metrics.queue_depth
+    ));
+    out.push_str("# TYPE mempulse_scheduler_handoff_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_handoff_queue_capacity {}\n",
+        scheduler_metrics.handoff_queue_capacity
     ));
     out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
     out.push_str(&format!(
@@ -2806,6 +2893,10 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider =
+            Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -2815,6 +2906,8 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
         }
     }
 
@@ -2824,6 +2917,10 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider =
+            Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -2833,6 +2930,55 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        }
+    }
+
+    fn sample_scheduler_tx(hash_seed: u8, nonce: u64) -> ValidatedTransaction {
+        ValidatedTransaction {
+            source_id: SourceId::new("rpc-mainnet"),
+            observed_at_unix_ms: 1_700_000_123_456,
+            observed_at_mono_ns: 999,
+            decoded: TxDecoded {
+                hash: [hash_seed; 32],
+                tx_type: 2,
+                sender: [hash_seed; 20],
+                nonce,
+                chain_id: Some(1),
+                to: Some([hash_seed.saturating_add(1); 20]),
+                value_wei: Some(42),
+                gas_limit: Some(21_000),
+                gas_price_wei: None,
+                max_fee_per_gas_wei: Some(101),
+                max_priority_fee_per_gas_wei: Some(3),
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(4),
+            },
+        }
+    }
+
+    fn test_state_with_scheduler(
+        limit: usize,
+        scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
+        scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
+    ) -> AppState {
+        let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        AppState {
+            provider: Arc::new(MockProvider),
+            downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
         }
     }
 
@@ -2913,6 +3059,49 @@ mod tests {
         assert!(payload.contains("mempulse_replay_lag_events"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
         assert!(payload.contains("mempulse_relay_success_rate"));
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_includes_scheduler_series() {
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(|| SchedulerMetrics {
+            admitted_total: 7,
+            duplicate_total: 2,
+            replacement_total: 1,
+            underpriced_replacement_total: 3,
+            sender_limit_drop_total: 4,
+            queue_full_drop_total: 5,
+            pending_total: 6,
+            ready_total: 4,
+            blocked_total: 2,
+            sender_total: 3,
+            queue_depth: 9,
+            handoff_queue_capacity: 128,
+        })
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_scheduler_admitted_total 7"));
+        assert!(payload.contains("mempulse_scheduler_duplicate_total 2"));
+        assert!(payload.contains("mempulse_scheduler_queue_depth 9"));
     }
 
     #[tokio::test]
@@ -3423,6 +3612,92 @@ mod tests {
         let payload: RelayDryRunStatus = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.total_submissions, 0);
         assert!(payload.latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_snapshot_route_returns_scheduler_state() {
+        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+        scheduler
+            .admit(sample_scheduler_tx(0x51, 7))
+            .await
+            .expect("scheduler admit");
+        let scheduler_for_snapshot = scheduler.clone();
+        let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(move || scheduler.metrics())
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/scheduler/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SchedulerSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.pending.len(), 1);
+        assert_eq!(payload.ready.len(), 1);
+        assert_eq!(payload.blocked.len(), 0);
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduler_metrics_route_returns_scheduler_metrics() {
+        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+        scheduler
+            .admit(sample_scheduler_tx(0x61, 9))
+            .await
+            .expect("first scheduler admit");
+        scheduler
+            .admit(sample_scheduler_tx(0x61, 9))
+            .await
+            .expect("duplicate scheduler admit");
+
+        let scheduler_for_snapshot = scheduler.clone();
+        let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(move || scheduler.metrics())
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/scheduler/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SchedulerMetrics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.admitted_total, 1);
+        assert_eq!(payload.duplicate_total, 1);
+        assert_eq!(payload.pending_total, 1);
+        assert_eq!(payload.ready_total, 1);
+
+        runtime_task.abort();
     }
 
     #[tokio::test]
