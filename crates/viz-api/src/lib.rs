@@ -19,9 +19,9 @@ use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
-    live_rpc_simulation_metrics_snapshot, live_rpc_simulation_status_snapshot,
     live_rpc_chain_status_snapshot, live_rpc_drop_metrics_snapshot,
-    live_rpc_searcher_metrics_snapshot,
+    live_rpc_searcher_metrics_snapshot, live_rpc_simulation_metrics_snapshot,
+    live_rpc_simulation_status_snapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
@@ -921,7 +921,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
-        let hash = parse_fixed_hex::<32>(hash)?;
+        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
             let seen = storage
                 .tx_seen()
@@ -1371,11 +1371,7 @@ fn current_mono_ns() -> u64 {
 }
 
 fn format_bytes(bytes: &[u8]) -> String {
-    let mut out = String::from("0x");
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    live_rpc::format_fixed_hex(bytes)
 }
 
 fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
@@ -1438,30 +1434,6 @@ fn parse_event_type_filters(raw: Option<&str>) -> Vec<String> {
     filters.sort_unstable();
     filters.dedup();
     filters
-}
-
-fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    let bytes = parse_hex_bytes(value)?;
-    if bytes.len() != N {
-        return None;
-    }
-    let mut out = [0_u8; N];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
-fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    let trimmed = value.strip_prefix("0x").unwrap_or(value);
-    if trimmed.is_empty() {
-        return Some(Vec::new());
-    }
-    if !trimmed.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&trimmed[index..index + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()
 }
 
 pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
@@ -2245,10 +2217,7 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         sim_metrics.cache_miss_total
     ));
     out.push_str("# TYPE mempulse_sim_tx_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_tx_total {}\n",
-        sim_metrics.tx_total
-    ));
+    out.push_str(&format!("mempulse_sim_tx_total {}\n", sim_metrics.tx_total));
     out.push_str("# TYPE mempulse_sim_fail_total counter\n");
     out.push_str(&format!(
         "mempulse_sim_fail_total{{category=\"revert\"}} {}\n",
@@ -4255,17 +4224,19 @@ mod tests {
     async fn sim_route_prefers_live_rpc_simulation_status_when_present() {
         let _guard = live_rpc_state_test_guard();
         crate::live_rpc::reset_live_rpc_simulation_runtime_state();
-        crate::live_rpc::seed_live_rpc_simulation_status(crate::live_rpc::LiveRpcSimulationStatusSnapshot {
-            id: "sim-local-1".to_owned(),
-            bundle_id: "bundle-local-1".to_owned(),
-            status: "ok".to_owned(),
-            relay_url: "not_submitted".to_owned(),
-            attempt_count: 0,
-            accepted: true,
-            fail_category: None,
-            started_unix_ms: 1_700_000_123_000,
-            finished_unix_ms: 1_700_000_123_111,
-        });
+        crate::live_rpc::seed_live_rpc_simulation_status(
+            crate::live_rpc::LiveRpcSimulationStatusSnapshot {
+                id: "sim-local-1".to_owned(),
+                bundle_id: "bundle-local-1".to_owned(),
+                status: "ok".to_owned(),
+                relay_url: "not_submitted".to_owned(),
+                attempt_count: 0,
+                accepted: true,
+                fail_category: None,
+                started_unix_ms: 1_700_000_123_000,
+                finished_unix_ms: 1_700_000_123_111,
+            },
+        );
         let app = build_router(test_state_with_relay(100, seeded_relay_status()));
 
         let response = app

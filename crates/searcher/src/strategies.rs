@@ -21,7 +21,6 @@ pub const BACKRUN_STRATEGY_VERSION: &str = "strategy.backrun.v1";
 pub const ARB_STRATEGY_VERSION: &str = "strategy.arb.v1";
 pub const BUNDLE_STRATEGY_VERSION: &str = "strategy.bundle.v1";
 
-#[inline]
 pub const fn strategy_version(kind: StrategyKind) -> &'static str {
     match kind {
         StrategyKind::SandwichCandidate => SANDWICH_STRATEGY_VERSION,

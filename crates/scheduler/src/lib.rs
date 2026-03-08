@@ -603,20 +603,9 @@ impl SchedulerState {
                 let Some(tx) = self.pending.get(hash) else {
                     continue;
                 };
-
-                match next_executable_nonce {
-                    None => {
-                        ready.push(tx.clone());
-                        next_executable_nonce = nonce.checked_add(1);
-                    }
-                    Some(expected) if !gap_seen && *nonce == expected => {
-                        ready.push(tx.clone());
-                        next_executable_nonce = nonce.checked_add(1);
-                    }
-                    Some(_) => {
-                        gap_seen = true;
-                        blocked.push(tx.clone());
-                    }
+                match queue_entry_state(&mut next_executable_nonce, &mut gap_seen, *nonce) {
+                    SchedulerQueueState::Ready => ready.push(tx.clone()),
+                    SchedulerQueueState::Blocked { .. } => blocked.push(tx.clone()),
                 }
             }
         }
@@ -635,19 +624,11 @@ impl SchedulerState {
                 if !self.pending.contains_key(hash) {
                     continue;
                 }
-
-                match next_executable_nonce {
-                    None => {
-                        frontier.push(*hash);
-                        next_executable_nonce = nonce.checked_add(1);
-                    }
-                    Some(expected) if !gap_seen && *nonce == expected => {
-                        frontier.push(*hash);
-                        next_executable_nonce = nonce.checked_add(1);
-                    }
-                    Some(_) => {
-                        gap_seen = true;
-                    }
+                if matches!(
+                    queue_entry_state(&mut next_executable_nonce, &mut gap_seen, *nonce),
+                    SchedulerQueueState::Ready
+                ) {
+                    frontier.push(*hash);
                 }
             }
         }
@@ -724,24 +705,7 @@ impl SchedulerState {
             if !self.pending.contains_key(hash) {
                 continue;
             }
-
-            let state = match next_executable_nonce {
-                None => {
-                    next_executable_nonce = nonce.checked_add(1);
-                    SchedulerQueueState::Ready
-                }
-                Some(expected) if !gap_seen && *nonce == expected => {
-                    next_executable_nonce = nonce.checked_add(1);
-                    SchedulerQueueState::Ready
-                }
-                Some(expected) => {
-                    gap_seen = true;
-                    SchedulerQueueState::Blocked {
-                        expected_nonce: expected,
-                    }
-                }
-            };
-
+            let state = queue_entry_state(&mut next_executable_nonce, &mut gap_seen, *nonce);
             positions.push(SenderQueuePosition {
                 hash: *hash,
                 nonce: *nonce,
@@ -786,24 +750,39 @@ impl SchedulerState {
             if !self.pending.contains_key(hash) {
                 continue;
             }
-
-            match next_executable_nonce {
-                None => {
-                    ready = ready.saturating_add(1);
-                    next_executable_nonce = nonce.checked_add(1);
-                }
-                Some(expected) if !gap_seen && *nonce == expected => {
-                    ready = ready.saturating_add(1);
-                    next_executable_nonce = nonce.checked_add(1);
-                }
-                Some(_) => {
-                    gap_seen = true;
-                    blocked = blocked.saturating_add(1);
-                }
+            match queue_entry_state(&mut next_executable_nonce, &mut gap_seen, *nonce) {
+                SchedulerQueueState::Ready => ready = ready.saturating_add(1),
+                SchedulerQueueState::Blocked { .. } => blocked = blocked.saturating_add(1),
             }
         }
 
         SenderQueueCounts { ready, blocked }
+    }
+}
+
+/// Advances the nonce-gap state machine for one queue entry and returns whether
+/// the entry is Ready or Blocked. Called from every queue traversal to avoid
+/// duplicating the identical three-arm match.
+fn queue_entry_state(
+    next_executable_nonce: &mut Option<u64>,
+    gap_seen: &mut bool,
+    nonce: u64,
+) -> SchedulerQueueState {
+    match *next_executable_nonce {
+        None => {
+            *next_executable_nonce = nonce.checked_add(1);
+            SchedulerQueueState::Ready
+        }
+        Some(expected) if !*gap_seen && nonce == expected => {
+            *next_executable_nonce = nonce.checked_add(1);
+            SchedulerQueueState::Ready
+        }
+        Some(expected) => {
+            *gap_seen = true;
+            SchedulerQueueState::Blocked {
+                expected_nonce: expected,
+            }
+        }
     }
 }
 

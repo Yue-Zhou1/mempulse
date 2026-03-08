@@ -17,6 +17,10 @@ use scheduler::{
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
+use sim_engine::{
+    AccountSeed, ChainContext, SimulationFailCategory, SimulationMode, SimulationTxInput,
+    StateProvider, simulate_with_mode,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
@@ -27,10 +31,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, StorageTryEnqueueError, StorageWriteHandle,
     StorageWriteOp, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
-};
-use sim_engine::{
-    AccountSeed, ChainContext, SimulationFailCategory, SimulationMode, SimulationTxInput,
-    StateProvider, simulate_with_mode,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_tungstenite::connect_async;
@@ -532,8 +532,7 @@ impl LiveRpcSimulationMetrics {
         fail_category: Option<&str>,
     ) {
         self.completed_total.fetch_add(1, Ordering::Relaxed);
-        self.tx_total
-            .fetch_add(tx_count as u64, Ordering::Relaxed);
+        self.tx_total.fetch_add(tx_count as u64, Ordering::Relaxed);
         self.last_latency_ms.store(latency_ms, Ordering::Relaxed);
         self.max_latency_ms.fetch_max(latency_ms, Ordering::Relaxed);
         self.total_latency_ms
@@ -648,7 +647,10 @@ impl LiveRpcSimulationServiceState {
     }
 
     fn replace_membership(&mut self, task_key: &str, members: &[TxHash]) {
-        if let Some(previous) = self.task_members.insert(task_key.to_owned(), members.to_vec()) {
+        if let Some(previous) = self
+            .task_members
+            .insert(task_key.to_owned(), members.to_vec())
+        {
             for member in previous {
                 if let Some(keys) = self.tasks_by_member.get_mut(&member) {
                     keys.remove(task_key);
@@ -668,7 +670,8 @@ impl LiveRpcSimulationServiceState {
     }
 
     fn commit_enqueue(&mut self, task_key: &str, generation: u64, members: &[TxHash]) {
-        self.task_generations.insert(task_key.to_owned(), generation);
+        self.task_generations
+            .insert(task_key.to_owned(), generation);
         self.replace_membership(task_key, members);
     }
 
@@ -683,7 +686,8 @@ impl LiveRpcSimulationServiceState {
 
         for task_key in task_keys {
             let next_generation = self.current_generation(&task_key).saturating_add(1).max(1);
-            self.task_generations.insert(task_key.clone(), next_generation);
+            self.task_generations
+                .insert(task_key.clone(), next_generation);
 
             if let Some(previous_members) = self.task_members.remove(&task_key) {
                 for member in previous_members {
@@ -907,8 +911,8 @@ async fn run_simulation_worker(
         }
 
         let started_unix_ms = current_unix_ms();
-        let outcome = simulate_remote_request(simulation_http_client(), &task.chain, &task.request)
-            .await;
+        let outcome =
+            simulate_remote_request(simulation_http_client(), &task.chain, &task.request).await;
         let finished_unix_ms = current_unix_ms();
 
         let still_current = {
@@ -923,9 +927,12 @@ async fn run_simulation_worker(
 
         match outcome {
             Ok(outcome) => {
-                if let Err(err) =
-                    apply_simulation_task_outcome(&task, &outcome, started_unix_ms, finished_unix_ms)
-                {
+                if let Err(err) = apply_simulation_task_outcome(
+                    &task,
+                    &outcome,
+                    started_unix_ms,
+                    finished_unix_ms,
+                ) {
                     tracing::warn!(
                         error = %err,
                         chain_key = %task.chain.chain_key,
@@ -1372,26 +1379,11 @@ impl Default for LiveRpcConfig {
 
 impl LiveRpcConfig {
     pub fn from_env() -> Result<Self> {
-        let chains_override = std::env::var(ENV_CHAINS)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let ws_override = std::env::var(ENV_ETH_WS_URL)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let http_override = std::env::var(ENV_ETH_HTTP_URL)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let source_id_override = std::env::var(ENV_SOURCE_ID)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
-        let max_seen_hashes = std::env::var(ENV_MAX_SEEN_HASHES)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
+        let chains_override = read_env_trimmed(ENV_CHAINS);
+        let ws_override = read_env_trimmed(ENV_ETH_WS_URL);
+        let http_override = read_env_trimmed(ENV_ETH_HTTP_URL);
+        let source_id_override = read_env_trimmed(ENV_SOURCE_ID);
+        let max_seen_hashes = read_env_trimmed(ENV_MAX_SEEN_HASHES)
             .map(|value| value.parse::<usize>())
             .transpose()
             .map_err(|err| anyhow!("invalid {ENV_MAX_SEEN_HASHES}: {err}"))?
@@ -1546,21 +1538,22 @@ pub fn should_rotate_silent_chain(
     elapsed_ms_u64 >= timeout_ms
 }
 
-fn parse_env_usize(key: &str) -> Result<Option<usize>> {
+fn read_env_trimmed(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+fn parse_env_usize(key: &str) -> Result<Option<usize>> {
+    read_env_trimmed(key)
         .map(|value| value.parse::<usize>())
         .transpose()
         .map_err(|err| anyhow!("invalid {key}: {err}"))
 }
 
 fn parse_env_u64(key: &str) -> Result<Option<u64>> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+    read_env_trimmed(key)
         .map(|value| value.parse::<u64>())
         .transpose()
         .map_err(|err| anyhow!("invalid {key}: {err}"))
@@ -1575,11 +1568,7 @@ fn parse_env_chain_configs(raw: &str) -> Result<Vec<ChainRpcConfig>> {
 }
 
 fn load_chain_configs_from_file() -> Result<Option<Vec<ChainRpcConfig>>> {
-    if let Some(path_override) = std::env::var(ENV_CHAIN_CONFIG_PATH)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(path_override) = read_env_trimmed(ENV_CHAIN_CONFIG_PATH) {
         return Ok(Some(read_chain_configs_from_path(PathBuf::from(
             path_override,
         ))?));
@@ -3127,7 +3116,10 @@ fn build_remote_simulation_request(
         .filter(|tx| selected_hashes.contains(&tx.hash()))
         .cloned()
         .collect::<Vec<_>>();
-    let member_tx_hashes = txs.iter().map(ValidatedTransaction::hash).collect::<Vec<_>>();
+    let member_tx_hashes = txs
+        .iter()
+        .map(ValidatedTransaction::hash)
+        .collect::<Vec<_>>();
 
     Some(RemoteSimulationRequest {
         tx_hash: opportunity.record.tx_hash,
@@ -3178,7 +3170,11 @@ async fn simulate_remote_request(
                 calldata: Some(tx.calldata.clone()),
             })
             .collect::<Vec<_>>();
-        simulate_with_mode(&chain_context, &inputs, SimulationMode::RpcBacked(&provider))
+        simulate_with_mode(
+            &chain_context,
+            &inputs,
+            SimulationMode::RpcBacked(&provider),
+        )
     })
     .await;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -3332,7 +3328,9 @@ async fn fetch_remote_chain_context(
     if let Some(error) = response.error {
         return Err(anyhow!(
             "rpc header fetch failed: {}",
-            error.message.unwrap_or_else(|| "unknown rpc error".to_owned())
+            error
+                .message
+                .unwrap_or_else(|| "unknown rpc error".to_owned())
         ));
     }
     let header = response
@@ -3486,7 +3484,9 @@ async fn fetch_rpc_scalar(
     if let Some(error) = response.error {
         return Err(anyhow!(
             "rpc scalar fetch failed: {}",
-            error.message.unwrap_or_else(|| "unknown rpc error".to_owned())
+            error
+                .message
+                .unwrap_or_else(|| "unknown rpc error".to_owned())
         ));
     }
     response
@@ -3504,21 +3504,14 @@ impl StateProvider for CachedStateProviderView {
     }
 }
 
-async fn fetch_transaction_by_hash(
+async fn rpc_post_bytes(
     client: &reqwest::Client,
     http_url: &str,
-    hash_hex: &str,
-) -> Result<Option<LiveTx>> {
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": 42,
-        "method": "eth_getTransactionByHash",
-        "params": [hash_hex],
-    });
-
-    let response_bytes = client
+    body: &serde_json::Value,
+) -> Result<Vec<u8>> {
+    let bytes = client
         .post(http_url)
-        .json(&request_body)
+        .json(body)
         .send()
         .await
         .with_context(|| format!("POST {http_url}"))?
@@ -3527,7 +3520,21 @@ async fn fetch_transaction_by_hash(
         .bytes()
         .await
         .context("read rpc response bytes")?;
+    Ok(bytes.to_vec())
+}
 
+async fn fetch_transaction_by_hash(
+    client: &reqwest::Client,
+    http_url: &str,
+    hash_hex: &str,
+) -> Result<Option<LiveTx>> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "eth_getTransactionByHash",
+        "params": [hash_hex],
+    });
+    let response_bytes = rpc_post_bytes(client, http_url, &body).await?;
     decode_transaction_fetch_response_to_live_tx(response_bytes.as_ref(), hash_hex)
 }
 
@@ -3535,25 +3542,13 @@ async fn fetch_pending_block_transactions(
     client: &reqwest::Client,
     http_url: &str,
 ) -> Result<Vec<LiveTx>> {
-    let request_body = json!({
+    let body = json!({
         "jsonrpc": "2.0",
         "id": 43,
         "method": "eth_getBlockByNumber",
         "params": ["pending", true],
     });
-
-    let response_bytes = client
-        .post(http_url)
-        .json(&request_body)
-        .send()
-        .await
-        .with_context(|| format!("POST {http_url}"))?
-        .error_for_status()
-        .context("rpc http status error")?
-        .bytes()
-        .await
-        .context("read pending block response bytes")?;
-
+    let response_bytes = rpc_post_bytes(client, http_url, &body).await?;
     decode_pending_block_response_to_live_txs(response_bytes.as_ref())
 }
 
@@ -3617,18 +3612,8 @@ async fn fetch_transactions_by_hash_batch(
         })
         .collect::<Vec<_>>();
 
-    let response_bytes = client
-        .post(http_url)
-        .json(&request_body)
-        .send()
-        .await
-        .with_context(|| format!("POST {http_url}"))?
-        .error_for_status()
-        .context("rpc http status error")?
-        .bytes()
-        .await
-        .context("read rpc batch response bytes")?;
-
+    let response_bytes =
+        rpc_post_bytes(client, http_url, &serde_json::Value::Array(request_body)).await?;
     decode_transaction_fetch_batch_response_to_live_txs(response_bytes.as_ref(), hashes)
 }
 
@@ -3881,7 +3866,7 @@ fn rpc_tx_to_live_tx(tx: RpcTransaction, hash_hex: &str) -> Result<LiveTx> {
     })
 }
 
-fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+pub(crate) fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     let bytes = parse_hex_bytes(value)?;
     if bytes.len() != N {
         return None;
@@ -3891,7 +3876,7 @@ fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
     let trimmed = value.strip_prefix("0x").unwrap_or(value);
     if trimmed.is_empty() {
         return Some(Vec::new());
@@ -3932,7 +3917,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
     rendered
 }
 
-fn format_fixed_hex(bytes: &[u8]) -> String {
+pub(crate) fn format_fixed_hex(bytes: &[u8]) -> String {
     let mut out = String::from("0x");
     out.reserve(bytes.len().saturating_mul(2));
     for byte in bytes {
@@ -4033,7 +4018,11 @@ mod tests {
 
     async fn start_mock_simulation_rpc(
         state: MockSimulationRpcState,
-    ) -> (MockSimulationRpcState, SocketAddr, tokio::task::JoinHandle<()>) {
+    ) -> (
+        MockSimulationRpcState,
+        SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
         let app = Router::new()
             .route("/", post(mock_simulation_rpc))
             .with_state(state.clone());
@@ -4561,13 +4550,15 @@ mod tests {
 
         let sim_count = ops
             .iter()
-            .filter(|op| matches!(
-                op,
-                StorageWriteOp::AppendPayload {
-                    payload: EventPayload::SimCompleted(sim),
-                    ..
-                } if sim.hash == tx.hash
-            ))
+            .filter(|op| {
+                matches!(
+                    op,
+                    StorageWriteOp::AppendPayload {
+                        payload: EventPayload::SimCompleted(sim),
+                        ..
+                    } if sim.hash == tx.hash
+                )
+            })
             .count() as u64;
         let metrics = live_rpc_simulation_metrics_snapshot();
         assert!(sim_count >= 1);

@@ -121,16 +121,12 @@ impl MempoolState {
         let mut state = Self::from_pending_hashes(pending_hashes);
         for queue in sender_queues {
             for entry in &queue.queued {
-                let tx_entry = state.txs.entry(entry.hash).or_insert(TxEntry {
+                state.txs.entry(entry.hash).or_insert(TxEntry {
                     sender: Some(queue.sender),
                     nonce: Some(entry.nonce),
                     status: TxLifecycleStatus::Pending,
                     queue_state: Some(entry.state),
                 });
-                tx_entry.sender = Some(queue.sender);
-                tx_entry.nonce = Some(entry.nonce);
-                tx_entry.status = TxLifecycleStatus::Pending;
-                tx_entry.queue_state = Some(entry.state);
                 state
                     .sender_queues
                     .entry(queue.sender)

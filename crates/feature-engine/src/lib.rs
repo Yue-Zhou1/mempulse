@@ -6,7 +6,6 @@ use registry::ProtocolRegistry;
 
 pub const FEATURE_ENGINE_VERSION: &str = "feature-engine.v1";
 
-#[inline]
 pub const fn version() -> &'static str {
     FEATURE_ENGINE_VERSION
 }

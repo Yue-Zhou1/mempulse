@@ -1,8 +1,8 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
 use searcher::{
-    SearcherConfig, SearcherInputTx, rank_opportunities, rank_opportunity_batch, scorer_version,
-    strategy_version,
+    SearcherConfig, SearcherInputTx, StrategyKind, rank_opportunities, rank_opportunity_batch,
+    scorer_version, strategy_version,
 };
 
 fn hash(v: u8) -> TxHash {
@@ -132,7 +132,7 @@ fn ranked_batch_reports_bounded_metrics_and_bundle_attribution() {
     let bundle = result
         .candidates
         .iter()
-        .find(|candidate| format!("{:?}", candidate.strategy) == "BundleCandidate")
+        .find(|candidate| candidate.strategy == StrategyKind::BundleCandidate)
         .expect("bundle candidate included in bounded result");
     assert_eq!(bundle.member_tx_hashes, vec![hash(0x70), hash(0x71)]);
 
