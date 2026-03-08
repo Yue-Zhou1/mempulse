@@ -19,6 +19,7 @@ fn sample_validated_tx(
         source_id: SourceId::new(source),
         observed_at_unix_ms,
         observed_at_mono_ns,
+        calldata: vec![hash_seed; 4],
         decoded: TxDecoded {
             hash: [hash_seed; 32],
             tx_type: 2,
@@ -138,4 +139,42 @@ async fn scheduler_persisted_snapshot_captures_frontier_and_rehydrates_state() {
     assert_eq!(after.sender_queues, before.sender_queues);
 
     restored_runtime_task.abort();
+}
+
+#[tokio::test]
+async fn scheduler_get_pending_transactions_returns_requested_hashes_in_input_order() {
+    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let runtime_task = tokio::spawn(runtime.run());
+
+    let sender_a = sender(0xa1);
+    let sender_b = sender(0xb2);
+    let ready = sample_validated_tx(10, sender_a, 7, 100, "rpc-mainnet", 1_700_000_000_010, 10);
+    let blocked = sample_validated_tx(11, sender_a, 9, 100, "rpc-mainnet", 1_700_000_000_011, 11);
+    let other_sender =
+        sample_validated_tx(12, sender_b, 4, 100, "rpc-mainnet", 1_700_000_000_012, 12);
+
+    handle.try_admit(ready.clone()).expect("enqueue ready tx");
+    handle
+        .try_admit(blocked.clone())
+        .expect("enqueue blocked tx");
+    handle
+        .try_admit(other_sender.clone())
+        .expect("enqueue second sender tx");
+
+    wait_for(|| {
+        let metrics = handle.metrics();
+        metrics.pending_total == 3
+    })
+    .await;
+
+    let pending = handle.get_pending_transactions(&[
+        other_sender.hash(),
+        [0xff; 32],
+        ready.hash(),
+        ready.hash(),
+    ]);
+
+    assert_eq!(pending, vec![other_sender, ready.clone(), ready]);
+
+    runtime_task.abort();
 }

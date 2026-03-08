@@ -13,6 +13,8 @@ pub struct ValidatedTransaction {
     pub source_id: SourceId,
     pub observed_at_unix_ms: i64,
     pub observed_at_mono_ns: u64,
+    #[serde(default)]
+    pub calldata: Vec<u8>,
     pub decoded: TxDecoded,
 }
 
@@ -192,6 +194,15 @@ impl SchedulerHandle {
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
         state.snapshot()
+    }
+
+    pub fn get_pending_transactions(&self, hashes: &[TxHash]) -> Vec<ValidatedTransaction> {
+        let state = self
+            .shared
+            .state
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.pending_transactions(hashes)
     }
 
     pub fn persisted_snapshot(
@@ -421,6 +432,13 @@ impl SchedulerState {
             blocked: classification.blocked,
             sender_queues: self.sender_queue_snapshots(),
         }
+    }
+
+    fn pending_transactions(&self, hashes: &[TxHash]) -> Vec<ValidatedTransaction> {
+        hashes
+            .iter()
+            .filter_map(|hash| self.pending.get(hash).cloned())
+            .collect()
     }
 
     fn persisted_snapshot(

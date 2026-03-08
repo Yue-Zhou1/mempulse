@@ -15,6 +15,7 @@ fn sample_validated_tx(hash_seed: u8, sender: Address, nonce: u64) -> ValidatedT
         source_id: SourceId::new("rpc-mainnet"),
         observed_at_unix_ms: 1_700_000_000_000 + hash_seed as i64,
         observed_at_mono_ns: hash_seed as u64,
+        calldata: vec![hash_seed; 4],
         decoded: TxDecoded {
             hash: [hash_seed; 32],
             tx_type: 2,

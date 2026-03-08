@@ -84,3 +84,66 @@ fn opportunity_scoring_is_deterministic_and_prunes() {
     assert_eq!(ranked_a[0].strategy, StrategyKind::SandwichCandidate);
     assert_eq!(ranked_a[0].tx_hash, hash(0x10));
 }
+
+#[test]
+fn contiguous_same_sender_swaps_produce_a_bundle_candidate() {
+    let uniswap_v2 = [
+        0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac, 0xb4,
+        0xc6, 0x59, 0xf2, 0x48, 0x8d,
+    ];
+    let sender = address(0xaa);
+    let batch = vec![
+        SearcherInputTx::owned(
+            TxDecoded {
+                hash: hash(0x40),
+                tx_type: 2,
+                sender,
+                nonce: 7,
+                chain_id: Some(1),
+                to: Some(uniswap_v2),
+                value_wei: Some(1_000_000_000_000_000),
+                gas_limit: Some(320_000),
+                gas_price_wei: None,
+                max_fee_per_gas_wei: Some(45_000_000_000),
+                max_priority_fee_per_gas_wei: Some(7_000_000_000),
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(256),
+            },
+            vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4, 5, 6, 7, 8],
+        ),
+        SearcherInputTx::owned(
+            TxDecoded {
+                hash: hash(0x41),
+                tx_type: 2,
+                sender,
+                nonce: 8,
+                chain_id: Some(1),
+                to: Some(uniswap_v2),
+                value_wei: Some(1_500_000_000_000_000),
+                gas_limit: Some(330_000),
+                gas_price_wei: None,
+                max_fee_per_gas_wei: Some(46_000_000_000),
+                max_priority_fee_per_gas_wei: Some(8_000_000_000),
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(264),
+            },
+            vec![0x38, 0xed, 0x17, 0x39, 8, 7, 6, 5, 4, 3, 2, 1],
+        ),
+    ];
+
+    let ranked = rank_opportunities(
+        &batch,
+        SearcherConfig {
+            min_score: 0,
+            max_candidates: 8,
+        },
+    );
+
+    assert!(ranked.iter().any(|candidate| {
+        format!("{:?}", candidate.strategy) == "BundleCandidate"
+            && candidate
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("bundle"))
+    }));
+}

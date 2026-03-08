@@ -19,6 +19,7 @@ fn sample_validated_tx(
         source_id: SourceId::new(source),
         observed_at_unix_ms,
         observed_at_mono_ns,
+        calldata: vec![hash_seed; 4],
         decoded: TxDecoded {
             hash: [hash_seed; 32],
             tx_type: 2,

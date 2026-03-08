@@ -6,7 +6,9 @@ use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use tower::util::ServiceExt;
-use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
+use viz_api::live_rpc::{
+    LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+};
 use viz_api::{
     AppState, DashboardCacheMetrics, MarketStats, ReplayPoint, TransactionDetail,
     TransactionSummary, VizDataProvider, build_router,
@@ -109,6 +111,7 @@ fn auth_state() -> AppState {
         api_auth,
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     }

@@ -14,10 +14,10 @@ use scheduler::{
     SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, SchedulerQueueState,
     SchedulerQueueTransition, ValidatedTransaction,
 };
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
+use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -79,11 +79,51 @@ pub struct LiveRpcDropMetricsSnapshot {
     pub invalid_pending_hash: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveRpcSearcherMetricsSnapshot {
+    pub executable_batches_total: u64,
+    pub executable_candidates_total: u64,
+    pub executable_bundle_candidates_total: u64,
+    pub max_executable_candidates_in_batch: u64,
+    pub legacy_shadow_batches_total: u64,
+    pub legacy_shadow_candidates_total: u64,
+    pub max_legacy_shadow_candidates_in_batch: u64,
+    pub comparison_batches_total: u64,
+    pub executable_top_score_total: u64,
+    pub legacy_top_score_total: u64,
+    pub executable_top_score_wins_total: u64,
+    pub legacy_top_score_wins_total: u64,
+    pub top_score_ties_total: u64,
+    pub overlapping_candidates_total: u64,
+    pub executable_only_candidates_total: u64,
+    pub legacy_only_candidates_total: u64,
+}
+
 #[derive(Debug, Default)]
 struct LiveRpcDropMetrics {
     storage_queue_full: AtomicU64,
     storage_queue_closed: AtomicU64,
     invalid_pending_hash: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct LiveRpcSearcherMetrics {
+    executable_batches_total: AtomicU64,
+    executable_candidates_total: AtomicU64,
+    executable_bundle_candidates_total: AtomicU64,
+    max_executable_candidates_in_batch: AtomicU64,
+    legacy_shadow_batches_total: AtomicU64,
+    legacy_shadow_candidates_total: AtomicU64,
+    max_legacy_shadow_candidates_in_batch: AtomicU64,
+    comparison_batches_total: AtomicU64,
+    executable_top_score_total: AtomicU64,
+    legacy_top_score_total: AtomicU64,
+    executable_top_score_wins_total: AtomicU64,
+    legacy_top_score_wins_total: AtomicU64,
+    top_score_ties_total: AtomicU64,
+    overlapping_candidates_total: AtomicU64,
+    executable_only_candidates_total: AtomicU64,
+    legacy_only_candidates_total: AtomicU64,
 }
 
 impl LiveRpcDropMetrics {
@@ -116,12 +156,153 @@ impl LiveRpcDropMetrics {
     }
 }
 
+impl LiveRpcSearcherMetrics {
+    fn observe_batch(&self, executable: &[OpportunityRecord], legacy_shadow: &[OpportunityRecord]) {
+        let executable_count = executable.len() as u64;
+        let legacy_count = legacy_shadow.len() as u64;
+
+        self.executable_batches_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.executable_candidates_total
+            .fetch_add(executable_count, Ordering::Relaxed);
+        self.executable_bundle_candidates_total.fetch_add(
+            executable
+                .iter()
+                .filter(|candidate| candidate.strategy == "BundleCandidate")
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        self.max_executable_candidates_in_batch
+            .fetch_max(executable_count, Ordering::Relaxed);
+
+        self.legacy_shadow_batches_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.legacy_shadow_candidates_total
+            .fetch_add(legacy_count, Ordering::Relaxed);
+        self.max_legacy_shadow_candidates_in_batch
+            .fetch_max(legacy_count, Ordering::Relaxed);
+
+        self.comparison_batches_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let executable_top_score = executable
+            .first()
+            .map_or(0, |candidate| candidate.score as u64);
+        let legacy_top_score = legacy_shadow
+            .first()
+            .map_or(0, |candidate| candidate.score as u64);
+        self.executable_top_score_total
+            .fetch_add(executable_top_score, Ordering::Relaxed);
+        self.legacy_top_score_total
+            .fetch_add(legacy_top_score, Ordering::Relaxed);
+
+        match executable_top_score.cmp(&legacy_top_score) {
+            std::cmp::Ordering::Greater => {
+                self.executable_top_score_wins_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Less => {
+                self.legacy_top_score_wins_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Equal => {
+                self.top_score_ties_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let executable_keys = executable
+            .iter()
+            .map(opportunity_identity)
+            .collect::<BTreeSet<_>>();
+        let legacy_keys = legacy_shadow
+            .iter()
+            .map(opportunity_identity)
+            .collect::<BTreeSet<_>>();
+        let overlapping = executable_keys.intersection(&legacy_keys).count() as u64;
+        let executable_only = executable_keys.difference(&legacy_keys).count() as u64;
+        let legacy_only = legacy_keys.difference(&executable_keys).count() as u64;
+
+        self.overlapping_candidates_total
+            .fetch_add(overlapping, Ordering::Relaxed);
+        self.executable_only_candidates_total
+            .fetch_add(executable_only, Ordering::Relaxed);
+        self.legacy_only_candidates_total
+            .fetch_add(legacy_only, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        self.executable_batches_total.store(0, Ordering::Relaxed);
+        self.executable_candidates_total.store(0, Ordering::Relaxed);
+        self.executable_bundle_candidates_total
+            .store(0, Ordering::Relaxed);
+        self.max_executable_candidates_in_batch
+            .store(0, Ordering::Relaxed);
+        self.legacy_shadow_batches_total.store(0, Ordering::Relaxed);
+        self.legacy_shadow_candidates_total
+            .store(0, Ordering::Relaxed);
+        self.max_legacy_shadow_candidates_in_batch
+            .store(0, Ordering::Relaxed);
+        self.comparison_batches_total.store(0, Ordering::Relaxed);
+        self.executable_top_score_total.store(0, Ordering::Relaxed);
+        self.legacy_top_score_total.store(0, Ordering::Relaxed);
+        self.executable_top_score_wins_total
+            .store(0, Ordering::Relaxed);
+        self.legacy_top_score_wins_total.store(0, Ordering::Relaxed);
+        self.top_score_ties_total.store(0, Ordering::Relaxed);
+        self.overlapping_candidates_total
+            .store(0, Ordering::Relaxed);
+        self.executable_only_candidates_total
+            .store(0, Ordering::Relaxed);
+        self.legacy_only_candidates_total
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LiveRpcSearcherMetricsSnapshot {
+        LiveRpcSearcherMetricsSnapshot {
+            executable_batches_total: self.executable_batches_total.load(Ordering::Relaxed),
+            executable_candidates_total: self.executable_candidates_total.load(Ordering::Relaxed),
+            executable_bundle_candidates_total: self
+                .executable_bundle_candidates_total
+                .load(Ordering::Relaxed),
+            max_executable_candidates_in_batch: self
+                .max_executable_candidates_in_batch
+                .load(Ordering::Relaxed),
+            legacy_shadow_batches_total: self.legacy_shadow_batches_total.load(Ordering::Relaxed),
+            legacy_shadow_candidates_total: self
+                .legacy_shadow_candidates_total
+                .load(Ordering::Relaxed),
+            max_legacy_shadow_candidates_in_batch: self
+                .max_legacy_shadow_candidates_in_batch
+                .load(Ordering::Relaxed),
+            comparison_batches_total: self.comparison_batches_total.load(Ordering::Relaxed),
+            executable_top_score_total: self.executable_top_score_total.load(Ordering::Relaxed),
+            legacy_top_score_total: self.legacy_top_score_total.load(Ordering::Relaxed),
+            executable_top_score_wins_total: self
+                .executable_top_score_wins_total
+                .load(Ordering::Relaxed),
+            legacy_top_score_wins_total: self.legacy_top_score_wins_total.load(Ordering::Relaxed),
+            top_score_ties_total: self.top_score_ties_total.load(Ordering::Relaxed),
+            overlapping_candidates_total: self.overlapping_candidates_total.load(Ordering::Relaxed),
+            executable_only_candidates_total: self
+                .executable_only_candidates_total
+                .load(Ordering::Relaxed),
+            legacy_only_candidates_total: self.legacy_only_candidates_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
 static LIVE_RPC_DROP_METRICS: OnceLock<Arc<LiveRpcDropMetrics>> = OnceLock::new();
+static LIVE_RPC_SEARCHER_METRICS: OnceLock<Arc<LiveRpcSearcherMetrics>> = OnceLock::new();
 static LIVE_RPC_FEED_START_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_RPC_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 fn live_rpc_drop_metrics() -> &'static Arc<LiveRpcDropMetrics> {
     LIVE_RPC_DROP_METRICS.get_or_init(|| Arc::new(LiveRpcDropMetrics::default()))
+}
+
+fn live_rpc_searcher_metrics() -> &'static Arc<LiveRpcSearcherMetrics> {
+    LIVE_RPC_SEARCHER_METRICS.get_or_init(|| Arc::new(LiveRpcSearcherMetrics::default()))
 }
 
 pub fn live_rpc_drop_metrics_snapshot() -> LiveRpcDropMetricsSnapshot {
@@ -130,6 +311,15 @@ pub fn live_rpc_drop_metrics_snapshot() -> LiveRpcDropMetricsSnapshot {
 
 pub fn reset_live_rpc_drop_metrics() {
     live_rpc_drop_metrics().reset();
+}
+
+pub fn live_rpc_searcher_metrics_snapshot() -> LiveRpcSearcherMetricsSnapshot {
+    live_rpc_searcher_metrics().snapshot()
+}
+
+#[cfg(test)]
+fn reset_live_rpc_searcher_metrics() {
+    live_rpc_searcher_metrics().reset();
 }
 
 pub fn observe_live_rpc_drop_reason(reason: LiveRpcDropReason) {
@@ -1369,10 +1559,6 @@ impl SchedulerPersistenceDecision {
         self.is_admitted()
     }
 
-    fn generates_opportunities(self) -> bool {
-        self.is_admitted()
-    }
-
     fn replaced_hash(self) -> Option<TxHash> {
         match self {
             Self::Replaced { replaced_hash } => Some(replaced_hash),
@@ -1541,13 +1727,13 @@ async fn process_pending_hash_with_fetched_tx(
     if let Some(tx) = fetched_tx {
         let analysis = feature_analysis.unwrap_or(default_feature_analysis());
         let raw_tx = tx.input.clone();
-        let decoded = validated_transaction_from_live_tx(
+        let validated = validated_transaction_from_live_tx(
             chain,
             observation.observed_at_unix_ms,
             observation.observed_at_mono_ns,
             &tx,
-        )
-        .decoded;
+        );
+        let decoded = validated.decoded.clone();
         let (scheduler_decision, queue_transitions) =
             scheduler_result.expect("decision exists when tx exists");
 
@@ -1628,6 +1814,8 @@ async fn process_pending_hash_with_fetched_tx(
                 return Ok(());
             }
         }
+        let executable_transactions =
+            ready_transactions_for_queue_transitions(scheduler, &queue_transitions);
         for transition in queue_transitions {
             if !append_queue_transition_event(
                 writer,
@@ -1639,26 +1827,35 @@ async fn process_pending_hash_with_fetched_tx(
                 return Ok(());
             }
         }
-        if scheduler_decision.generates_opportunities() {
-            for opportunity in build_opportunity_records(
-                &decoded,
-                &raw_tx,
+        let executable_opportunities = build_executable_opportunity_records(
+            &executable_transactions,
+            processed_at_unix_ms,
+            resolved_chain_id,
+        );
+        if !executable_transactions.is_empty() {
+            let legacy_shadow_opportunities = build_legacy_comparison_opportunity_records(
+                &executable_transactions,
                 processed_at_unix_ms,
                 resolved_chain_id,
-            ) {
-                let payloads = build_rule_versioned_payloads(&opportunity);
-                for payload in payloads {
-                    if !append_event(writer, chain, next_seq_id, processed_at_unix_ms, payload)? {
-                        return Ok(());
-                    }
-                }
-                if !try_enqueue_storage_write(
-                    writer,
-                    chain,
-                    StorageWriteOp::UpsertOpportunity(opportunity),
-                )? {
+            );
+            if !executable_opportunities.is_empty() || !legacy_shadow_opportunities.is_empty() {
+                live_rpc_searcher_metrics()
+                    .observe_batch(&executable_opportunities, &legacy_shadow_opportunities);
+            }
+        }
+        for opportunity in executable_opportunities {
+            let payloads = build_rule_versioned_payloads(&opportunity);
+            for payload in payloads {
+                if !append_event(writer, chain, next_seq_id, processed_at_unix_ms, payload)? {
                     return Ok(());
                 }
+            }
+            if !try_enqueue_storage_write(
+                writer,
+                chain,
+                StorageWriteOp::UpsertOpportunity(opportunity),
+            )? {
+                return Ok(());
             }
         }
     }
@@ -1772,6 +1969,7 @@ fn validated_transaction_from_live_tx(
         source_id: chain.source_id.clone(),
         observed_at_unix_ms,
         observed_at_mono_ns,
+        calldata: tx.input.clone(),
         decoded: TxDecoded {
             hash: tx.hash,
             tx_type: tx.tx_type,
@@ -1933,7 +2131,7 @@ fn build_opportunity_records(
     detected_unix_ms: i64,
     chain_id: Option<u64>,
 ) -> Vec<OpportunityRecord> {
-    rank_opportunities(
+    rank_opportunity_batch(
         &[SearcherInputTx {
             decoded: decoded.clone(),
             calldata: calldata.to_vec().into(),
@@ -1943,6 +2141,7 @@ fn build_opportunity_records(
             max_candidates: SEARCHER_MAX_CANDIDATES,
         },
     )
+    .candidates
     .into_iter()
     .map(|candidate| OpportunityRecord {
         tx_hash: candidate.tx_hash,
@@ -1958,6 +2157,100 @@ fn build_opportunity_records(
         chain_id,
     })
     .collect()
+}
+
+fn build_legacy_comparison_opportunity_records(
+    executable: &[ValidatedTransaction],
+    detected_unix_ms: i64,
+    chain_id: Option<u64>,
+) -> Vec<OpportunityRecord> {
+    let mut candidates = executable
+        .iter()
+        .flat_map(|tx| {
+            build_opportunity_records(
+                &tx.decoded,
+                tx.calldata.as_slice(),
+                detected_unix_ms,
+                chain_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    sort_and_limit_opportunity_records(&mut candidates);
+    candidates
+}
+
+fn build_executable_opportunity_records(
+    executable: &[ValidatedTransaction],
+    detected_unix_ms: i64,
+    chain_id: Option<u64>,
+) -> Vec<OpportunityRecord> {
+    if executable.is_empty() {
+        return Vec::new();
+    }
+
+    let batch = executable
+        .iter()
+        .map(|tx| SearcherInputTx::borrowed(tx.decoded.clone(), tx.calldata.as_slice()))
+        .collect::<Vec<_>>();
+
+    rank_opportunity_batch(
+        &batch,
+        SearcherConfig {
+            min_score: SEARCHER_MIN_SCORE,
+            max_candidates: SEARCHER_MAX_CANDIDATES,
+        },
+    )
+    .candidates
+    .into_iter()
+    .map(|candidate| OpportunityRecord {
+        tx_hash: candidate.tx_hash,
+        strategy: format!("{:?}", candidate.strategy),
+        score: candidate.score,
+        protocol: candidate.protocol,
+        category: candidate.category,
+        feature_engine_version: candidate.feature_engine_version,
+        scorer_version: candidate.scorer_version,
+        strategy_version: candidate.strategy_version,
+        reasons: candidate.reasons,
+        detected_unix_ms,
+        chain_id,
+    })
+    .collect()
+}
+
+fn sort_and_limit_opportunity_records(candidates: &mut Vec<OpportunityRecord>) {
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.strategy.cmp(&right.strategy))
+            .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+    });
+    candidates.truncate(SEARCHER_MAX_CANDIDATES);
+}
+
+fn opportunity_identity(candidate: &OpportunityRecord) -> (TxHash, String) {
+    (candidate.tx_hash, candidate.strategy.clone())
+}
+
+fn ready_transactions_for_queue_transitions(
+    scheduler: &SchedulerHandle,
+    queue_transitions: &[SchedulerQueueTransition],
+) -> Vec<ValidatedTransaction> {
+    let mut ready_hashes = Vec::new();
+    let mut seen = FastSet::default();
+
+    for transition in queue_transitions {
+        if matches!(transition.state, SchedulerQueueState::Ready) && seen.insert(transition.hash) {
+            ready_hashes.push(transition.hash);
+        }
+    }
+
+    if ready_hashes.is_empty() {
+        return Vec::new();
+    }
+
+    scheduler.get_pending_transactions(&ready_hashes)
 }
 
 fn build_rule_versioned_payloads(opportunity: &OpportunityRecord) -> Vec<EventPayload> {
@@ -2485,6 +2778,16 @@ mod tests {
     use event_log::{TxBlocked, TxDropped, TxReady, TxReplaced};
     use serde_json::json;
 
+    static LIVE_RPC_TEST_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn live_rpc_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_RPC_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn test_chain() -> ChainRpcConfig {
         ChainRpcConfig {
             chain_key: "eth-mainnet".to_owned(),
@@ -2518,6 +2821,27 @@ mod tests {
             max_fee_per_blob_gas_wei: None,
             input: vec![0xaa, 0xbb, 0xcc],
         }
+    }
+
+    fn sample_swap_live_tx(
+        hash_seed: u8,
+        sender_seed: u8,
+        nonce: u64,
+        max_fee_per_gas_wei: u128,
+    ) -> LiveTx {
+        let mut tx = sample_live_tx(hash_seed, sender_seed, nonce, max_fee_per_gas_wei);
+        tx.to = Some([
+            0x7a, 0x25, 0x0d, 0x56, 0x30, 0xb4, 0xcf, 0x53, 0x97, 0x39, 0xdf, 0x2c, 0x5d, 0xac,
+            0xb4, 0xc6, 0x59, 0xf2, 0x48, 0x8d,
+        ]);
+        tx.gas_limit = Some(320_000);
+        tx.max_priority_fee_per_gas_wei = Some(7_000_000_000);
+        tx.input = {
+            let mut calldata = vec![0x38, 0xed, 0x17, 0x39];
+            calldata.extend((0..160).map(|offset| offset as u8));
+            calldata
+        };
+        tx
     }
 
     fn sample_pending_observation(
@@ -2781,6 +3105,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_uses_pending_notification_timestamps_for_scheduler_admission()
      {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(32);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
@@ -2821,6 +3146,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_emits_replaced_event_for_scheduler_replacement() {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
@@ -2875,6 +3201,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_emits_dropped_event_when_scheduler_queue_is_full_but_still_writes_legacy_records()
      {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) = scheduler::scheduler_channel(scheduler::SchedulerConfig {
@@ -2927,6 +3254,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_rejects_before_storage_when_scheduler_is_closed()
     {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
@@ -2955,6 +3283,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_emits_queue_transition_events_for_gap_fill() {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
@@ -3027,7 +3356,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_defers_opportunities_until_transactions_are_ready()
+     {
+        let _guard = live_rpc_test_guard();
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let nonce_7 = sample_live_tx(0xa1, 0x31, 7, 100);
+        let nonce_9 = sample_swap_live_tx(0xa2, 0x31, 9, 120);
+        let nonce_8 = sample_swap_live_tx(0xa3, 0x31, 8, 121);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_7.hash, 1_700_000_000_001, 101),
+            nonce_7.hash,
+            Some(nonce_7),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 7");
+        let _ = drain_storage_ops(&mut storage_rx);
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_9.hash, 1_700_000_000_002, 202),
+            nonce_9.hash,
+            Some(nonce_9.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 9");
+
+        let blocked_ops = drain_storage_ops(&mut storage_rx);
+        assert!(blocked_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxBlocked(TxBlocked { hash, expected_nonce, .. }), .. }
+                if *hash == nonce_9.hash && *expected_nonce == Some(8)
+        )));
+        assert!(!blocked_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_9.hash
+        )));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_8.hash, 1_700_000_000_003, 303),
+            nonce_8.hash,
+            Some(nonce_8.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 8");
+
+        let ready_ops = drain_storage_ops(&mut storage_rx);
+        assert!(ready_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_8.hash
+        )));
+        assert!(ready_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_9.hash
+        )));
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_records_internal_candidate_comparison_metrics() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_searcher_metrics();
+
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let nonce_7 = sample_live_tx(0xb1, 0x31, 7, 100);
+        let nonce_9 = sample_swap_live_tx(0xb2, 0x31, 9, 120);
+        let nonce_8 = sample_swap_live_tx(0xb3, 0x31, 8, 121);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_7.hash, 1_700_000_000_011, 111),
+            nonce_7.hash,
+            Some(nonce_7),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 7");
+        let _ = drain_storage_ops(&mut storage_rx);
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_9.hash, 1_700_000_000_012, 222),
+            nonce_9.hash,
+            Some(nonce_9),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 9");
+        let _ = drain_storage_ops(&mut storage_rx);
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_8.hash, 1_700_000_000_013, 333),
+            nonce_8.hash,
+            Some(nonce_8),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 8");
+
+        let metrics = live_rpc_searcher_metrics_snapshot();
+        assert_eq!(metrics.executable_batches_total, 1);
+        assert_eq!(metrics.legacy_shadow_batches_total, 1);
+        assert_eq!(metrics.comparison_batches_total, 1);
+        assert!(metrics.executable_candidates_total > metrics.legacy_shadow_candidates_total);
+        assert!(metrics.executable_bundle_candidates_total >= 1);
+        assert!(metrics.executable_only_candidates_total >= 1);
+        assert_eq!(metrics.executable_top_score_wins_total, 1);
+        assert_eq!(metrics.legacy_top_score_wins_total, 0);
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
     async fn rebuild_scheduler_from_pending_transactions_rehydrates_scheduler_and_emits_events() {
+        let _guard = live_rpc_test_guard();
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =

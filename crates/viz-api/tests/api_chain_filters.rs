@@ -9,7 +9,9 @@ use storage::{
 };
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
-use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
+use viz_api::live_rpc::{
+    LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+};
 use viz_api::{
     AppState, DashboardSnapshotV2, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
     TransactionDetail, TransactionSummary, VizDataProvider, build_router,
@@ -128,6 +130,7 @@ fn build_test_app() -> axum::Router {
         api_rate_limiter: ApiRateLimiter::new(600),
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     };

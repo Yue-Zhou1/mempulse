@@ -5,7 +5,7 @@ use scheduler::{
     ValidatedTransaction,
 };
 use std::sync::{Arc, RwLock};
-use storage::{EventStore, InMemoryStorage};
+use storage::{EventStore, InMemoryStorage, TxFullRecord};
 use tokio::time::{Duration, Instant, sleep};
 use viz_api::{
     SchedulerRehydrationConfig, default_state_with_runtime_from_storage,
@@ -21,6 +21,7 @@ fn sample_validated_tx(hash_seed: u8, sender: Address, nonce: u64) -> ValidatedT
         source_id: SourceId::new("rpc-mainnet"),
         observed_at_unix_ms: 1_700_000_000_000 + hash_seed as i64,
         observed_at_mono_ns: hash_seed as u64,
+        calldata: vec![hash_seed; 4],
         decoded: TxDecoded {
             hash: [hash_seed; 32],
             tx_type: 2,
@@ -46,6 +47,25 @@ fn decoded_event(seq_id: u64, tx: &ValidatedTransaction) -> EventEnvelope {
         ingest_ts_mono_ns: tx.observed_at_mono_ns,
         source_id: tx.source_id.clone(),
         payload: EventPayload::TxDecoded(tx.decoded.clone()),
+    }
+}
+
+fn tx_full_record(tx: &ValidatedTransaction) -> TxFullRecord {
+    TxFullRecord {
+        hash: tx.hash(),
+        tx_type: tx.decoded.tx_type,
+        sender: tx.decoded.sender,
+        nonce: tx.decoded.nonce,
+        to: tx.decoded.to,
+        chain_id: tx.decoded.chain_id,
+        value_wei: tx.decoded.value_wei,
+        gas_limit: tx.decoded.gas_limit,
+        gas_price_wei: tx.decoded.gas_price_wei,
+        max_fee_per_gas_wei: tx.decoded.max_fee_per_gas_wei,
+        max_priority_fee_per_gas_wei: tx.decoded.max_priority_fee_per_gas_wei,
+        max_fee_per_blob_gas_wei: tx.decoded.max_fee_per_blob_gas_wei,
+        calldata_len: Some(tx.calldata.len() as u32),
+        raw_tx: tx.calldata.clone(),
     }
 }
 
@@ -137,6 +157,7 @@ async fn binary_bootstrap_replays_post_snapshot_decoded_tail_events() {
 
     {
         let mut guard = storage.write().expect("storage writable");
+        guard.upsert_tx_full(tx_full_record(&ready));
         guard.append_event(decoded_event(1, &ready));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
@@ -152,6 +173,7 @@ async fn binary_bootstrap_replays_post_snapshot_decoded_tail_events() {
                 }],
             }],
         });
+        guard.upsert_tx_full(tx_full_record(&tail));
         guard.append_event(decoded_event(2, &tail));
     }
 
@@ -170,6 +192,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_confirmed_in_wal_tail() {
 
     {
         let mut guard = storage.write().expect("storage writable");
+        guard.upsert_tx_full(tx_full_record(&ready));
         guard.append_event(decoded_event(1, &ready));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
@@ -204,6 +227,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_replaced_in_wal_tail() {
 
     {
         let mut guard = storage.write().expect("storage writable");
+        guard.upsert_tx_full(tx_full_record(&replaced));
         guard.append_event(decoded_event(1, &replaced));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
@@ -219,6 +243,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_replaced_in_wal_tail() {
                 }],
             }],
         });
+        guard.upsert_tx_full(tx_full_record(&replacement));
         guard.append_event(decoded_event(2, &replacement));
         guard.append_event(replaced_event(3, &replaced, &replacement));
     }

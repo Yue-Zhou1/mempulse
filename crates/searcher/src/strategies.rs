@@ -13,11 +13,13 @@ pub enum StrategyKind {
     SandwichCandidate,
     BackrunCandidate,
     ArbCandidate,
+    BundleCandidate,
 }
 
 pub const SANDWICH_STRATEGY_VERSION: &str = "strategy.sandwich.v1";
 pub const BACKRUN_STRATEGY_VERSION: &str = "strategy.backrun.v1";
 pub const ARB_STRATEGY_VERSION: &str = "strategy.arb.v1";
+pub const BUNDLE_STRATEGY_VERSION: &str = "strategy.bundle.v1";
 
 #[inline]
 pub const fn strategy_version(kind: StrategyKind) -> &'static str {
@@ -25,6 +27,7 @@ pub const fn strategy_version(kind: StrategyKind) -> &'static str {
         StrategyKind::SandwichCandidate => SANDWICH_STRATEGY_VERSION,
         StrategyKind::BackrunCandidate => BACKRUN_STRATEGY_VERSION,
         StrategyKind::ArbCandidate => ARB_STRATEGY_VERSION,
+        StrategyKind::BundleCandidate => BUNDLE_STRATEGY_VERSION,
     }
 }
 
@@ -159,6 +162,7 @@ fn candidate(
 ) -> OpportunityCandidate {
     OpportunityCandidate {
         tx_hash: featured.hash,
+        member_tx_hashes: vec![featured.hash],
         strategy,
         feature_engine_version: feature_engine_version().to_owned(),
         scorer_version: scorer_version().to_owned(),

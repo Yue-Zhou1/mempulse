@@ -11,8 +11,8 @@ use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{
     LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcDropReason,
-    classify_storage_enqueue_drop_reason, live_rpc_drop_metrics_snapshot,
-    observe_live_rpc_drop_reason, reset_live_rpc_drop_metrics,
+    LiveRpcSearcherMetricsSnapshot, classify_storage_enqueue_drop_reason,
+    live_rpc_drop_metrics_snapshot, observe_live_rpc_drop_reason, reset_live_rpc_drop_metrics,
 };
 use viz_api::{AppState, InMemoryVizProvider, VizDataProvider, build_router};
 
@@ -75,6 +75,7 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(live_rpc_drop_metrics_snapshot)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+        live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
     };

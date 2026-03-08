@@ -18,8 +18,9 @@ use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_aler
 use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
-    LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
-    live_rpc_drop_metrics_snapshot,
+    LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+    live_rpc_chain_status_snapshot, live_rpc_drop_metrics_snapshot,
+    live_rpc_searcher_metrics_snapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
@@ -85,6 +86,8 @@ pub struct AppState {
     pub api_rate_limiter: ApiRateLimiter,
     pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
     pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+    pub live_rpc_searcher_metrics_provider:
+        Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
     pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
     pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
 }
@@ -1093,10 +1096,16 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
     let sanitized_snapshot = rehydration_plan
         .snapshot
         .map(|snapshot| sanitize_scheduler_snapshot_for_rehydration(snapshot, &replay_events));
-    let replay_transactions = replay_events
-        .iter()
-        .filter_map(validated_transaction_from_event)
-        .collect::<Vec<_>>();
+    let replay_transactions = storage
+        .read()
+        .ok()
+        .map(|guard| {
+            replay_events
+                .iter()
+                .filter_map(|event| validated_transaction_from_event(event, &guard))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let scheduler = match spawn_scheduler_with_rehydration(
         SchedulerConfig::default(),
         sanitized_snapshot,
@@ -1150,6 +1159,8 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
         as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
     let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
         as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+    let live_rpc_searcher_metrics_provider = Arc::new(live_rpc_searcher_metrics_snapshot)
+        as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
     let scheduler_for_snapshot = scheduler.clone();
     let scheduler_for_metrics = scheduler.clone();
     let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
@@ -1170,6 +1181,7 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
         api_rate_limiter,
         live_rpc_chain_status_provider,
         live_rpc_drop_metrics_provider,
+        live_rpc_searcher_metrics_provider,
         scheduler_snapshot_provider,
         scheduler_metrics_provider,
     };
@@ -1291,12 +1303,19 @@ fn resolve_scheduler_snapshot_max_finality_age_ms(raw: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
 }
 
-fn validated_transaction_from_event(event: &EventEnvelope) -> Option<ValidatedTransaction> {
+fn validated_transaction_from_event(
+    event: &EventEnvelope,
+    storage: &InMemoryStorage,
+) -> Option<ValidatedTransaction> {
     match &event.payload {
         EventPayload::TxDecoded(decoded) => Some(ValidatedTransaction {
             source_id: event.source_id.clone(),
             observed_at_unix_ms: event.ingest_ts_unix_ms,
             observed_at_mono_ns: event.ingest_ts_mono_ns,
+            calldata: storage
+                .tx_full_by_hash(&decoded.hash)
+                .map(|row| row.raw_tx.clone())
+                .unwrap_or_default(),
             decoded: decoded.clone(),
         }),
         _ => None,
@@ -2035,6 +2054,87 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "mempulse_scheduler_handoff_queue_capacity {}\n",
         scheduler_metrics.handoff_queue_capacity
+    ));
+    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
+    out.push_str("# TYPE mempulse_searcher_executable_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_batches_total {}\n",
+        searcher_metrics.executable_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_candidates_total {}\n",
+        searcher_metrics.executable_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_bundle_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_bundle_candidates_total {}\n",
+        searcher_metrics.executable_bundle_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge\n");
+    out.push_str(&format!(
+        "mempulse_searcher_max_executable_candidates_in_batch {}\n",
+        searcher_metrics.max_executable_candidates_in_batch
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_shadow_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_shadow_batches_total {}\n",
+        searcher_metrics.legacy_shadow_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_shadow_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_shadow_candidates_total {}\n",
+        searcher_metrics.legacy_shadow_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_max_legacy_shadow_candidates_in_batch gauge\n");
+    out.push_str(&format!(
+        "mempulse_searcher_max_legacy_shadow_candidates_in_batch {}\n",
+        searcher_metrics.max_legacy_shadow_candidates_in_batch
+    ));
+    out.push_str("# TYPE mempulse_searcher_comparison_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_comparison_batches_total {}\n",
+        searcher_metrics.comparison_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_top_score_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_top_score_total {}\n",
+        searcher_metrics.executable_top_score_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_top_score_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_top_score_total {}\n",
+        searcher_metrics.legacy_top_score_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_top_score_wins_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_top_score_wins_total {}\n",
+        searcher_metrics.executable_top_score_wins_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_top_score_wins_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_top_score_wins_total {}\n",
+        searcher_metrics.legacy_top_score_wins_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_top_score_ties_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_top_score_ties_total {}\n",
+        searcher_metrics.top_score_ties_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_overlapping_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_overlapping_candidates_total {}\n",
+        searcher_metrics.overlapping_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_only_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_only_candidates_total {}\n",
+        searcher_metrics.executable_only_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_only_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_only_candidates_total {}\n",
+        searcher_metrics.legacy_only_candidates_total
     ));
     out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
     out.push_str(&format!(
@@ -3102,6 +3202,8 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
         let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
@@ -3115,6 +3217,7 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
         }
@@ -3126,6 +3229,8 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
         let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
@@ -3139,6 +3244,7 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
         }
@@ -3149,6 +3255,7 @@ mod tests {
             source_id: SourceId::new("rpc-mainnet"),
             observed_at_unix_ms: 1_700_000_123_456,
             observed_at_mono_ns: 999,
+            calldata: vec![hash_seed; 4],
             decoded: TxDecoded {
                 hash: [hash_seed; 32],
                 tx_type: 2,
@@ -3177,6 +3284,8 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -3186,6 +3295,7 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
         }
@@ -3268,6 +3378,8 @@ mod tests {
         assert!(payload.contains("mempulse_replay_lag_events"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
         assert!(payload.contains("mempulse_relay_success_rate"));
+        assert!(payload.contains("mempulse_searcher_comparison_batches_total"));
+        assert!(payload.contains("mempulse_searcher_executable_bundle_candidates_total"));
     }
 
     #[tokio::test]
@@ -3311,6 +3423,62 @@ mod tests {
         assert!(payload.contains("mempulse_scheduler_admitted_total 7"));
         assert!(payload.contains("mempulse_scheduler_duplicate_total 2"));
         assert!(payload.contains("mempulse_scheduler_queue_depth 9"));
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_includes_searcher_series() {
+        let api_auth = ApiAuthConfig::default();
+        let state = AppState {
+            provider: Arc::new(MockProvider),
+            downsample_limit: 100,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
+            live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+            live_rpc_searcher_metrics_provider: Arc::new(|| LiveRpcSearcherMetricsSnapshot {
+                executable_batches_total: 11,
+                executable_candidates_total: 22,
+                executable_bundle_candidates_total: 3,
+                max_executable_candidates_in_batch: 6,
+                legacy_shadow_batches_total: 10,
+                legacy_shadow_candidates_total: 20,
+                max_legacy_shadow_candidates_in_batch: 5,
+                comparison_batches_total: 9,
+                executable_top_score_total: 90_000,
+                legacy_top_score_total: 80_000,
+                executable_top_score_wins_total: 7,
+                legacy_top_score_wins_total: 1,
+                top_score_ties_total: 1,
+                overlapping_candidates_total: 12,
+                executable_only_candidates_total: 8,
+                legacy_only_candidates_total: 4,
+            }),
+            scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+            scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_searcher_executable_batches_total 11"));
+        assert!(payload.contains("mempulse_searcher_executable_bundle_candidates_total 3"));
+        assert!(payload.contains("mempulse_searcher_max_executable_candidates_in_batch 6"));
+        assert!(payload.contains("mempulse_searcher_comparison_batches_total 9"));
+        assert!(payload.contains("mempulse_searcher_executable_top_score_wins_total 7"));
+        assert!(payload.contains("mempulse_searcher_legacy_only_candidates_total 4"));
     }
 
     #[tokio::test]
