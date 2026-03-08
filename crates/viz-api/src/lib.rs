@@ -19,6 +19,7 @@ use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+    live_rpc_simulation_metrics_snapshot, live_rpc_simulation_status_snapshot,
     live_rpc_chain_status_snapshot, live_rpc_drop_metrics_snapshot,
     live_rpc_searcher_metrics_snapshot,
 };
@@ -1892,6 +1893,20 @@ async fn sim_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SimDetail>, StatusCode> {
+    if let Some(status) = live_rpc_simulation_status_snapshot(&id) {
+        return Ok(Json(SimDetail {
+            id: status.id,
+            bundle_id: status.bundle_id,
+            status: status.status,
+            relay_url: status.relay_url,
+            attempt_count: status.attempt_count,
+            accepted: status.accepted,
+            fail_category: status.fail_category,
+            started_unix_ms: status.started_unix_ms,
+            finished_unix_ms: status.finished_unix_ms,
+        }));
+    }
+
     let relay = state
         .relay_dry_run_status
         .read()
@@ -2171,11 +2186,107 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
     out.push_str("mempulse_replay_reorg_depth 0\n");
 
-    // Stub values until simulator exports categorized metrics directly.
+    let sim_metrics = live_rpc_simulation_metrics_snapshot();
+    out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_enqueued_total {}\n",
+        sim_metrics.enqueued_total
+    ));
+    out.push_str("# TYPE mempulse_sim_queue_depth gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_queue_depth {}\n",
+        sim_metrics.queue_depth
+    ));
+    out.push_str("# TYPE mempulse_sim_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_queue_capacity {}\n",
+        sim_metrics.queue_capacity
+    ));
+    out.push_str("# TYPE mempulse_sim_inflight_current gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_inflight_current {}\n",
+        sim_metrics.inflight_current
+    ));
+    out.push_str("# TYPE mempulse_sim_worker_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_worker_total {}\n",
+        sim_metrics.worker_total
+    ));
     out.push_str("# TYPE mempulse_sim_latency_ms gauge\n");
-    out.push_str("mempulse_sim_latency_ms 0\n");
+    out.push_str(&format!(
+        "mempulse_sim_latency_ms {}\n",
+        sim_metrics.last_latency_ms
+    ));
+    out.push_str("# TYPE mempulse_sim_completed_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"ok\"}} {}\n",
+        sim_metrics.ok_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"failed\"}} {}\n",
+        sim_metrics.failed_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"state_error\"}} {}\n",
+        sim_metrics.state_error_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"timeout\"}} {}\n",
+        sim_metrics.timeout_total
+    ));
+    out.push_str("# TYPE mempulse_sim_cache_hits_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_cache_hits_total {}\n",
+        sim_metrics.cache_hit_total
+    ));
+    out.push_str("# TYPE mempulse_sim_cache_misses_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_cache_misses_total {}\n",
+        sim_metrics.cache_miss_total
+    ));
+    out.push_str("# TYPE mempulse_sim_tx_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_tx_total {}\n",
+        sim_metrics.tx_total
+    ));
     out.push_str("# TYPE mempulse_sim_fail_total counter\n");
-    out.push_str("mempulse_sim_fail_total{category=\"unknown\"} 0\n");
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"revert\"}} {}\n",
+        sim_metrics.revert_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"out_of_gas\"}} {}\n",
+        sim_metrics.out_of_gas_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {}\n",
+        sim_metrics.nonce_mismatch_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_mismatch\"}} {}\n",
+        sim_metrics.state_mismatch_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_rpc\"}} {}\n",
+        sim_metrics.state_rpc_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_timeout\"}} {}\n",
+        sim_metrics.state_timeout_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"unknown\"}} {}\n",
+        sim_metrics.unknown_fail_total
+    ));
+    out.push_str("# TYPE mempulse_sim_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_drop_total{{reason=\"queue_full\"}} {}\n",
+        sim_metrics.queue_full_drop_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_drop_total{{reason=\"stale\"}} {}\n",
+        sim_metrics.stale_drop_total
+    ));
 
     out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
     out.push_str(&format!(
@@ -2899,6 +3010,16 @@ mod tests {
     use axum::http::{HeaderValue, Method};
     use tower::util::ServiceExt;
 
+    static LIVE_RPC_STATE_TEST_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn live_rpc_state_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_RPC_STATE_TEST_MUTEX
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     #[derive(Clone)]
     struct MockProvider;
 
@@ -3344,6 +3465,8 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_prometheus_route_returns_prometheus_text_series() {
+        let _guard = live_rpc_state_test_guard();
+        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
         let app = build_router(test_state(100));
 
         let response = app
@@ -3376,6 +3499,8 @@ mod tests {
         assert!(payload.contains("mempulse_dashboard_cache_last_build_ms"));
         assert!(payload.contains("mempulse_dashboard_cache_estimated_bytes"));
         assert!(payload.contains("mempulse_replay_lag_events"));
+        assert!(payload.contains("mempulse_sim_queue_depth"));
+        assert!(payload.contains("mempulse_sim_drop_total{reason=\"stale\"}"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
         assert!(payload.contains("mempulse_relay_success_rate"));
         assert!(payload.contains("mempulse_searcher_comparison_batches_total"));
@@ -4102,6 +4227,8 @@ mod tests {
 
     #[tokio::test]
     async fn sim_route_returns_latest_sim_detail() {
+        let _guard = live_rpc_state_test_guard();
+        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
         let app = build_router(test_state_with_relay(100, seeded_relay_status()));
 
         let response = app
@@ -4121,6 +4248,45 @@ mod tests {
         assert_eq!(payload.relay_url, "https://relay.example");
         assert_eq!(payload.status, "fail");
         assert_eq!(payload.fail_category.as_deref(), Some("relay_exhausted"));
+        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
+    }
+
+    #[tokio::test]
+    async fn sim_route_prefers_live_rpc_simulation_status_when_present() {
+        let _guard = live_rpc_state_test_guard();
+        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
+        crate::live_rpc::seed_live_rpc_simulation_status(crate::live_rpc::LiveRpcSimulationStatusSnapshot {
+            id: "sim-local-1".to_owned(),
+            bundle_id: "bundle-local-1".to_owned(),
+            status: "ok".to_owned(),
+            relay_url: "not_submitted".to_owned(),
+            attempt_count: 0,
+            accepted: true,
+            fail_category: None,
+            started_unix_ms: 1_700_000_123_000,
+            finished_unix_ms: 1_700_000_123_111,
+        });
+        let app = build_router(test_state_with_relay(100, seeded_relay_status()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sim/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SimDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.id, "sim-local-1");
+        assert_eq!(payload.bundle_id, "bundle-local-1");
+        assert_eq!(payload.status, "ok");
+        assert_eq!(payload.relay_url, "not_submitted");
+        assert!(payload.accepted);
+        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
     }
 
     #[test]

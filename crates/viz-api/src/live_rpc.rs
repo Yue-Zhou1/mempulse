@@ -1,6 +1,6 @@
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
-use common::{SourceId, TxHash};
+use common::{Address, SourceId, TxHash};
 use event_log::{
     BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxBlocked, TxDecoded, TxDropped,
     TxFetched, TxReady, TxReplaced, TxSeen,
@@ -9,7 +9,7 @@ use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
 };
 use futures::{SinkExt, StreamExt};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use scheduler::{
     SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, SchedulerQueueState,
     SchedulerQueueTransition, ValidatedTransaction,
@@ -28,7 +28,11 @@ use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, StorageTryEnqueueError, StorageWriteHandle,
     StorageWriteOp, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
-use tokio::sync::Semaphore;
+use sim_engine::{
+    AccountSeed, ChainContext, SimulationFailCategory, SimulationMode, SimulationTxInput,
+    StateProvider, simulate_with_mode,
+};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -51,7 +55,15 @@ const ENV_RPC_RETRY_ATTEMPTS: &str = "VIZ_API_RPC_RETRY_ATTEMPTS";
 const ENV_RPC_RETRY_BACKOFF_MS: &str = "VIZ_API_RPC_RETRY_BACKOFF_MS";
 const ENV_RPC_BATCH_FLUSH_MS: &str = "VIZ_API_RPC_BATCH_FLUSH_MS";
 const ENV_SILENT_CHAIN_TIMEOUT_SECS: &str = "VIZ_API_SILENT_CHAIN_TIMEOUT_SECS";
+const ENV_SIM_CACHE_TTL_MS: &str = "VIZ_API_SIM_CACHE_TTL_MS";
+const ENV_SIM_RPC_TIMEOUT_MS: &str = "VIZ_API_SIM_RPC_TIMEOUT_MS";
+const ENV_SIM_QUEUE_CAPACITY: &str = "VIZ_API_SIM_QUEUE_CAPACITY";
+const ENV_SIM_WORKER_COUNT: &str = "VIZ_API_SIM_WORKER_COUNT";
 const DEFAULT_SILENT_CHAIN_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_SIM_CACHE_TTL_MS: u64 = 5_000;
+const DEFAULT_SIM_RPC_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_SIM_QUEUE_CAPACITY: usize = 128;
+const DEFAULT_SIM_WORKER_COUNT: usize = 4;
 const SEARCHER_MIN_SCORE: u32 = 0;
 const SEARCHER_MAX_CANDIDATES: usize = 8;
 
@@ -99,6 +111,48 @@ pub struct LiveRpcSearcherMetricsSnapshot {
     pub legacy_only_candidates_total: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiveRpcSimulationMetricsSnapshot {
+    pub enqueued_total: u64,
+    pub completed_total: u64,
+    pub ok_total: u64,
+    pub failed_total: u64,
+    pub state_error_total: u64,
+    pub timeout_total: u64,
+    pub queue_full_drop_total: u64,
+    pub stale_drop_total: u64,
+    pub queue_depth: u64,
+    pub queue_capacity: u64,
+    pub inflight_current: u64,
+    pub worker_total: u64,
+    pub cache_hit_total: u64,
+    pub cache_miss_total: u64,
+    pub tx_total: u64,
+    pub last_latency_ms: u64,
+    pub max_latency_ms: u64,
+    pub total_latency_ms: u64,
+    pub revert_fail_total: u64,
+    pub out_of_gas_fail_total: u64,
+    pub nonce_mismatch_fail_total: u64,
+    pub state_mismatch_fail_total: u64,
+    pub unknown_fail_total: u64,
+    pub state_rpc_fail_total: u64,
+    pub state_timeout_fail_total: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LiveRpcSimulationStatusSnapshot {
+    pub id: String,
+    pub bundle_id: String,
+    pub status: String,
+    pub relay_url: String,
+    pub attempt_count: usize,
+    pub accepted: bool,
+    pub fail_category: Option<String>,
+    pub started_unix_ms: i64,
+    pub finished_unix_ms: i64,
+}
+
 #[derive(Debug, Default)]
 struct LiveRpcDropMetrics {
     storage_queue_full: AtomicU64,
@@ -124,6 +178,146 @@ struct LiveRpcSearcherMetrics {
     overlapping_candidates_total: AtomicU64,
     executable_only_candidates_total: AtomicU64,
     legacy_only_candidates_total: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct LiveRpcSimulationMetrics {
+    enqueued_total: AtomicU64,
+    completed_total: AtomicU64,
+    ok_total: AtomicU64,
+    failed_total: AtomicU64,
+    state_error_total: AtomicU64,
+    timeout_total: AtomicU64,
+    queue_full_drop_total: AtomicU64,
+    stale_drop_total: AtomicU64,
+    queue_depth: AtomicU64,
+    queue_capacity: AtomicU64,
+    inflight_current: AtomicU64,
+    worker_total: AtomicU64,
+    cache_hit_total: AtomicU64,
+    cache_miss_total: AtomicU64,
+    tx_total: AtomicU64,
+    last_latency_ms: AtomicU64,
+    max_latency_ms: AtomicU64,
+    total_latency_ms: AtomicU64,
+    revert_fail_total: AtomicU64,
+    out_of_gas_fail_total: AtomicU64,
+    nonce_mismatch_fail_total: AtomicU64,
+    state_mismatch_fail_total: AtomicU64,
+    unknown_fail_total: AtomicU64,
+    state_rpc_fail_total: AtomicU64,
+    state_timeout_fail_total: AtomicU64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableOpportunity {
+    record: OpportunityRecord,
+    member_tx_hashes: Vec<TxHash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteSimulationRequest {
+    tx_hash: TxHash,
+    member_tx_hashes: Vec<TxHash>,
+    txs: Vec<ValidatedTransaction>,
+    detected_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteSimulationOutcome {
+    sim_id: String,
+    status: RemoteSimulationStatus,
+    fail_category: Option<String>,
+    latency_ms: u64,
+    tx_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteSimulationStatus {
+    Ok,
+    Failed,
+    StateError,
+    Timeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedAccountSeed {
+    seed: AccountSeed,
+    block_number: u64,
+    cached_at_unix_ms: i64,
+}
+
+#[derive(Clone)]
+struct SimulationTask {
+    task_key: String,
+    generation: u64,
+    chain: ChainRpcConfig,
+    request: RemoteSimulationRequest,
+    opportunities: Vec<OpportunityRecord>,
+    writer: StorageWriteHandle,
+    next_seq_id: Arc<AtomicU64>,
+    enqueued_unix_ms: i64,
+}
+
+#[derive(Clone)]
+struct LiveRpcSimulationService {
+    runtime: Arc<RwLock<LiveRpcSimulationRuntime>>,
+    queue_capacity: usize,
+    worker_total: usize,
+}
+
+#[derive(Clone)]
+struct LiveRpcSimulationRuntime {
+    ingress_tx: mpsc::Sender<SimulationTask>,
+    state: Arc<RwLock<LiveRpcSimulationServiceState>>,
+}
+
+#[derive(Default)]
+struct LiveRpcSimulationServiceState {
+    task_generations: HashMap<String, u64>,
+    task_members: HashMap<String, Vec<TxHash>>,
+    tasks_by_member: HashMap<TxHash, FastSet<String>>,
+}
+
+#[derive(Default)]
+struct LiveRpcSimulationStatusStore {
+    latest: Option<LiveRpcSimulationStatusSnapshot>,
+    by_id: HashMap<String, LiveRpcSimulationStatusSnapshot>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RemoteStateCache {
+    account_seeds: HashMap<(String, Address), CachedAccountSeed>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcHeader {
+    number: String,
+    timestamp: String,
+    #[serde(rename = "gasLimit")]
+    gas_limit: String,
+    #[serde(default, rename = "baseFeePerGas")]
+    base_fee_per_gas: Option<String>,
+    #[serde(default)]
+    miner: Option<String>,
+    #[serde(default, rename = "stateRoot")]
+    state_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcHeaderResponseEnvelope {
+    #[serde(default)]
+    error: Option<RpcFetchErrorEnvelope>,
+    #[serde(default)]
+    result: Option<RpcHeader>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcScalarResponseEnvelope {
+    #[serde(default)]
+    error: Option<RpcFetchErrorEnvelope>,
+    #[serde(default)]
+    result: Option<String>,
 }
 
 impl LiveRpcDropMetrics {
@@ -292,8 +486,256 @@ impl LiveRpcSearcherMetrics {
     }
 }
 
+impl LiveRpcSimulationMetrics {
+    fn configure_queue(&self, queue_capacity: usize, worker_total: usize) {
+        self.queue_capacity
+            .store(queue_capacity as u64, Ordering::Relaxed);
+        self.worker_total
+            .store(worker_total as u64, Ordering::Relaxed);
+    }
+
+    fn observe_enqueue(&self) {
+        self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_dequeue(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        self.inflight_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_finish(&self) {
+        self.inflight_current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn observe_queue_full_drop(&self) {
+        self.queue_full_drop_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_stale_drop(&self) {
+        self.stale_drop_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_cache_hit(&self) {
+        self.cache_hit_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_cache_miss(&self) {
+        self.cache_miss_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_result(
+        &self,
+        status: RemoteSimulationStatus,
+        latency_ms: u64,
+        tx_count: usize,
+        fail_category: Option<&str>,
+    ) {
+        self.completed_total.fetch_add(1, Ordering::Relaxed);
+        self.tx_total
+            .fetch_add(tx_count as u64, Ordering::Relaxed);
+        self.last_latency_ms.store(latency_ms, Ordering::Relaxed);
+        self.max_latency_ms.fetch_max(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
+
+        match status {
+            RemoteSimulationStatus::Ok => {
+                self.ok_total.fetch_add(1, Ordering::Relaxed);
+            }
+            RemoteSimulationStatus::Failed => {
+                self.failed_total.fetch_add(1, Ordering::Relaxed);
+            }
+            RemoteSimulationStatus::StateError => {
+                self.state_error_total.fetch_add(1, Ordering::Relaxed);
+            }
+            RemoteSimulationStatus::Timeout => {
+                self.timeout_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if let Some(category) = fail_category {
+            match category {
+                "revert" => {
+                    self.revert_fail_total.fetch_add(1, Ordering::Relaxed);
+                }
+                "out_of_gas" => {
+                    self.out_of_gas_fail_total.fetch_add(1, Ordering::Relaxed);
+                }
+                "nonce_mismatch" => {
+                    self.nonce_mismatch_fail_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                "state_mismatch" => {
+                    self.state_mismatch_fail_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                "state_rpc" => {
+                    self.state_rpc_fail_total.fetch_add(1, Ordering::Relaxed);
+                }
+                "state_timeout" => {
+                    self.state_timeout_fail_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    self.unknown_fail_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn reset(&self) {
+        self.enqueued_total.store(0, Ordering::Relaxed);
+        self.completed_total.store(0, Ordering::Relaxed);
+        self.ok_total.store(0, Ordering::Relaxed);
+        self.failed_total.store(0, Ordering::Relaxed);
+        self.state_error_total.store(0, Ordering::Relaxed);
+        self.timeout_total.store(0, Ordering::Relaxed);
+        self.queue_full_drop_total.store(0, Ordering::Relaxed);
+        self.stale_drop_total.store(0, Ordering::Relaxed);
+        self.queue_depth.store(0, Ordering::Relaxed);
+        self.inflight_current.store(0, Ordering::Relaxed);
+        self.cache_hit_total.store(0, Ordering::Relaxed);
+        self.cache_miss_total.store(0, Ordering::Relaxed);
+        self.tx_total.store(0, Ordering::Relaxed);
+        self.last_latency_ms.store(0, Ordering::Relaxed);
+        self.max_latency_ms.store(0, Ordering::Relaxed);
+        self.total_latency_ms.store(0, Ordering::Relaxed);
+        self.revert_fail_total.store(0, Ordering::Relaxed);
+        self.out_of_gas_fail_total.store(0, Ordering::Relaxed);
+        self.nonce_mismatch_fail_total.store(0, Ordering::Relaxed);
+        self.state_mismatch_fail_total.store(0, Ordering::Relaxed);
+        self.unknown_fail_total.store(0, Ordering::Relaxed);
+        self.state_rpc_fail_total.store(0, Ordering::Relaxed);
+        self.state_timeout_fail_total.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LiveRpcSimulationMetricsSnapshot {
+        LiveRpcSimulationMetricsSnapshot {
+            enqueued_total: self.enqueued_total.load(Ordering::Relaxed),
+            completed_total: self.completed_total.load(Ordering::Relaxed),
+            ok_total: self.ok_total.load(Ordering::Relaxed),
+            failed_total: self.failed_total.load(Ordering::Relaxed),
+            state_error_total: self.state_error_total.load(Ordering::Relaxed),
+            timeout_total: self.timeout_total.load(Ordering::Relaxed),
+            queue_full_drop_total: self.queue_full_drop_total.load(Ordering::Relaxed),
+            stale_drop_total: self.stale_drop_total.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_capacity: self.queue_capacity.load(Ordering::Relaxed),
+            inflight_current: self.inflight_current.load(Ordering::Relaxed),
+            worker_total: self.worker_total.load(Ordering::Relaxed),
+            cache_hit_total: self.cache_hit_total.load(Ordering::Relaxed),
+            cache_miss_total: self.cache_miss_total.load(Ordering::Relaxed),
+            tx_total: self.tx_total.load(Ordering::Relaxed),
+            last_latency_ms: self.last_latency_ms.load(Ordering::Relaxed),
+            max_latency_ms: self.max_latency_ms.load(Ordering::Relaxed),
+            total_latency_ms: self.total_latency_ms.load(Ordering::Relaxed),
+            revert_fail_total: self.revert_fail_total.load(Ordering::Relaxed),
+            out_of_gas_fail_total: self.out_of_gas_fail_total.load(Ordering::Relaxed),
+            nonce_mismatch_fail_total: self.nonce_mismatch_fail_total.load(Ordering::Relaxed),
+            state_mismatch_fail_total: self.state_mismatch_fail_total.load(Ordering::Relaxed),
+            unknown_fail_total: self.unknown_fail_total.load(Ordering::Relaxed),
+            state_rpc_fail_total: self.state_rpc_fail_total.load(Ordering::Relaxed),
+            state_timeout_fail_total: self.state_timeout_fail_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl LiveRpcSimulationServiceState {
+    fn current_generation(&self, task_key: &str) -> u64 {
+        self.task_generations.get(task_key).copied().unwrap_or(0)
+    }
+
+    fn replace_membership(&mut self, task_key: &str, members: &[TxHash]) {
+        if let Some(previous) = self.task_members.insert(task_key.to_owned(), members.to_vec()) {
+            for member in previous {
+                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
+                    keys.remove(task_key);
+                    if keys.is_empty() {
+                        self.tasks_by_member.remove(&member);
+                    }
+                }
+            }
+        }
+
+        for member in members {
+            self.tasks_by_member
+                .entry(*member)
+                .or_insert_with(FastSet::default)
+                .insert(task_key.to_owned());
+        }
+    }
+
+    fn commit_enqueue(&mut self, task_key: &str, generation: u64, members: &[TxHash]) {
+        self.task_generations.insert(task_key.to_owned(), generation);
+        self.replace_membership(task_key, members);
+    }
+
+    fn is_current(&self, task_key: &str, generation: u64) -> bool {
+        self.current_generation(task_key) == generation
+    }
+
+    fn invalidate_hash(&mut self, hash: TxHash) {
+        let Some(task_keys) = self.tasks_by_member.remove(&hash) else {
+            return;
+        };
+
+        for task_key in task_keys {
+            let next_generation = self.current_generation(&task_key).saturating_add(1).max(1);
+            self.task_generations.insert(task_key.clone(), next_generation);
+
+            if let Some(previous_members) = self.task_members.remove(&task_key) {
+                for member in previous_members {
+                    if member == hash {
+                        continue;
+                    }
+
+                    if let Some(keys) = self.tasks_by_member.get_mut(&member) {
+                        keys.remove(&task_key);
+                        if keys.is_empty() {
+                            self.tasks_by_member.remove(&member);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn complete_current(&mut self, task_key: &str, generation: u64) {
+        if !self.is_current(task_key, generation) {
+            return;
+        }
+
+        self.task_generations.remove(task_key);
+        if let Some(previous_members) = self.task_members.remove(task_key) {
+            for member in previous_members {
+                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
+                    keys.remove(task_key);
+                    if keys.is_empty() {
+                        self.tasks_by_member.remove(&member);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.task_generations.clear();
+        self.task_members.clear();
+        self.tasks_by_member.clear();
+    }
+}
+
 static LIVE_RPC_DROP_METRICS: OnceLock<Arc<LiveRpcDropMetrics>> = OnceLock::new();
 static LIVE_RPC_SEARCHER_METRICS: OnceLock<Arc<LiveRpcSearcherMetrics>> = OnceLock::new();
+static LIVE_RPC_SIMULATION_METRICS: OnceLock<Arc<LiveRpcSimulationMetrics>> = OnceLock::new();
+static LIVE_RPC_SIMULATION_CACHE: OnceLock<Arc<RwLock<RemoteStateCache>>> = OnceLock::new();
+static LIVE_RPC_SIMULATION_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static LIVE_RPC_SIMULATION_SERVICE: OnceLock<LiveRpcSimulationService> = OnceLock::new();
+static LIVE_RPC_SIMULATION_STATUS: OnceLock<Arc<RwLock<LiveRpcSimulationStatusStore>>> =
+    OnceLock::new();
 static LIVE_RPC_FEED_START_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_RPC_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -303,6 +745,296 @@ fn live_rpc_drop_metrics() -> &'static Arc<LiveRpcDropMetrics> {
 
 fn live_rpc_searcher_metrics() -> &'static Arc<LiveRpcSearcherMetrics> {
     LIVE_RPC_SEARCHER_METRICS.get_or_init(|| Arc::new(LiveRpcSearcherMetrics::default()))
+}
+
+fn live_rpc_simulation_metrics() -> &'static Arc<LiveRpcSimulationMetrics> {
+    LIVE_RPC_SIMULATION_METRICS.get_or_init(|| Arc::new(LiveRpcSimulationMetrics::default()))
+}
+
+fn live_rpc_simulation_cache() -> &'static Arc<RwLock<RemoteStateCache>> {
+    LIVE_RPC_SIMULATION_CACHE.get_or_init(|| Arc::new(RwLock::new(RemoteStateCache::default())))
+}
+
+fn simulation_http_client() -> &'static reqwest::Client {
+    LIVE_RPC_SIMULATION_HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn live_rpc_simulation_status_store() -> &'static Arc<RwLock<LiveRpcSimulationStatusStore>> {
+    LIVE_RPC_SIMULATION_STATUS
+        .get_or_init(|| Arc::new(RwLock::new(LiveRpcSimulationStatusStore::default())))
+}
+
+fn spawn_live_rpc_simulation_runtime(
+    queue_capacity: usize,
+    worker_total: usize,
+) -> LiveRpcSimulationRuntime {
+    let (ingress_tx, ingress_rx) = mpsc::channel(queue_capacity);
+    let receiver = Arc::new(Mutex::new(ingress_rx));
+    let state = Arc::new(RwLock::new(LiveRpcSimulationServiceState::default()));
+
+    for _ in 0..worker_total {
+        tokio::spawn(run_simulation_worker(receiver.clone(), state.clone()));
+    }
+
+    LiveRpcSimulationRuntime { ingress_tx, state }
+}
+
+fn live_rpc_simulation_service() -> &'static LiveRpcSimulationService {
+    LIVE_RPC_SIMULATION_SERVICE.get_or_init(|| {
+        let queue_capacity = resolve_sim_queue_capacity();
+        let worker_total = resolve_sim_worker_count();
+        live_rpc_simulation_metrics().configure_queue(queue_capacity, worker_total);
+        LiveRpcSimulationService {
+            runtime: Arc::new(RwLock::new(spawn_live_rpc_simulation_runtime(
+                queue_capacity,
+                worker_total,
+            ))),
+            queue_capacity,
+            worker_total,
+        }
+    })
+}
+
+impl LiveRpcSimulationService {
+    fn runtime(&self) -> LiveRpcSimulationRuntime {
+        {
+            let runtime = self
+                .runtime
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !runtime.ingress_tx.is_closed() {
+                return runtime.clone();
+            }
+        }
+
+        let mut runtime = self
+            .runtime
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if runtime.ingress_tx.is_closed() {
+            *runtime = spawn_live_rpc_simulation_runtime(self.queue_capacity, self.worker_total);
+        }
+        runtime.clone()
+    }
+
+    fn enqueue(&self, mut task: SimulationTask) -> Result<()> {
+        let runtime = self.runtime();
+        let task_key = task.task_key.clone();
+        let next_generation = {
+            let state = runtime
+                .state
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.current_generation(&task_key).saturating_add(1).max(1)
+        };
+        task.generation = next_generation;
+        let members = task.request.member_tx_hashes.clone();
+        match runtime.ingress_tx.try_send(task) {
+            Ok(()) => {
+                let mut state = runtime
+                    .state
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                state.commit_enqueue(&task_key, next_generation, &members);
+                live_rpc_simulation_metrics().observe_enqueue();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                live_rpc_simulation_metrics().observe_queue_full_drop();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("live rpc simulation queue closed"))
+            }
+        }
+    }
+
+    fn invalidate_hash(&self, hash: TxHash) {
+        let runtime = self.runtime();
+        let mut state = runtime
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.invalidate_hash(hash);
+    }
+}
+
+fn resolve_sim_queue_capacity() -> usize {
+    match parse_env_usize(ENV_SIM_QUEUE_CAPACITY) {
+        Ok(Some(value)) => value.max(1),
+        Ok(None) => DEFAULT_SIM_QUEUE_CAPACITY,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid simulation queue capacity override; using default");
+            DEFAULT_SIM_QUEUE_CAPACITY
+        }
+    }
+}
+
+fn resolve_sim_worker_count() -> usize {
+    match parse_env_usize(ENV_SIM_WORKER_COUNT) {
+        Ok(Some(value)) => value.max(1),
+        Ok(None) => DEFAULT_SIM_WORKER_COUNT,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid simulation worker count override; using default");
+            DEFAULT_SIM_WORKER_COUNT
+        }
+    }
+}
+
+async fn run_simulation_worker(
+    receiver: Arc<Mutex<mpsc::Receiver<SimulationTask>>>,
+    state: Arc<RwLock<LiveRpcSimulationServiceState>>,
+) {
+    loop {
+        let task = {
+            let mut receiver = receiver.lock().await;
+            receiver.recv().await
+        };
+        let Some(task) = task else {
+            break;
+        };
+
+        live_rpc_simulation_metrics().observe_dequeue();
+
+        let is_current = {
+            let state = state.read().unwrap_or_else(|poison| poison.into_inner());
+            state.is_current(&task.task_key, task.generation)
+        };
+        if !is_current {
+            live_rpc_simulation_metrics().observe_stale_drop();
+            live_rpc_simulation_metrics().observe_finish();
+            continue;
+        }
+
+        let started_unix_ms = current_unix_ms();
+        let outcome = simulate_remote_request(simulation_http_client(), &task.chain, &task.request)
+            .await;
+        let finished_unix_ms = current_unix_ms();
+
+        let still_current = {
+            let state = state.read().unwrap_or_else(|poison| poison.into_inner());
+            state.is_current(&task.task_key, task.generation)
+        };
+        if !still_current {
+            live_rpc_simulation_metrics().observe_stale_drop();
+            live_rpc_simulation_metrics().observe_finish();
+            continue;
+        }
+
+        match outcome {
+            Ok(outcome) => {
+                if let Err(err) =
+                    apply_simulation_task_outcome(&task, &outcome, started_unix_ms, finished_unix_ms)
+                {
+                    tracing::warn!(
+                        error = %err,
+                        chain_key = %task.chain.chain_key,
+                        tx_hash = %format_fixed_hex(&task.request.tx_hash),
+                        "failed to persist live rpc simulation result"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chain_key = %task.chain.chain_key,
+                    tx_hash = %format_fixed_hex(&task.request.tx_hash),
+                    "live rpc simulation worker failed before producing a result"
+                );
+            }
+        }
+
+        {
+            let mut state = state.write().unwrap_or_else(|poison| poison.into_inner());
+            state.complete_current(&task.task_key, task.generation);
+        }
+        live_rpc_simulation_metrics().observe_finish();
+    }
+}
+
+fn apply_simulation_task_outcome(
+    task: &SimulationTask,
+    outcome: &RemoteSimulationOutcome,
+    started_unix_ms: i64,
+    finished_unix_ms: i64,
+) -> Result<()> {
+    record_live_rpc_simulation_status(build_live_rpc_simulation_status_snapshot(
+        task,
+        outcome,
+        started_unix_ms,
+        finished_unix_ms,
+    ));
+
+    for opportunity in &task.opportunities {
+        let sim_event = build_sim_completed_payload(opportunity, outcome);
+        if !append_event(
+            &task.writer,
+            &task.chain,
+            &task.next_seq_id,
+            finished_unix_ms,
+            EventPayload::SimCompleted(sim_event.clone()),
+        )? {
+            return Ok(());
+        }
+
+        if outcome.status == RemoteSimulationStatus::Ok {
+            if !append_event(
+                &task.writer,
+                &task.chain,
+                &task.next_seq_id,
+                finished_unix_ms,
+                build_bundle_submitted_payload(opportunity, &sim_event),
+            )? {
+                return Ok(());
+            }
+            if !try_enqueue_storage_write(
+                &task.writer,
+                &task.chain,
+                StorageWriteOp::UpsertOpportunity(opportunity.clone()),
+            )? {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_live_rpc_simulation_status_snapshot(
+    task: &SimulationTask,
+    outcome: &RemoteSimulationOutcome,
+    _started_unix_ms: i64,
+    finished_unix_ms: i64,
+) -> LiveRpcSimulationStatusSnapshot {
+    let bundle_id = task
+        .opportunities
+        .first()
+        .map(bundle_id_for_opportunity)
+        .unwrap_or_else(|| build_bundle_id(task.request.tx_hash, task.request.detected_unix_ms));
+    LiveRpcSimulationStatusSnapshot {
+        id: outcome.sim_id.clone(),
+        bundle_id,
+        status: simulation_status_label(outcome.status).to_owned(),
+        relay_url: "not_submitted".to_owned(),
+        attempt_count: 0,
+        accepted: outcome.status == RemoteSimulationStatus::Ok,
+        fail_category: outcome.fail_category.clone(),
+        started_unix_ms: task.enqueued_unix_ms,
+        finished_unix_ms,
+    }
+}
+
+fn record_live_rpc_simulation_status(snapshot: LiveRpcSimulationStatusSnapshot) {
+    let mut store = live_rpc_simulation_status_store()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    store.latest = Some(snapshot.clone());
+    store.by_id.insert(snapshot.id.clone(), snapshot);
+}
+
+#[cfg(test)]
+pub(crate) fn seed_live_rpc_simulation_status(snapshot: LiveRpcSimulationStatusSnapshot) {
+    record_live_rpc_simulation_status(snapshot);
 }
 
 pub fn live_rpc_drop_metrics_snapshot() -> LiveRpcDropMetricsSnapshot {
@@ -317,9 +1049,50 @@ pub fn live_rpc_searcher_metrics_snapshot() -> LiveRpcSearcherMetricsSnapshot {
     live_rpc_searcher_metrics().snapshot()
 }
 
+pub fn live_rpc_simulation_metrics_snapshot() -> LiveRpcSimulationMetricsSnapshot {
+    live_rpc_simulation_metrics().snapshot()
+}
+
+pub fn live_rpc_simulation_status_snapshot(id: &str) -> Option<LiveRpcSimulationStatusSnapshot> {
+    let store = live_rpc_simulation_status_store()
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if id == "latest" {
+        return store.latest.clone();
+    }
+    store.by_id.get(id).cloned()
+}
+
 #[cfg(test)]
 fn reset_live_rpc_searcher_metrics() {
     live_rpc_searcher_metrics().reset();
+}
+
+#[cfg(test)]
+fn reset_live_rpc_simulation_metrics() {
+    live_rpc_simulation_metrics().reset();
+}
+
+#[cfg(test)]
+fn reset_live_rpc_simulation_cache() {
+    let mut cache = live_rpc_simulation_cache()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    cache.account_seeds.clear();
+}
+
+#[cfg(test)]
+pub(crate) fn reset_live_rpc_simulation_runtime_state() {
+    if let Some(service) = LIVE_RPC_SIMULATION_SERVICE.get()
+        && let Ok(runtime) = service.runtime.read()
+        && let Ok(mut state) = runtime.state.write()
+    {
+        state.clear();
+    }
+    if let Ok(mut store) = live_rpc_simulation_status_store().write() {
+        store.latest = None;
+        store.by_id.clear();
+    }
 }
 
 pub fn observe_live_rpc_drop_reason(reason: LiveRpcDropReason) {
@@ -1788,6 +2561,7 @@ async fn process_pending_hash_with_fetched_tx(
             )? {
                 return Ok(());
             }
+            live_rpc_simulation_service().invalidate_hash(replaced_hash);
         }
         if scheduler_decision.emits_decoded()
             && !append_event(
@@ -1816,6 +2590,8 @@ async fn process_pending_hash_with_fetched_tx(
         }
         let executable_transactions =
             ready_transactions_for_queue_transitions(scheduler, &queue_transitions);
+        let simulation_context_transactions =
+            ready_frontier_for_queue_transitions(scheduler, &queue_transitions);
         for transition in queue_transitions {
             if !append_queue_transition_event(
                 writer,
@@ -1827,36 +2603,50 @@ async fn process_pending_hash_with_fetched_tx(
                 return Ok(());
             }
         }
-        let executable_opportunities = build_executable_opportunity_records(
+        let executable_opportunities = build_executable_opportunities(
             &executable_transactions,
             processed_at_unix_ms,
             resolved_chain_id,
         );
         if !executable_transactions.is_empty() {
+            let executable_records = executable_opportunities
+                .iter()
+                .map(|opportunity| opportunity.record.clone())
+                .collect::<Vec<_>>();
             let legacy_shadow_opportunities = build_legacy_comparison_opportunity_records(
                 &executable_transactions,
                 processed_at_unix_ms,
                 resolved_chain_id,
             );
-            if !executable_opportunities.is_empty() || !legacy_shadow_opportunities.is_empty() {
+            if !executable_records.is_empty() || !legacy_shadow_opportunities.is_empty() {
                 live_rpc_searcher_metrics()
-                    .observe_batch(&executable_opportunities, &legacy_shadow_opportunities);
+                    .observe_batch(&executable_records, &legacy_shadow_opportunities);
             }
         }
-        for opportunity in executable_opportunities {
-            let payloads = build_rule_versioned_payloads(&opportunity);
-            for payload in payloads {
-                if !append_event(writer, chain, next_seq_id, processed_at_unix_ms, payload)? {
-                    return Ok(());
-                }
-            }
-            if !try_enqueue_storage_write(
+        for opportunity in &executable_opportunities {
+            if !append_event(
                 writer,
                 chain,
-                StorageWriteOp::UpsertOpportunity(opportunity),
+                next_seq_id,
+                processed_at_unix_ms,
+                build_opportunity_detected_payload(&opportunity.record),
             )? {
                 return Ok(());
             }
+        }
+        for (task_key, request, opportunities) in
+            build_simulation_batches(&executable_opportunities, &simulation_context_transactions)
+        {
+            live_rpc_simulation_service().enqueue(SimulationTask {
+                task_key,
+                generation: 0,
+                chain: chain.clone(),
+                request,
+                opportunities,
+                writer: writer.clone(),
+                next_seq_id: next_seq_id.clone(),
+                enqueued_unix_ms: processed_at_unix_ms,
+            })?;
         }
     }
 
@@ -2179,11 +2969,11 @@ fn build_legacy_comparison_opportunity_records(
     candidates
 }
 
-fn build_executable_opportunity_records(
+fn build_executable_opportunities(
     executable: &[ValidatedTransaction],
     detected_unix_ms: i64,
     chain_id: Option<u64>,
-) -> Vec<OpportunityRecord> {
+) -> Vec<ExecutableOpportunity> {
     if executable.is_empty() {
         return Vec::new();
     }
@@ -2202,18 +2992,21 @@ fn build_executable_opportunity_records(
     )
     .candidates
     .into_iter()
-    .map(|candidate| OpportunityRecord {
-        tx_hash: candidate.tx_hash,
-        strategy: format!("{:?}", candidate.strategy),
-        score: candidate.score,
-        protocol: candidate.protocol,
-        category: candidate.category,
-        feature_engine_version: candidate.feature_engine_version,
-        scorer_version: candidate.scorer_version,
-        strategy_version: candidate.strategy_version,
-        reasons: candidate.reasons,
-        detected_unix_ms,
-        chain_id,
+    .map(|candidate| ExecutableOpportunity {
+        record: OpportunityRecord {
+            tx_hash: candidate.tx_hash,
+            strategy: format!("{:?}", candidate.strategy),
+            score: candidate.score,
+            protocol: candidate.protocol,
+            category: candidate.category,
+            feature_engine_version: candidate.feature_engine_version,
+            scorer_version: candidate.scorer_version,
+            strategy_version: candidate.strategy_version,
+            reasons: candidate.reasons,
+            detected_unix_ms,
+            chain_id,
+        },
+        member_tx_hashes: candidate.member_tx_hashes,
     })
     .collect()
 }
@@ -2253,42 +3046,462 @@ fn ready_transactions_for_queue_transitions(
     scheduler.get_pending_transactions(&ready_hashes)
 }
 
-fn build_rule_versioned_payloads(opportunity: &OpportunityRecord) -> Vec<EventPayload> {
-    let hash_prefix = format_fixed_hex(&opportunity.tx_hash)[2..10].to_owned();
-    let sim_id = format!("sim-{hash_prefix}-{}", opportunity.detected_unix_ms);
-    let bundle_id = format!("bundle-{hash_prefix}-{}", opportunity.detected_unix_ms);
+fn ready_frontier_for_queue_transitions(
+    scheduler: &SchedulerHandle,
+    queue_transitions: &[SchedulerQueueTransition],
+) -> Vec<ValidatedTransaction> {
+    if !queue_transitions
+        .iter()
+        .any(|transition| matches!(transition.state, SchedulerQueueState::Ready))
+    {
+        return Vec::new();
+    }
 
-    vec![
-        EventPayload::OppDetected(OppDetected {
-            hash: opportunity.tx_hash,
-            strategy: opportunity.strategy.clone(),
-            score: opportunity.score,
-            protocol: opportunity.protocol.clone(),
-            category: opportunity.category.clone(),
-            feature_engine_version: opportunity.feature_engine_version.clone(),
-            scorer_version: opportunity.scorer_version.clone(),
-            strategy_version: opportunity.strategy_version.clone(),
-            reasons: opportunity.reasons.clone(),
-        }),
-        EventPayload::SimCompleted(SimCompleted {
-            hash: opportunity.tx_hash,
-            sim_id: sim_id.clone(),
-            status: "not_run".to_owned(),
-            feature_engine_version: opportunity.feature_engine_version.clone(),
-            scorer_version: opportunity.scorer_version.clone(),
-            strategy_version: opportunity.strategy_version.clone(),
-        }),
-        EventPayload::BundleSubmitted(BundleSubmitted {
-            hash: opportunity.tx_hash,
-            bundle_id,
-            sim_id,
-            relay: "not_submitted".to_owned(),
-            accepted: false,
-            feature_engine_version: opportunity.feature_engine_version.clone(),
-            scorer_version: opportunity.scorer_version.clone(),
-            strategy_version: opportunity.strategy_version.clone(),
-        }),
-    ]
+    scheduler.snapshot().ready
+}
+
+fn build_opportunity_detected_payload(opportunity: &OpportunityRecord) -> EventPayload {
+    EventPayload::OppDetected(OppDetected {
+        hash: opportunity.tx_hash,
+        strategy: opportunity.strategy.clone(),
+        score: opportunity.score,
+        protocol: opportunity.protocol.clone(),
+        category: opportunity.category.clone(),
+        feature_engine_version: opportunity.feature_engine_version.clone(),
+        scorer_version: opportunity.scorer_version.clone(),
+        strategy_version: opportunity.strategy_version.clone(),
+        reasons: opportunity.reasons.clone(),
+    })
+}
+
+fn build_simulation_batches(
+    opportunities: &[ExecutableOpportunity],
+    executable: &[ValidatedTransaction],
+) -> Vec<(String, RemoteSimulationRequest, Vec<OpportunityRecord>)> {
+    let mut batches = BTreeMap::<String, (RemoteSimulationRequest, Vec<OpportunityRecord>)>::new();
+
+    for opportunity in opportunities {
+        let Some(request) = build_remote_simulation_request(opportunity, executable) else {
+            continue;
+        };
+        let task_key = simulation_task_key(&request);
+        batches
+            .entry(task_key)
+            .and_modify(|(_, grouped)| grouped.push(opportunity.record.clone()))
+            .or_insert_with(|| (request, vec![opportunity.record.clone()]));
+    }
+
+    batches
+        .into_iter()
+        .map(|(task_key, (request, grouped_opportunities))| {
+            (task_key, request, grouped_opportunities)
+        })
+        .collect()
+}
+
+fn build_remote_simulation_request(
+    opportunity: &ExecutableOpportunity,
+    executable: &[ValidatedTransaction],
+) -> Option<RemoteSimulationRequest> {
+    let requested_hashes = if opportunity.member_tx_hashes.is_empty() {
+        vec![opportunity.record.tx_hash]
+    } else {
+        opportunity.member_tx_hashes.clone()
+    };
+    let mut selected_hashes = requested_hashes
+        .iter()
+        .copied()
+        .collect::<FastSet<TxHash>>();
+    for requested_hash in &requested_hashes {
+        let requested_tx = executable.iter().find(|tx| tx.hash() == *requested_hash)?;
+        for candidate in executable {
+            if candidate.decoded.sender == requested_tx.decoded.sender
+                && candidate.decoded.nonce <= requested_tx.decoded.nonce
+            {
+                selected_hashes.insert(candidate.hash());
+            }
+        }
+    }
+    let txs = executable
+        .iter()
+        .filter(|tx| selected_hashes.contains(&tx.hash()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let member_tx_hashes = txs.iter().map(ValidatedTransaction::hash).collect::<Vec<_>>();
+
+    Some(RemoteSimulationRequest {
+        tx_hash: opportunity.record.tx_hash,
+        member_tx_hashes,
+        txs,
+        detected_unix_ms: opportunity.record.detected_unix_ms,
+    })
+}
+
+fn simulation_task_key(request: &RemoteSimulationRequest) -> String {
+    let mut members = request
+        .member_tx_hashes
+        .iter()
+        .map(|hash| format_fixed_hex(hash))
+        .collect::<Vec<_>>();
+    members.sort();
+    format!(
+        "{}:{}",
+        format_fixed_hex(&request.tx_hash),
+        members.join(",")
+    )
+}
+
+async fn simulate_remote_request(
+    client: &reqwest::Client,
+    chain: &ChainRpcConfig,
+    request: &RemoteSimulationRequest,
+) -> Result<RemoteSimulationOutcome> {
+    let hash_prefix = format_fixed_hex(&request.tx_hash)[2..10].to_owned();
+    let sim_id = format!("sim-{hash_prefix}-{}", request.detected_unix_ms);
+    let started = Instant::now();
+    let tx_count = request.txs.len();
+    let timeout = Duration::from_millis(resolve_sim_rpc_timeout_ms());
+    let simulated = tokio::time::timeout(timeout, async {
+        let http_url = chain
+            .primary_http_url()
+            .ok_or_else(|| anyhow!("no http endpoint configured for simulation"))?;
+        let chain_context = fetch_remote_chain_context(client, chain, http_url, request).await?;
+        let account_seeds =
+            fetch_cached_account_seeds(client, http_url, chain_context.block_number, &request.txs)
+                .await?;
+        let provider = CachedStateProviderView { account_seeds };
+        let inputs = request
+            .txs
+            .iter()
+            .map(|tx| SimulationTxInput {
+                decoded: tx.decoded.clone(),
+                calldata: Some(tx.calldata.clone()),
+            })
+            .collect::<Vec<_>>();
+        simulate_with_mode(&chain_context, &inputs, SimulationMode::RpcBacked(&provider))
+    })
+    .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let (status, fail_category) = match simulated {
+        Ok(Ok(batch)) => summarize_simulation_batch(&batch),
+        Ok(Err(_)) => (
+            RemoteSimulationStatus::StateError,
+            Some("state_rpc".to_owned()),
+        ),
+        Err(_) => (
+            RemoteSimulationStatus::Timeout,
+            Some("state_timeout".to_owned()),
+        ),
+    };
+    live_rpc_simulation_metrics().observe_result(
+        status,
+        latency_ms,
+        tx_count,
+        fail_category.as_deref(),
+    );
+
+    Ok(RemoteSimulationOutcome {
+        sim_id,
+        status,
+        fail_category,
+        latency_ms,
+        tx_count: tx_count as u32,
+    })
+}
+
+fn build_bundle_submitted_payload(
+    opportunity: &OpportunityRecord,
+    sim_event: &SimCompleted,
+) -> EventPayload {
+    EventPayload::BundleSubmitted(BundleSubmitted {
+        hash: opportunity.tx_hash,
+        bundle_id: bundle_id_for_opportunity(opportunity),
+        sim_id: sim_event.sim_id.clone(),
+        relay: "not_submitted".to_owned(),
+        accepted: false,
+        feature_engine_version: opportunity.feature_engine_version.clone(),
+        scorer_version: opportunity.scorer_version.clone(),
+        strategy_version: opportunity.strategy_version.clone(),
+    })
+}
+
+fn build_sim_completed_payload(
+    opportunity: &OpportunityRecord,
+    outcome: &RemoteSimulationOutcome,
+) -> SimCompleted {
+    SimCompleted {
+        hash: opportunity.tx_hash,
+        sim_id: outcome.sim_id.clone(),
+        status: simulation_status_label(outcome.status).to_owned(),
+        feature_engine_version: opportunity.feature_engine_version.clone(),
+        scorer_version: opportunity.scorer_version.clone(),
+        strategy_version: opportunity.strategy_version.clone(),
+        fail_category: outcome.fail_category.clone(),
+        latency_ms: Some(outcome.latency_ms),
+        tx_count: Some(outcome.tx_count),
+    }
+}
+
+fn bundle_id_for_opportunity(opportunity: &OpportunityRecord) -> String {
+    build_bundle_id(opportunity.tx_hash, opportunity.detected_unix_ms)
+}
+
+fn build_bundle_id(hash: TxHash, detected_unix_ms: i64) -> String {
+    let hash_prefix = format_fixed_hex(&hash)[2..10].to_owned();
+    format!("bundle-{hash_prefix}-{detected_unix_ms}")
+}
+
+fn summarize_simulation_batch(
+    batch: &sim_engine::SimulationBatchResult,
+) -> (RemoteSimulationStatus, Option<String>) {
+    if let Some(failed) = batch.tx_results.iter().find(|result| !result.success) {
+        let category = failed
+            .fail_category
+            .map(simulation_fail_category_label)
+            .unwrap_or("unknown")
+            .to_owned();
+        return (RemoteSimulationStatus::Failed, Some(category));
+    }
+
+    (RemoteSimulationStatus::Ok, None)
+}
+
+fn simulation_status_label(status: RemoteSimulationStatus) -> &'static str {
+    match status {
+        RemoteSimulationStatus::Ok => "ok",
+        RemoteSimulationStatus::Failed => "failed",
+        RemoteSimulationStatus::StateError => "state_error",
+        RemoteSimulationStatus::Timeout => "timeout",
+    }
+}
+
+fn simulation_fail_category_label(category: SimulationFailCategory) -> &'static str {
+    match category {
+        SimulationFailCategory::Revert => "revert",
+        SimulationFailCategory::OutOfGas => "out_of_gas",
+        SimulationFailCategory::NonceMismatch => "nonce_mismatch",
+        SimulationFailCategory::StateMismatch => "state_mismatch",
+        SimulationFailCategory::Unknown => "unknown",
+    }
+}
+
+fn resolve_sim_cache_ttl_ms() -> u64 {
+    std::env::var(ENV_SIM_CACHE_TTL_MS)
+        .ok()
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SIM_CACHE_TTL_MS)
+}
+
+fn resolve_sim_rpc_timeout_ms() -> u64 {
+    std::env::var(ENV_SIM_RPC_TIMEOUT_MS)
+        .ok()
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SIM_RPC_TIMEOUT_MS)
+}
+
+async fn fetch_remote_chain_context(
+    client: &reqwest::Client,
+    chain: &ChainRpcConfig,
+    http_url: &str,
+    request: &RemoteSimulationRequest,
+) -> Result<ChainContext> {
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 44,
+        "method": "eth_getBlockByNumber",
+        "params": ["latest", false],
+    });
+
+    let response: RpcHeaderResponseEnvelope = client
+        .post(http_url)
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("POST {http_url}"))?
+        .error_for_status()
+        .context("rpc http status error")?
+        .json()
+        .await
+        .context("decode simulation header response")?;
+
+    if let Some(error) = response.error {
+        return Err(anyhow!(
+            "rpc header fetch failed: {}",
+            error.message.unwrap_or_else(|| "unknown rpc error".to_owned())
+        ));
+    }
+    let header = response
+        .result
+        .ok_or_else(|| anyhow!("rpc header response missing result"))?;
+    let chain_id = request
+        .txs
+        .first()
+        .and_then(|tx| tx.decoded.chain_id)
+        .or(chain.chain_id)
+        .unwrap_or(1);
+    let block_number =
+        parse_hex_u64(&header.number).ok_or_else(|| anyhow!("invalid block number"))?;
+    let block_timestamp =
+        parse_hex_u64(&header.timestamp).ok_or_else(|| anyhow!("invalid block timestamp"))?;
+    let gas_limit =
+        parse_hex_u64(&header.gas_limit).ok_or_else(|| anyhow!("invalid block gas limit"))?;
+    let base_fee_wei = header
+        .base_fee_per_gas
+        .as_deref()
+        .and_then(parse_hex_u128)
+        .unwrap_or_default();
+    let coinbase = header
+        .miner
+        .as_deref()
+        .and_then(parse_fixed_hex::<20>)
+        .unwrap_or([0_u8; 20]);
+    let state_root = header
+        .state_root
+        .as_deref()
+        .and_then(parse_fixed_hex::<32>)
+        .unwrap_or([0_u8; 32]);
+
+    Ok(ChainContext {
+        chain_id,
+        block_number,
+        block_timestamp,
+        gas_limit,
+        base_fee_wei,
+        coinbase,
+        state_root,
+    })
+}
+
+async fn fetch_cached_account_seeds(
+    client: &reqwest::Client,
+    http_url: &str,
+    block_number: u64,
+    txs: &[ValidatedTransaction],
+) -> Result<HashMap<Address, AccountSeed>> {
+    let ttl_ms = resolve_sim_cache_ttl_ms() as i64;
+    let now_unix_ms = current_unix_ms();
+    let mut seeds = HashMap::new();
+    let mut unique_senders = BTreeSet::new();
+    for tx in txs {
+        unique_senders.insert(tx.decoded.sender);
+    }
+
+    for sender in unique_senders {
+        let cache_key = (http_url.to_owned(), sender);
+        let cached = live_rpc_simulation_cache()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .account_seeds
+            .get(&cache_key)
+            .copied();
+        if let Some(entry) = cached
+            && entry.block_number == block_number
+            && now_unix_ms.saturating_sub(entry.cached_at_unix_ms) <= ttl_ms
+        {
+            live_rpc_simulation_metrics().observe_cache_hit();
+            seeds.insert(sender, entry.seed);
+            continue;
+        }
+
+        live_rpc_simulation_metrics().observe_cache_miss();
+        let seed = fetch_account_seed_from_rpc(client, http_url, sender).await?;
+        live_rpc_simulation_cache()
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .account_seeds
+            .insert(
+                cache_key,
+                CachedAccountSeed {
+                    seed,
+                    block_number,
+                    cached_at_unix_ms: now_unix_ms,
+                },
+            );
+        seeds.insert(sender, seed);
+    }
+
+    Ok(seeds)
+}
+
+async fn fetch_account_seed_from_rpc(
+    client: &reqwest::Client,
+    http_url: &str,
+    address: Address,
+) -> Result<AccountSeed> {
+    let address_hex = format_fixed_hex(&address);
+    let balance = fetch_rpc_scalar(
+        client,
+        http_url,
+        45,
+        "eth_getBalance",
+        json!([address_hex, "latest"]),
+    )
+    .await
+    .and_then(|raw| parse_hex_u128(&raw).ok_or_else(|| anyhow!("invalid balance payload")))?;
+    let nonce = fetch_rpc_scalar(
+        client,
+        http_url,
+        46,
+        "eth_getTransactionCount",
+        json!([address_hex, "latest"]),
+    )
+    .await
+    .and_then(|raw| parse_hex_u64(&raw).ok_or_else(|| anyhow!("invalid nonce payload")))?;
+
+    Ok(AccountSeed {
+        balance_wei: balance,
+        nonce,
+    })
+}
+
+async fn fetch_rpc_scalar(
+    client: &reqwest::Client,
+    http_url: &str,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<String> {
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let response: RpcScalarResponseEnvelope = client
+        .post(http_url)
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("POST {http_url}"))?
+        .error_for_status()
+        .context("rpc http status error")?
+        .json()
+        .await
+        .context("decode rpc scalar response")?;
+    if let Some(error) = response.error {
+        return Err(anyhow!(
+            "rpc scalar fetch failed: {}",
+            error.message.unwrap_or_else(|| "unknown rpc error".to_owned())
+        ));
+    }
+    response
+        .result
+        .ok_or_else(|| anyhow!("rpc scalar response missing result"))
+}
+
+struct CachedStateProviderView {
+    account_seeds: HashMap<Address, AccountSeed>,
+}
+
+impl StateProvider for CachedStateProviderView {
+    fn account_seed(&self, address: Address) -> Result<Option<AccountSeed>> {
+        Ok(self.account_seeds.get(&address).copied())
+    }
 }
 
 async fn fetch_transaction_by_hash(
@@ -2775,8 +3988,15 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use axum::Json;
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Router, serve};
     use event_log::{TxBlocked, TxDropped, TxReady, TxReplaced};
     use serde_json::json;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use tokio::net::TcpListener;
 
     static LIVE_RPC_TEST_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
         std::sync::OnceLock::new();
@@ -2788,16 +4008,137 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn test_chain() -> ChainRpcConfig {
+    #[derive(Clone)]
+    struct MockSimulationRpcState {
+        block_number: Arc<AtomicU64>,
+        block_requests: Arc<AtomicUsize>,
+        balance_requests: Arc<AtomicUsize>,
+        nonce_requests: Arc<AtomicUsize>,
+        fail_account_reads: bool,
+        response_delay_ms: u64,
+    }
+
+    impl MockSimulationRpcState {
+        fn new(block_number: u64) -> Self {
+            Self {
+                block_number: Arc::new(AtomicU64::new(block_number)),
+                block_requests: Arc::new(AtomicUsize::new(0)),
+                balance_requests: Arc::new(AtomicUsize::new(0)),
+                nonce_requests: Arc::new(AtomicUsize::new(0)),
+                fail_account_reads: false,
+                response_delay_ms: 0,
+            }
+        }
+    }
+
+    async fn start_mock_simulation_rpc(
+        state: MockSimulationRpcState,
+    ) -> (MockSimulationRpcState, SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/", post(mock_simulation_rpc))
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve(listener, app).await.unwrap();
+        });
+
+        (state, addr, server)
+    }
+
+    async fn mock_simulation_rpc(
+        State(state): State<MockSimulationRpcState>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        if state.response_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(state.response_delay_ms)).await;
+        }
+        let method = payload
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        match method {
+            "eth_getBlockByNumber" => {
+                state.block_requests.fetch_add(1, Ordering::SeqCst);
+                let block_number = state.block_number.load(Ordering::SeqCst);
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                    "result": {
+                        "number": format!("0x{block_number:x}"),
+                        "timestamp": "0x65",
+                        "gasLimit": "0x1c9c380",
+                        "baseFeePerGas": "0x5",
+                        "miner": format!("0x{}", "11".repeat(20)),
+                        "stateRoot": format!("0x{}", "22".repeat(32)),
+                    }
+                }))
+            }
+            "eth_getBalance" => {
+                state.balance_requests.fetch_add(1, Ordering::SeqCst);
+                if state.fail_account_reads {
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                        "error": {
+                            "code": -32000,
+                            "message": "balance unavailable"
+                        }
+                    }))
+                } else {
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                        "result": "0x3635c9adc5dea00000"
+                    }))
+                }
+            }
+            "eth_getTransactionCount" => {
+                state.nonce_requests.fetch_add(1, Ordering::SeqCst);
+                if state.fail_account_reads {
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                        "error": {
+                            "code": -32000,
+                            "message": "nonce unavailable"
+                        }
+                    }))
+                } else {
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                        "result": "0x7"
+                    }))
+                }
+            }
+            other => Json(json!({
+                "jsonrpc": "2.0",
+                "id": payload.get("id").cloned().unwrap_or(json!(1)),
+                "error": {
+                    "code": -32601,
+                    "message": format!("unsupported method: {other}")
+                }
+            })),
+        }
+    }
+
+    fn test_chain_with_http_url(http_url: String) -> ChainRpcConfig {
         ChainRpcConfig {
             chain_key: "eth-mainnet".to_owned(),
             chain_id: Some(1),
             source_id: SourceId::new("rpc-live"),
             endpoints: vec![RpcEndpoint {
-                ws_url: PRIMARY_PUBLIC_WS_URL.to_owned(),
-                http_url: PRIMARY_PUBLIC_HTTP_URL.to_owned(),
+                ws_url: "ws://127.0.0.1/unused".to_owned(),
+                http_url,
             }],
         }
+    }
+
+    fn test_chain() -> ChainRpcConfig {
+        test_chain_with_http_url(PRIMARY_PUBLIC_HTTP_URL.to_owned())
     }
 
     fn sample_live_tx(
@@ -2864,6 +4205,42 @@ mod tests {
             ops.push(op);
         }
         ops
+    }
+
+    async fn drain_storage_ops_until_quiet(
+        storage_rx: &mut tokio::sync::mpsc::Receiver<StorageWriteOp>,
+        quiet_ms: u64,
+    ) -> Vec<StorageWriteOp> {
+        let mut ops = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(quiet_ms), storage_rx.recv()).await {
+                Ok(Some(op)) => ops.push(op),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        ops
+    }
+
+    fn sample_executable_opportunity(
+        tx: &ValidatedTransaction,
+        detected_unix_ms: i64,
+    ) -> ExecutableOpportunity {
+        ExecutableOpportunity {
+            record: OpportunityRecord {
+                tx_hash: tx.hash(),
+                chain_id: tx.decoded.chain_id,
+                strategy: "SandwichCandidate".to_owned(),
+                score: 10_000,
+                protocol: "uniswap-v2".to_owned(),
+                category: "swap".to_owned(),
+                feature_engine_version: "feature-engine.test".to_owned(),
+                scorer_version: "scorer.test".to_owned(),
+                strategy_version: "strategy.test".to_owned(),
+                reasons: vec!["test".to_owned()],
+                detected_unix_ms,
+            },
+            member_tx_hashes: Vec::new(),
+        }
     }
 
     #[test]
@@ -3024,7 +4401,7 @@ mod tests {
     }
 
     #[test]
-    fn build_rule_versioned_payloads_emit_opp_sim_and_bundle_with_same_versions() {
+    fn build_opportunity_detected_payload_preserves_rule_versions() {
         let tx_hash = [0x11; 32];
         let opportunity = OpportunityRecord {
             tx_hash,
@@ -3040,10 +4417,7 @@ mod tests {
             detected_unix_ms: 1_700_000_001_000,
         };
 
-        let events = build_rule_versioned_payloads(&opportunity);
-        assert_eq!(events.len(), 3);
-
-        match &events[0] {
+        match build_opportunity_detected_payload(&opportunity) {
             EventPayload::OppDetected(opp) => {
                 assert_eq!(opp.hash, tx_hash);
                 assert_eq!(
@@ -3055,35 +4429,290 @@ mod tests {
             }
             other => panic!("expected OppDetected payload, got {other:?}"),
         }
+    }
 
-        match &events[1] {
-            EventPayload::SimCompleted(sim) => {
-                assert_eq!(sim.hash, tx_hash);
-                assert_eq!(sim.status, "not_run");
-                assert_eq!(
-                    sim.feature_engine_version,
-                    opportunity.feature_engine_version
-                );
-                assert_eq!(sim.scorer_version, opportunity.scorer_version);
-                assert_eq!(sim.strategy_version, opportunity.strategy_version);
-            }
-            other => panic!("expected SimCompleted payload, got {other:?}"),
-        }
+    #[tokio::test]
+    async fn remote_simulation_request_uses_cache_until_block_number_changes() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
 
-        match &events[2] {
-            EventPayload::BundleSubmitted(bundle) => {
-                assert_eq!(bundle.hash, tx_hash);
-                assert!(!bundle.accepted);
-                assert_eq!(bundle.relay, "not_submitted");
-                assert_eq!(
-                    bundle.feature_engine_version,
-                    opportunity.feature_engine_version
-                );
-                assert_eq!(bundle.scorer_version, opportunity.scorer_version);
-                assert_eq!(bundle.strategy_version, opportunity.strategy_version);
-            }
-            other => panic!("expected BundleSubmitted payload, got {other:?}"),
-        }
+        let (rpc_state, rpc_addr, server) =
+            start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let tx = validated_transaction_from_live_tx(
+            &chain,
+            1_700_000_000_001,
+            101,
+            &sample_swap_live_tx(0xc1, 0x41, 7, 120),
+        );
+        let request = build_remote_simulation_request(
+            &sample_executable_opportunity(&tx, 1_700_000_000_010),
+            &[tx.clone()],
+        )
+        .expect("simulation request");
+        let client = simulation_http_client().clone();
+
+        let first = simulate_remote_request(&client, &chain, &request)
+            .await
+            .expect("first simulation");
+        let second = simulate_remote_request(&client, &chain, &request)
+            .await
+            .expect("second simulation");
+
+        assert_eq!(first.status, RemoteSimulationStatus::Ok);
+        assert_eq!(second.status, RemoteSimulationStatus::Ok);
+        assert_eq!(rpc_state.balance_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(rpc_state.nonce_requests.load(Ordering::SeqCst), 1);
+
+        rpc_state.block_number.store(101, Ordering::SeqCst);
+        let third = simulate_remote_request(&client, &chain, &request)
+            .await
+            .expect("third simulation after block advance");
+
+        assert_eq!(third.status, RemoteSimulationStatus::Ok);
+        assert_eq!(rpc_state.balance_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(rpc_state.nonce_requests.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_simulation_request_classifies_rpc_state_errors() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let mut mock_state = MockSimulationRpcState::new(100);
+        mock_state.fail_account_reads = true;
+        let (_rpc_state, rpc_addr, server) = start_mock_simulation_rpc(mock_state).await;
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let tx = validated_transaction_from_live_tx(
+            &chain,
+            1_700_000_000_001,
+            101,
+            &sample_swap_live_tx(0xc2, 0x42, 7, 120),
+        );
+        let request = build_remote_simulation_request(
+            &sample_executable_opportunity(&tx, 1_700_000_000_010),
+            &[tx],
+        )
+        .expect("simulation request");
+
+        let outcome = simulate_remote_request(simulation_http_client(), &chain, &request)
+            .await
+            .expect("simulation outcome");
+
+        assert_eq!(outcome.status, RemoteSimulationStatus::StateError);
+        assert_eq!(outcome.fail_category.as_deref(), Some("state_rpc"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_emits_real_sim_completed_payload() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let (rpc_state, rpc_addr, server) =
+            start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let tx = sample_swap_live_tx(0xc3, 0x43, 7, 120);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(tx.hash, 1_700_000_000_003, 303),
+            tx.hash,
+            Some(tx.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process tx");
+
+        let ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
+        let sim_payload = ops
+            .iter()
+            .find_map(|op| match op {
+                StorageWriteOp::AppendPayload {
+                    payload: EventPayload::SimCompleted(sim),
+                    ..
+                } if sim.hash == tx.hash => Some(sim.clone()),
+                _ => None,
+            })
+            .expect("sim payload");
+
+        assert_eq!(sim_payload.status, "ok");
+        assert_eq!(sim_payload.fail_category, None);
+        assert!(sim_payload.latency_ms.is_some());
+        assert_eq!(sim_payload.tx_count, Some(1));
+
+        let sim_count = ops
+            .iter()
+            .filter(|op| matches!(
+                op,
+                StorageWriteOp::AppendPayload {
+                    payload: EventPayload::SimCompleted(sim),
+                    ..
+                } if sim.hash == tx.hash
+            ))
+            .count() as u64;
+        let metrics = live_rpc_simulation_metrics_snapshot();
+        assert!(sim_count >= 1);
+        assert_eq!(metrics.completed_total, 1);
+        assert_eq!(metrics.ok_total, 1);
+        assert_eq!(rpc_state.balance_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(rpc_state.nonce_requests.load(Ordering::SeqCst), 1);
+
+        runtime_task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_runs_simulation_in_downstream_worker_stage() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let mut mock_state = MockSimulationRpcState::new(100);
+        mock_state.response_delay_ms = 25;
+        let (_rpc_state, rpc_addr, server) = start_mock_simulation_rpc(mock_state).await;
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(256);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let tx = sample_swap_live_tx(0xc4, 0x44, 7, 120);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(tx.hash, 1_700_000_000_004, 404),
+            tx.hash,
+            Some(tx.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process tx");
+
+        let immediate_ops = drain_storage_ops(&mut storage_rx);
+        assert!(!immediate_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::SimCompleted(sim),
+                ..
+            } if sim.hash == tx.hash
+        )));
+        assert!(!immediate_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+        )));
+
+        let eventual_ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
+        assert!(eventual_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::SimCompleted(sim),
+                ..
+            } if sim.hash == tx.hash
+        )));
+        assert!(eventual_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+        )));
+
+        runtime_task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduler_replacement_discards_stale_simulation_results() {
+        let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let mut mock_state = MockSimulationRpcState::new(100);
+        mock_state.response_delay_ms = 40;
+        let (_rpc_state, rpc_addr, server) = start_mock_simulation_rpc(mock_state).await;
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(512);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let incumbent = sample_swap_live_tx(0xc5, 0x45, 7, 120);
+        let replacement = sample_swap_live_tx(0xc6, 0x45, 7, 240);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(incumbent.hash, 1_700_000_000_005, 505),
+            incumbent.hash,
+            Some(incumbent.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process incumbent");
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(replacement.hash, 1_700_000_000_006, 606),
+            replacement.hash,
+            Some(replacement.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process replacement");
+
+        let ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::SimCompleted(sim),
+                ..
+            } if sim.hash == incumbent.hash
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == incumbent.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::SimCompleted(sim),
+                ..
+            } if sim.hash == replacement.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == replacement.hash
+        )));
+
+        runtime_task.abort();
+        server.abort();
     }
 
     #[test]
@@ -3359,13 +4988,19 @@ mod tests {
     async fn process_pending_hash_with_fetched_tx_defers_opportunities_until_transactions_are_ready()
      {
         let _guard = live_rpc_test_guard();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let (mock_state, rpc_addr, server) =
+            start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
             scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
         let runtime_task = tokio::spawn(runtime.run());
 
-        let chain = test_chain();
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let nonce_7 = sample_live_tx(0xa1, 0x31, 7, 100);
         let nonce_9 = sample_swap_live_tx(0xa2, 0x31, 9, 120);
         let nonce_8 = sample_swap_live_tx(0xa3, 0x31, 8, 121);
@@ -3404,6 +5039,13 @@ mod tests {
         )));
         assert!(!blocked_ops.iter().any(|op| matches!(
             op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::OppDetected(opp),
+                ..
+            } if opp.hash == nonce_9.hash
+        )));
+        assert!(!blocked_ops.iter().any(|op| matches!(
+            op,
             StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_9.hash
         )));
 
@@ -3419,23 +5061,37 @@ mod tests {
         .await
         .expect("process nonce 8");
 
-        let ready_ops = drain_storage_ops(&mut storage_rx);
+        let ready_ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
         assert!(ready_ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_8.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::OppDetected(opp),
+                ..
+            } if opp.hash == nonce_8.hash
         )));
         assert!(ready_ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_9.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::OppDetected(opp),
+                ..
+            } if opp.hash == nonce_9.hash
         )));
+        assert!(mock_state.balance_requests.load(Ordering::SeqCst) >= 1);
 
         runtime_task.abort();
+        server.abort();
     }
 
     #[tokio::test]
     async fn process_pending_hash_with_fetched_tx_records_internal_candidate_comparison_metrics() {
         let _guard = live_rpc_test_guard();
         reset_live_rpc_searcher_metrics();
+        reset_live_rpc_simulation_metrics();
+        reset_live_rpc_simulation_cache();
+        reset_live_rpc_simulation_runtime_state();
+
+        let (_mock_state, rpc_addr, server) =
+            start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
 
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
@@ -3443,7 +5099,7 @@ mod tests {
             scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
         let runtime_task = tokio::spawn(runtime.run());
 
-        let chain = test_chain();
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let nonce_7 = sample_live_tx(0xb1, 0x31, 7, 100);
         let nonce_9 = sample_swap_live_tx(0xb2, 0x31, 9, 120);
         let nonce_8 = sample_swap_live_tx(0xb3, 0x31, 8, 121);
@@ -3498,6 +5154,7 @@ mod tests {
         assert_eq!(metrics.legacy_top_score_wins_total, 0);
 
         runtime_task.abort();
+        server.abort();
     }
 
     #[tokio::test]

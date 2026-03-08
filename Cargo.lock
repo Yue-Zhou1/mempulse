@@ -3666,6 +3666,7 @@ dependencies = [
  "searcher",
  "serde",
  "serde_json",
+ "sim-engine",
  "storage",
  "tokio",
  "tokio-tungstenite",

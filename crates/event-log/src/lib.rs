@@ -173,6 +173,12 @@ pub struct SimCompleted {
     pub feature_engine_version: String,
     pub scorer_version: String,
     pub strategy_version: String,
+    #[serde(default)]
+    pub fail_category: Option<String>,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub tx_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

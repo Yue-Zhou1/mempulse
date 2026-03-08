@@ -17,6 +17,7 @@ node-runtime = { path = "../node-runtime" }
 replay = { path = "../replay" }
 scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }
+sim-engine = { path = "../sim-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 storage = { path = "../storage" }
