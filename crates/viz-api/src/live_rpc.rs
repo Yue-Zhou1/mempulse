@@ -2,15 +2,18 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use common::{SourceId, TxHash};
 use event_log::{
-    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxDecoded, TxDropped, TxFetched,
-    TxReplaced, TxSeen,
+    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxBlocked, TxDecoded, TxDropped,
+    TxFetched, TxReady, TxReplaced, TxSeen,
 };
 use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
 };
 use futures::{SinkExt, StreamExt};
 use hashbrown::HashSet;
-use scheduler::{SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, ValidatedTransaction};
+use scheduler::{
+    SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, SchedulerQueueState,
+    SchedulerQueueTransition, ValidatedTransaction,
+};
 use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
@@ -728,6 +731,16 @@ pub fn start_live_rpc_feed(
     scheduler: SchedulerHandle,
     config: LiveRpcConfig,
 ) {
+    start_live_rpc_feed_with_bootstrap(storage, writer, scheduler, config, false);
+}
+
+pub fn start_live_rpc_feed_with_bootstrap(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
+    config: LiveRpcConfig,
+    bootstrap_from_pending_pool: bool,
+) {
     LIVE_RPC_FEED_START_COUNT.fetch_add(1, Ordering::Relaxed);
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
@@ -752,11 +765,13 @@ pub fn start_live_rpc_feed(
         let writer = writer.clone();
         let next_seq_id = next_seq_id.clone();
         let scheduler = scheduler.clone();
+        let bootstrap_from_pending_pool = bootstrap_from_pending_pool;
         handle.spawn(async move {
             run_chain_worker(
                 writer,
                 scheduler,
                 chain,
+                bootstrap_from_pending_pool,
                 max_seen_hashes,
                 batch_fetch,
                 silent_chain_timeout_secs,
@@ -767,10 +782,40 @@ pub fn start_live_rpc_feed(
     }
 }
 
+pub fn start_live_rpc_pending_pool_rebuild(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
+    config: LiveRpcConfig,
+) {
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(_) => return,
+    };
+
+    if config.chains.is_empty() {
+        tracing::error!("live rpc config has no chains configured");
+        return;
+    }
+
+    let next_seq_id = Arc::new(AtomicU64::new(
+        current_seq_hi(&storage).saturating_add(1).max(1),
+    ));
+    for chain in config.chains {
+        let writer = writer.clone();
+        let next_seq_id = next_seq_id.clone();
+        let scheduler = scheduler.clone();
+        handle.spawn(async move {
+            run_chain_pending_pool_rebuild(writer, scheduler, chain, next_seq_id).await;
+        });
+    }
+}
+
 async fn run_chain_worker(
     writer: StorageWriteHandle,
     scheduler: SchedulerHandle,
     chain: ChainRpcConfig,
+    bootstrap_from_pending_pool: bool,
     max_seen_hashes: usize,
     batch_fetch: BatchFetchConfig,
     silent_chain_timeout_secs: u64,
@@ -796,6 +841,35 @@ async fn run_chain_worker(
             "live rpc chain config has no endpoints"
         );
         return;
+    }
+
+    if bootstrap_from_pending_pool {
+        match rebuild_scheduler_from_pending_pool(
+            &writer,
+            &scheduler,
+            &chain,
+            &client,
+            &next_seq_id,
+        )
+        .await
+        {
+            Ok(rebuilt) => {
+                tracing::info!(
+                    chain_key = %chain.chain_key,
+                    chain_id = ?chain.chain_id,
+                    rebuilt,
+                    "rebuilt scheduler state from rpc pending pool before websocket ingest"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chain_key = %chain.chain_key,
+                    chain_id = ?chain.chain_id,
+                    "failed to rebuild scheduler state from rpc pending pool before websocket ingest"
+                );
+            }
+        }
     }
 
     let mut seen_hashes = FastSet::default();
@@ -898,6 +972,56 @@ async fn run_chain_worker(
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn run_chain_pending_pool_rebuild(
+    writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
+    chain: ChainRpcConfig,
+    next_seq_id: Arc<AtomicU64>,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                chain_key = %chain.chain_key,
+                "failed to build reqwest client for pending-pool rebuild"
+            );
+            return;
+        }
+    };
+    if chain.endpoints.is_empty() {
+        tracing::error!(
+            chain_key = %chain.chain_key,
+            "live rpc chain config has no endpoints"
+        );
+        return;
+    }
+
+    match rebuild_scheduler_from_pending_pool(&writer, &scheduler, &chain, &client, &next_seq_id)
+        .await
+    {
+        Ok(rebuilt) => {
+            tracing::info!(
+                chain_key = %chain.chain_key,
+                chain_id = ?chain.chain_id,
+                rebuilt,
+                "rebuilt scheduler state from rpc pending pool"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                chain_key = %chain.chain_key,
+                chain_id = ?chain.chain_id,
+                "failed to rebuild scheduler state from rpc pending pool"
+            );
+        }
     }
 }
 
@@ -1334,18 +1458,24 @@ async fn process_pending_hash_with_fetched_tx(
         );
     }
 
-    let scheduler_decision = if let Some(tx) = fetched_tx.as_ref() {
+    let scheduler_result = if let Some(tx) = fetched_tx.as_ref() {
         let validated = validated_transaction_from_live_tx(
             chain,
             observation.observed_at_unix_ms,
             observation.observed_at_mono_ns,
             tx,
         );
-        let decision = match scheduler.admit(validated).await {
-            Ok(admission) => SchedulerPersistenceDecision::from_admission(admission),
-            Err(SchedulerEnqueueError::QueueFull) => SchedulerPersistenceDecision::Dropped {
-                reason: "queue_full",
-            },
+        let (decision, queue_transitions) = match scheduler.admit_outcome(validated).await {
+            Ok(outcome) => (
+                SchedulerPersistenceDecision::from_admission(outcome.admission),
+                outcome.queue_transitions,
+            ),
+            Err(SchedulerEnqueueError::QueueFull) => (
+                SchedulerPersistenceDecision::Dropped {
+                    reason: "queue_full",
+                },
+                Vec::new(),
+            ),
             Err(SchedulerEnqueueError::QueueClosed) => {
                 return Err(anyhow!("scheduler admission failed: queue closed"));
             }
@@ -1358,7 +1488,7 @@ async fn process_pending_hash_with_fetched_tx(
             admitted = decision.is_admitted(),
             "scheduler admission applied before legacy persistence"
         );
-        Some(decision)
+        Some((decision, queue_transitions))
     } else {
         None
     };
@@ -1418,7 +1548,8 @@ async fn process_pending_hash_with_fetched_tx(
             &tx,
         )
         .decoded;
-        let scheduler_decision = scheduler_decision.expect("decision exists when tx exists");
+        let (scheduler_decision, queue_transitions) =
+            scheduler_result.expect("decision exists when tx exists");
 
         if !try_enqueue_storage_write(
             writer,
@@ -1497,6 +1628,17 @@ async fn process_pending_hash_with_fetched_tx(
                 return Ok(());
             }
         }
+        for transition in queue_transitions {
+            if !append_queue_transition_event(
+                writer,
+                chain,
+                next_seq_id,
+                processed_at_unix_ms,
+                transition,
+            )? {
+                return Ok(());
+            }
+        }
         if scheduler_decision.generates_opportunities() {
             for opportunity in build_opportunity_records(
                 &decoded,
@@ -1522,6 +1664,102 @@ async fn process_pending_hash_with_fetched_tx(
     }
 
     Ok(())
+}
+
+async fn rebuild_scheduler_from_pending_pool(
+    writer: &StorageWriteHandle,
+    scheduler: &SchedulerHandle,
+    chain: &ChainRpcConfig,
+    client: &reqwest::Client,
+    next_seq_id: &Arc<AtomicU64>,
+) -> Result<usize> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for endpoint in &chain.endpoints {
+        match fetch_pending_block_transactions(client, endpoint.http_url.as_str()).await {
+            Ok(pending) => {
+                return rebuild_scheduler_from_pending_transactions(
+                    writer,
+                    scheduler,
+                    chain,
+                    &pending,
+                    next_seq_id,
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    chain_key = %chain.chain_key,
+                    chain_id = ?chain.chain_id,
+                    http_url = endpoint.http_url,
+                    "rpc pending-pool rebuild fetch failed; trying next endpoint"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("no rpc endpoints configured for pending-pool rebuild")))
+}
+
+async fn rebuild_scheduler_from_pending_transactions(
+    writer: &StorageWriteHandle,
+    scheduler: &SchedulerHandle,
+    chain: &ChainRpcConfig,
+    pending: &[LiveTx],
+    next_seq_id: &Arc<AtomicU64>,
+) -> Result<usize> {
+    let mut rebuilt = 0usize;
+    let mut seen_hashes = FastSet::default();
+
+    for tx in pending {
+        if !seen_hashes.insert(tx.hash) {
+            continue;
+        }
+
+        let observation = PendingHashObservation {
+            hash_hex: format_fixed_hex(&tx.hash),
+            observed_at_unix_ms: current_unix_ms(),
+            observed_at_mono_ns: current_mono_ns(),
+        };
+        process_pending_hash_with_fetched_tx(
+            writer,
+            scheduler,
+            chain,
+            &observation,
+            tx.hash,
+            Some(tx.clone()),
+            next_seq_id,
+        )
+        .await?;
+        rebuilt = rebuilt.saturating_add(1);
+    }
+
+    Ok(rebuilt)
+}
+
+fn append_queue_transition_event(
+    writer: &StorageWriteHandle,
+    chain: &ChainRpcConfig,
+    next_seq_id: &Arc<AtomicU64>,
+    now_unix_ms: i64,
+    transition: SchedulerQueueTransition,
+) -> Result<bool> {
+    let payload = match transition.state {
+        SchedulerQueueState::Ready => EventPayload::TxReady(TxReady {
+            hash: transition.hash,
+            sender: transition.sender,
+            nonce: transition.nonce,
+        }),
+        SchedulerQueueState::Blocked { expected_nonce } => EventPayload::TxBlocked(TxBlocked {
+            hash: transition.hash,
+            sender: transition.sender,
+            nonce: transition.nonce,
+            expected_nonce: Some(expected_nonce),
+        }),
+    };
+    append_event(writer, chain, next_seq_id, now_unix_ms, payload)
 }
 
 fn validated_transaction_from_live_tx(
@@ -1787,6 +2025,32 @@ async fn fetch_transaction_by_hash(
     decode_transaction_fetch_response_to_live_tx(response_bytes.as_ref(), hash_hex)
 }
 
+async fn fetch_pending_block_transactions(
+    client: &reqwest::Client,
+    http_url: &str,
+) -> Result<Vec<LiveTx>> {
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "eth_getBlockByNumber",
+        "params": ["pending", true],
+    });
+
+    let response_bytes = client
+        .post(http_url)
+        .json(&request_body)
+        .send()
+        .await
+        .with_context(|| format!("POST {http_url}"))?
+        .error_for_status()
+        .context("rpc http status error")?
+        .bytes()
+        .await
+        .context("read pending block response bytes")?;
+
+    decode_pending_block_response_to_live_txs(response_bytes.as_ref())
+}
+
 async fn fetch_transactions_by_hash_batch_with_retry(
     client: &reqwest::Client,
     http_url: &str,
@@ -1879,6 +2143,20 @@ struct RpcFetchResponseEnvelope {
 }
 
 #[derive(Debug, Deserialize)]
+struct RpcPendingBlock {
+    #[serde(default)]
+    transactions: Vec<RpcTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcPendingBlockResponseEnvelope {
+    #[serde(default)]
+    error: Option<RpcFetchErrorEnvelope>,
+    #[serde(default)]
+    result: Option<RpcPendingBlock>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RpcBatchResponseId {
     Number(u64),
@@ -1937,6 +2215,32 @@ fn decode_transaction_fetch_response_to_live_tx(
         None => return Ok(None),
     };
     Ok(Some(rpc_tx_to_live_tx(tx, hash_hex)?))
+}
+
+fn decode_pending_block_response_to_live_txs(payload: &[u8]) -> Result<Vec<LiveTx>> {
+    let response: RpcPendingBlockResponseEnvelope =
+        serde_json::from_slice(payload).context("decode pending block rpc json response")?;
+    if let Some(error) = response.error {
+        let code = error
+            .code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let message = error.message.unwrap_or_else(|| "unknown".to_owned());
+        return Err(anyhow!("rpc returned error: code={code} message={message}"));
+    }
+
+    let Some(block) = response.result else {
+        return Ok(Vec::new());
+    };
+
+    block
+        .transactions
+        .into_iter()
+        .map(|tx| {
+            let hash_hex = tx.hash.clone();
+            rpc_tx_to_live_tx(tx, hash_hex.as_str())
+        })
+        .collect()
 }
 
 fn decode_transaction_fetch_batch_response_to_live_txs(
@@ -2178,7 +2482,7 @@ fn current_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use event_log::{TxDropped, TxReplaced};
+    use event_log::{TxBlocked, TxDropped, TxReady, TxReplaced};
     use serde_json::json;
 
     fn test_chain() -> ChainRpcConfig {
@@ -2300,6 +2604,56 @@ mod tests {
         assert_eq!(live.max_fee_per_gas_wei, Some(20_000_000_000));
         assert_eq!(live.max_priority_fee_per_gas_wei, Some(2_000_000_000));
         assert_eq!(live.max_fee_per_blob_gas_wei, Some(3));
+    }
+
+    #[test]
+    fn decode_pending_block_response_to_live_txs_maps_transactions() {
+        let payload = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "transactions": [
+                    {
+                        "hash": format!("0x{}", "11".repeat(32)),
+                        "from": format!("0x{}", "22".repeat(20)),
+                        "to": format!("0x{}", "33".repeat(20)),
+                        "nonce": "0x7",
+                        "type": "0x2",
+                        "input": "0xaabb",
+                        "value": "0x1",
+                        "gas": "0x5208",
+                        "chainId": "0x1",
+                        "maxFeePerGas": "0x64",
+                        "maxPriorityFeePerGas": "0x3"
+                    },
+                    {
+                        "hash": format!("0x{}", "44".repeat(32)),
+                        "from": format!("0x{}", "55".repeat(20)),
+                        "to": serde_json::Value::Null,
+                        "nonce": "0x8",
+                        "type": "0x2",
+                        "input": "0xccdd",
+                        "value": "0x2",
+                        "gas": "0x7530",
+                        "chainId": "0x1",
+                        "maxFeePerGas": "0x96",
+                        "maxPriorityFeePerGas": "0x4"
+                    }
+                ]
+            }
+        }))
+        .expect("encode pending block payload");
+
+        let txs =
+            decode_pending_block_response_to_live_txs(&payload).expect("decode pending block");
+
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].hash, [0x11; 32]);
+        assert_eq!(txs[0].sender, [0x22; 20]);
+        assert_eq!(txs[0].nonce, 7);
+        assert_eq!(txs[1].hash, [0x44; 32]);
+        assert_eq!(txs[1].sender, [0x55; 20]);
+        assert_eq!(txs[1].nonce, 8);
     }
 
     #[test]
@@ -2597,5 +2951,138 @@ mod tests {
 
         assert!(error.to_string().contains("scheduler"));
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_emits_queue_transition_events_for_gap_fill() {
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let nonce_7 = sample_live_tx(0x91, 0x31, 7, 100);
+        let nonce_9 = sample_live_tx(0x92, 0x31, 9, 100);
+        let nonce_8 = sample_live_tx(0x93, 0x31, 8, 100);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_7.hash, 1_700_000_000_001, 101),
+            nonce_7.hash,
+            Some(nonce_7.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 7");
+        let _ = drain_storage_ops(&mut storage_rx);
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_9.hash, 1_700_000_000_002, 202),
+            nonce_9.hash,
+            Some(nonce_9.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 9");
+
+        let blocked_ops = drain_storage_ops(&mut storage_rx);
+        assert!(blocked_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxBlocked(TxBlocked { hash, expected_nonce, .. }), .. }
+                if *hash == nonce_9.hash && *expected_nonce == Some(8)
+        )));
+
+        process_pending_hash_with_fetched_tx(
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(nonce_8.hash, 1_700_000_000_003, 303),
+            nonce_8.hash,
+            Some(nonce_8.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process nonce 8");
+
+        let ready_ops = drain_storage_ops(&mut storage_rx);
+        assert!(ready_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxReady(TxReady { hash, nonce, .. }), .. }
+                if *hash == nonce_8.hash && *nonce == 8
+        )));
+        assert!(ready_ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxReady(TxReady { hash, nonce, .. }), .. }
+                if *hash == nonce_9.hash && *nonce == 9
+        )));
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rebuild_scheduler_from_pending_transactions_rehydrates_scheduler_and_emits_events() {
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+
+        let chain = test_chain();
+        let pending = vec![
+            sample_live_tx(0xa1, 0x31, 7, 100),
+            sample_live_tx(0xa2, 0x31, 9, 100),
+        ];
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        let rebuilt = rebuild_scheduler_from_pending_transactions(
+            &writer,
+            &scheduler,
+            &chain,
+            &pending,
+            &next_seq_id,
+        )
+        .await
+        .expect("rebuild scheduler from pending transactions");
+
+        assert_eq!(rebuilt, pending.len());
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending.len(), 2);
+        assert_eq!(
+            snapshot
+                .ready
+                .iter()
+                .map(ValidatedTransaction::hash)
+                .collect::<Vec<_>>(),
+            vec![pending[0].hash]
+        );
+        assert_eq!(
+            snapshot
+                .blocked
+                .iter()
+                .map(ValidatedTransaction::hash)
+                .collect::<Vec<_>>(),
+            vec![pending[1].hash]
+        );
+
+        let ops = drain_storage_ops(&mut storage_rx);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxDecoded(decoded), .. }
+                if decoded.hash == pending[0].hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload { payload: EventPayload::TxBlocked(TxBlocked { hash, expected_nonce, .. }), .. }
+                if *hash == pending[1].hash && *expected_nonce == Some(8)
+        )));
+
+        runtime_task.abort();
     }
 }

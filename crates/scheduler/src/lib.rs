@@ -46,6 +46,31 @@ pub struct SenderQueueSnapshot {
     pub queued: Vec<ValidatedTransaction>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedSenderQueueEntry {
+    pub nonce: u64,
+    pub hash: TxHash,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedSenderQueueSnapshot {
+    pub sender: Address,
+    pub queued: Vec<PersistedSenderQueueEntry>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedSchedulerSnapshot {
+    pub captured_at_unix_ms: i64,
+    pub captured_at_mono_ns: u64,
+    /// Populated by the persistence layer when the snapshot is written.
+    /// Scheduler-generated snapshots leave this as `0`.
+    #[serde(default)]
+    pub event_seq_hi: u64,
+    pub pending: Vec<ValidatedTransaction>,
+    pub executable_frontier: Vec<TxHash>,
+    pub sender_queues: Vec<PersistedSenderQueueSnapshot>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerSnapshot {
     pub pending: Vec<ValidatedTransaction>,
@@ -85,11 +110,31 @@ impl SchedulerAdmission {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerQueueState {
+    Ready,
+    Blocked { expected_nonce: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerQueueTransition {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+    pub state: SchedulerQueueState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulerAdmissionOutcome {
+    pub admission: SchedulerAdmission,
+    pub queue_transitions: Vec<SchedulerQueueTransition>,
+}
+
 #[derive(Debug)]
 enum SchedulerCommand {
     Admit {
         tx: ValidatedTransaction,
-        reply_tx: Option<oneshot::Sender<SchedulerAdmission>>,
+        reply_tx: Option<oneshot::Sender<SchedulerAdmissionOutcome>>,
     },
 }
 
@@ -100,10 +145,10 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    pub async fn admit(
+    pub async fn admit_outcome(
         &self,
         tx: ValidatedTransaction,
-    ) -> Result<SchedulerAdmission, SchedulerEnqueueError> {
+    ) -> Result<SchedulerAdmissionOutcome, SchedulerEnqueueError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.try_send_command(SchedulerCommand::Admit {
             tx,
@@ -112,6 +157,15 @@ impl SchedulerHandle {
         reply_rx
             .await
             .map_err(|_| SchedulerEnqueueError::QueueClosed)
+    }
+
+    pub async fn admit(
+        &self,
+        tx: ValidatedTransaction,
+    ) -> Result<SchedulerAdmission, SchedulerEnqueueError> {
+        self.admit_outcome(tx)
+            .await
+            .map(|outcome| outcome.admission)
     }
 
     pub fn try_admit(&self, tx: ValidatedTransaction) -> Result<(), SchedulerEnqueueError> {
@@ -138,6 +192,21 @@ impl SchedulerHandle {
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
         state.snapshot()
+    }
+
+    pub fn persisted_snapshot(
+        &self,
+        captured_at_unix_ms: i64,
+        captured_at_mono_ns: u64,
+    ) -> PersistedSchedulerSnapshot {
+        // `event_seq_hi` is always left at 0 here and must be populated by the
+        // persistence layer when the snapshot is written.
+        let state = self
+            .shared
+            .state
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.persisted_snapshot(captured_at_unix_ms, captured_at_mono_ns)
     }
 
     pub fn metrics(&self) -> SchedulerMetrics {
@@ -172,6 +241,15 @@ pub enum SchedulerEnqueueError {
     QueueClosed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerSnapshotError {
+    DuplicatePendingHash { hash: TxHash },
+    MissingPendingTransaction { hash: TxHash },
+    DuplicateSenderNonce { sender: Address, nonce: u64 },
+    QueueEntryMismatch { hash: TxHash },
+    ExecutableFrontierMismatch,
+}
+
 #[derive(Debug)]
 pub struct SchedulerRuntime {
     ingress_rx: mpsc::Receiver<SchedulerCommand>,
@@ -194,15 +272,42 @@ impl SchedulerRuntime {
 }
 
 pub fn scheduler_channel(config: SchedulerConfig) -> (SchedulerHandle, SchedulerRuntime) {
-    let config = SchedulerConfig {
-        handoff_queue_capacity: config.handoff_queue_capacity.max(1),
-        max_pending_per_sender: config.max_pending_per_sender.max(1),
-        replacement_fee_bump_bps: config.replacement_fee_bump_bps,
+    scheduler_channel_with_state(config, SchedulerState::default())
+}
+
+pub fn scheduler_channel_with_snapshot(
+    config: SchedulerConfig,
+    snapshot: PersistedSchedulerSnapshot,
+) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerSnapshotError> {
+    let state = SchedulerState::from_persisted_snapshot(snapshot)?;
+    Ok(scheduler_channel_with_state(config, state))
+}
+
+pub fn scheduler_channel_with_rehydration(
+    config: SchedulerConfig,
+    snapshot: Option<PersistedSchedulerSnapshot>,
+    replay_transactions: Vec<ValidatedTransaction>,
+) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerSnapshotError> {
+    let config = normalize_config(config);
+    let mut state = match snapshot {
+        Some(snapshot) => SchedulerState::from_persisted_snapshot(snapshot)?,
+        None => SchedulerState::default(),
     };
+    for tx in replay_transactions {
+        let _ = state.admit(tx, config);
+    }
+    Ok(scheduler_channel_with_state(config, state))
+}
+
+fn scheduler_channel_with_state(
+    config: SchedulerConfig,
+    state: SchedulerState,
+) -> (SchedulerHandle, SchedulerRuntime) {
+    let config = normalize_config(config);
     let (ingress_tx, ingress_rx) = mpsc::channel(config.handoff_queue_capacity);
     let shared = Arc::new(SharedState {
         config,
-        state: RwLock::new(SchedulerState::default()),
+        state: RwLock::new(state),
         queue_full_drop_total: AtomicU64::new(0),
     });
 
@@ -217,6 +322,28 @@ pub fn scheduler_channel(config: SchedulerConfig) -> (SchedulerHandle, Scheduler
 
 pub fn spawn_scheduler(config: SchedulerConfig) -> SchedulerHandle {
     let (handle, runtime) = scheduler_channel(config);
+    spawn_runtime(handle, runtime)
+}
+
+pub fn spawn_scheduler_with_snapshot(
+    config: SchedulerConfig,
+    snapshot: PersistedSchedulerSnapshot,
+) -> Result<SchedulerHandle, SchedulerSnapshotError> {
+    let (handle, runtime) = scheduler_channel_with_snapshot(config, snapshot)?;
+    Ok(spawn_runtime(handle, runtime))
+}
+
+pub fn spawn_scheduler_with_rehydration(
+    config: SchedulerConfig,
+    snapshot: Option<PersistedSchedulerSnapshot>,
+    replay_transactions: Vec<ValidatedTransaction>,
+) -> Result<SchedulerHandle, SchedulerSnapshotError> {
+    let (handle, runtime) =
+        scheduler_channel_with_rehydration(config, snapshot, replay_transactions)?;
+    Ok(spawn_runtime(handle, runtime))
+}
+
+fn spawn_runtime(handle: SchedulerHandle, runtime: SchedulerRuntime) -> SchedulerHandle {
     let runtime_task = tokio::spawn(runtime.run());
     tokio::spawn(async move {
         match runtime_task.await {
@@ -227,6 +354,14 @@ pub fn spawn_scheduler(config: SchedulerConfig) -> SchedulerHandle {
     handle
 }
 
+fn normalize_config(config: SchedulerConfig) -> SchedulerConfig {
+    SchedulerConfig {
+        handoff_queue_capacity: config.handoff_queue_capacity.max(1),
+        max_pending_per_sender: config.max_pending_per_sender.max(1),
+        replacement_fee_bump_bps: config.replacement_fee_bump_bps,
+    }
+}
+
 #[derive(Debug)]
 struct SharedState {
     config: SchedulerConfig,
@@ -235,7 +370,7 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn admit(&self, tx: ValidatedTransaction) -> SchedulerAdmission {
+    fn admit(&self, tx: ValidatedTransaction) -> SchedulerAdmissionOutcome {
         let mut state = self
             .state
             .write()
@@ -270,6 +405,13 @@ struct SenderQueueCounts {
     blocked: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SenderQueuePosition {
+    hash: TxHash,
+    nonce: u64,
+    state: SchedulerQueueState,
+}
+
 impl SchedulerState {
     fn snapshot(&self) -> SchedulerSnapshot {
         let classification = self.classify_by_sender();
@@ -281,15 +423,84 @@ impl SchedulerState {
         }
     }
 
-    fn admit(&mut self, tx: ValidatedTransaction, config: SchedulerConfig) -> SchedulerAdmission {
+    fn persisted_snapshot(
+        &self,
+        captured_at_unix_ms: i64,
+        captured_at_mono_ns: u64,
+    ) -> PersistedSchedulerSnapshot {
+        PersistedSchedulerSnapshot {
+            captured_at_unix_ms,
+            captured_at_mono_ns,
+            event_seq_hi: 0,
+            pending: self.pending.values().cloned().collect(),
+            executable_frontier: self.executable_frontier_hashes(),
+            sender_queues: self.persisted_sender_queue_snapshots(),
+        }
+    }
+
+    fn from_persisted_snapshot(
+        snapshot: PersistedSchedulerSnapshot,
+    ) -> Result<Self, SchedulerSnapshotError> {
+        let mut pending = BTreeMap::new();
+        for tx in snapshot.pending {
+            let hash = tx.hash();
+            if pending.insert(hash, tx).is_some() {
+                return Err(SchedulerSnapshotError::DuplicatePendingHash { hash });
+            }
+        }
+
+        let sender_queues = if snapshot.sender_queues.is_empty() {
+            build_sender_queues_from_pending(&pending)?
+        } else {
+            build_sender_queues_from_snapshot(&snapshot.sender_queues, &pending)?
+        };
+
+        let mut state = Self {
+            pending,
+            sender_queues,
+            sender_queue_counts: BTreeMap::new(),
+            admitted_total: 0,
+            duplicate_total: 0,
+            replacement_total: 0,
+            underpriced_replacement_total: 0,
+            sender_limit_drop_total: 0,
+            ready_total: 0,
+            blocked_total: 0,
+        };
+        state.recompute_queue_counts();
+
+        let restored_frontier = state
+            .classify_by_sender()
+            .ready
+            .iter()
+            .map(ValidatedTransaction::hash)
+            .collect::<Vec<_>>();
+        if !snapshot.executable_frontier.is_empty()
+            && restored_frontier != snapshot.executable_frontier
+        {
+            return Err(SchedulerSnapshotError::ExecutableFrontierMismatch);
+        }
+
+        Ok(state)
+    }
+
+    fn admit(
+        &mut self,
+        tx: ValidatedTransaction,
+        config: SchedulerConfig,
+    ) -> SchedulerAdmissionOutcome {
         let hash = tx.hash();
         if self.pending.contains_key(&hash) {
             self.duplicate_total = self.duplicate_total.saturating_add(1);
-            return SchedulerAdmission::Duplicate;
+            return SchedulerAdmissionOutcome {
+                admission: SchedulerAdmission::Duplicate,
+                queue_transitions: Vec::new(),
+            };
         }
 
         let sender = tx.decoded.sender;
         let nonce = tx.decoded.nonce;
+        let previous_positions = self.sender_queue_positions(sender);
 
         if let Some(incumbent_hash) = self
             .sender_queues
@@ -304,7 +515,10 @@ impl SchedulerState {
                 self.pending.insert(hash, tx);
                 self.admitted_total = self.admitted_total.saturating_add(1);
                 self.refresh_sender_counts(sender);
-                return SchedulerAdmission::Admitted;
+                return SchedulerAdmissionOutcome {
+                    admission: SchedulerAdmission::Admitted,
+                    queue_transitions: self.queue_transitions(sender, &previous_positions),
+                };
             };
             if replacement_fee(
                 tx.decoded.tx_type,
@@ -321,20 +535,29 @@ impl SchedulerState {
                 self.admitted_total = self.admitted_total.saturating_add(1);
                 self.replacement_total = self.replacement_total.saturating_add(1);
                 self.refresh_sender_counts(sender);
-                return SchedulerAdmission::Replaced {
-                    replaced_hash: incumbent_hash,
+                return SchedulerAdmissionOutcome {
+                    admission: SchedulerAdmission::Replaced {
+                        replaced_hash: incumbent_hash,
+                    },
+                    queue_transitions: self.queue_transitions(sender, &previous_positions),
                 };
             } else {
                 self.underpriced_replacement_total =
                     self.underpriced_replacement_total.saturating_add(1);
-                return SchedulerAdmission::UnderpricedReplacement;
+                return SchedulerAdmissionOutcome {
+                    admission: SchedulerAdmission::UnderpricedReplacement,
+                    queue_transitions: Vec::new(),
+                };
             }
         }
 
         let sender_queue_len = self.sender_queues.get(&sender).map_or(0, BTreeMap::len);
         if sender_queue_len >= config.max_pending_per_sender {
             self.sender_limit_drop_total = self.sender_limit_drop_total.saturating_add(1);
-            return SchedulerAdmission::SenderLimitReached;
+            return SchedulerAdmissionOutcome {
+                admission: SchedulerAdmission::SenderLimitReached,
+                queue_transitions: Vec::new(),
+            };
         }
 
         self.sender_queues
@@ -344,12 +567,15 @@ impl SchedulerState {
         self.pending.insert(hash, tx);
         self.admitted_total = self.admitted_total.saturating_add(1);
         self.refresh_sender_counts(sender);
-        SchedulerAdmission::Admitted
+        SchedulerAdmissionOutcome {
+            admission: SchedulerAdmission::Admitted,
+            queue_transitions: self.queue_transitions(sender, &previous_positions),
+        }
     }
 
     fn classify_by_sender(&self) -> QueueClassification {
-        let mut ready = Vec::new();
-        let mut blocked = Vec::new();
+        let mut ready = Vec::with_capacity(self.ready_total);
+        let mut blocked = Vec::with_capacity(self.blocked_total);
 
         for queue in self.sender_queues.values() {
             let mut next_executable_nonce = None;
@@ -380,6 +606,37 @@ impl SchedulerState {
         QueueClassification { ready, blocked }
     }
 
+    fn executable_frontier_hashes(&self) -> Vec<TxHash> {
+        let mut frontier = Vec::with_capacity(self.ready_total);
+
+        for queue in self.sender_queues.values() {
+            let mut next_executable_nonce = None;
+            let mut gap_seen = false;
+
+            for (nonce, hash) in queue {
+                if !self.pending.contains_key(hash) {
+                    continue;
+                }
+
+                match next_executable_nonce {
+                    None => {
+                        frontier.push(*hash);
+                        next_executable_nonce = nonce.checked_add(1);
+                    }
+                    Some(expected) if !gap_seen && *nonce == expected => {
+                        frontier.push(*hash);
+                        next_executable_nonce = nonce.checked_add(1);
+                    }
+                    Some(_) => {
+                        gap_seen = true;
+                    }
+                }
+            }
+        }
+
+        frontier
+    }
+
     fn sender_queue_snapshots(&self) -> Vec<SenderQueueSnapshot> {
         self.sender_queues
             .iter()
@@ -388,6 +645,22 @@ impl SchedulerState {
                 queued: queue
                     .values()
                     .filter_map(|hash| self.pending.get(hash).cloned())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn persisted_sender_queue_snapshots(&self) -> Vec<PersistedSenderQueueSnapshot> {
+        self.sender_queues
+            .iter()
+            .map(|(sender, queue)| PersistedSenderQueueSnapshot {
+                sender: *sender,
+                queued: queue
+                    .iter()
+                    .map(|(nonce, hash)| PersistedSenderQueueEntry {
+                        nonce: *nonce,
+                        hash: *hash,
+                    })
                     .collect(),
             })
             .collect()
@@ -408,6 +681,81 @@ impl SchedulerState {
         }
         self.ready_total = self.ready_total.saturating_add(next.ready);
         self.blocked_total = self.blocked_total.saturating_add(next.blocked);
+    }
+
+    fn recompute_queue_counts(&mut self) {
+        self.sender_queue_counts.clear();
+        self.ready_total = 0;
+        self.blocked_total = 0;
+        let senders = self.sender_queues.keys().copied().collect::<Vec<_>>();
+        for sender in senders {
+            self.refresh_sender_counts(sender);
+        }
+    }
+
+    fn sender_queue_positions(&self, sender: Address) -> Vec<SenderQueuePosition> {
+        let Some(queue) = self.sender_queues.get(&sender) else {
+            return Vec::new();
+        };
+
+        let mut positions = Vec::new();
+        let mut next_executable_nonce = None;
+        let mut gap_seen = false;
+
+        for (nonce, hash) in queue {
+            if !self.pending.contains_key(hash) {
+                continue;
+            }
+
+            let state = match next_executable_nonce {
+                None => {
+                    next_executable_nonce = nonce.checked_add(1);
+                    SchedulerQueueState::Ready
+                }
+                Some(expected) if !gap_seen && *nonce == expected => {
+                    next_executable_nonce = nonce.checked_add(1);
+                    SchedulerQueueState::Ready
+                }
+                Some(expected) => {
+                    gap_seen = true;
+                    SchedulerQueueState::Blocked {
+                        expected_nonce: expected,
+                    }
+                }
+            };
+
+            positions.push(SenderQueuePosition {
+                hash: *hash,
+                nonce: *nonce,
+                state,
+            });
+        }
+
+        positions
+    }
+
+    fn queue_transitions(
+        &self,
+        sender: Address,
+        previous_positions: &[SenderQueuePosition],
+    ) -> Vec<SchedulerQueueTransition> {
+        let previous_by_hash = previous_positions
+            .iter()
+            .map(|position| (position.hash, position.state))
+            .collect::<BTreeMap<_, _>>();
+
+        self.sender_queue_positions(sender)
+            .into_iter()
+            .filter_map(|position| match previous_by_hash.get(&position.hash) {
+                Some(state) if *state == position.state => None,
+                _ => Some(SchedulerQueueTransition {
+                    hash: position.hash,
+                    sender,
+                    nonce: position.nonce,
+                    state: position.state,
+                }),
+            })
+            .collect()
     }
 
     fn classify_sender_queue_counts(&self, queue: &BTreeMap<u64, TxHash>) -> SenderQueueCounts {
@@ -461,4 +809,56 @@ fn replacement_fee(
         0 | 1 => gas_price_wei.unwrap_or_default(),
         _ => max_fee_per_gas_wei.or(gas_price_wei).unwrap_or_default(),
     }
+}
+
+fn build_sender_queues_from_pending(
+    pending: &BTreeMap<TxHash, ValidatedTransaction>,
+) -> Result<BTreeMap<Address, BTreeMap<u64, TxHash>>, SchedulerSnapshotError> {
+    let mut sender_queues = BTreeMap::new();
+    for tx in pending.values() {
+        insert_sender_queue_entry(
+            &mut sender_queues,
+            tx.decoded.sender,
+            tx.decoded.nonce,
+            tx.hash(),
+        )?;
+    }
+    Ok(sender_queues)
+}
+
+fn build_sender_queues_from_snapshot(
+    persisted_sender_queues: &[PersistedSenderQueueSnapshot],
+    pending: &BTreeMap<TxHash, ValidatedTransaction>,
+) -> Result<BTreeMap<Address, BTreeMap<u64, TxHash>>, SchedulerSnapshotError> {
+    let mut sender_queues = BTreeMap::new();
+    for persisted_queue in persisted_sender_queues {
+        for entry in &persisted_queue.queued {
+            let Some(tx) = pending.get(&entry.hash) else {
+                return Err(SchedulerSnapshotError::MissingPendingTransaction { hash: entry.hash });
+            };
+            if tx.decoded.sender != persisted_queue.sender || tx.decoded.nonce != entry.nonce {
+                return Err(SchedulerSnapshotError::QueueEntryMismatch { hash: entry.hash });
+            }
+            insert_sender_queue_entry(
+                &mut sender_queues,
+                persisted_queue.sender,
+                entry.nonce,
+                entry.hash,
+            )?;
+        }
+    }
+    Ok(sender_queues)
+}
+
+fn insert_sender_queue_entry(
+    sender_queues: &mut BTreeMap<Address, BTreeMap<u64, TxHash>>,
+    sender: Address,
+    nonce: u64,
+    hash: TxHash,
+) -> Result<(), SchedulerSnapshotError> {
+    let queue = sender_queues.entry(sender).or_default();
+    if queue.insert(nonce, hash).is_some() {
+        return Err(SchedulerSnapshotError::DuplicateSenderNonce { sender, nonce });
+    }
+    Ok(())
 }

@@ -3185,6 +3185,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "replay",
  "reqwest",
+ "scheduler",
  "serde",
  "serde_json",
  "tokio",

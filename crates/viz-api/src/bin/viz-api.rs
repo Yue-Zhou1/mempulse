@@ -3,23 +3,37 @@ use node_runtime::{IngestMode, NodeRuntimeBuilder};
 use std::env;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-use viz_api::live_rpc::start_live_rpc_feed;
+use viz_api::live_rpc::{start_live_rpc_feed_with_bootstrap, start_live_rpc_pending_pool_rebuild};
 use viz_api::{build_router, default_state_with_runtime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(env::var("RUST_LOG").ok().as_deref());
     let (state, bootstrap) = default_state_with_runtime();
+    let bootstrap_storage = bootstrap.storage;
+    let bootstrap_writer = bootstrap.writer;
+    let bootstrap_scheduler = bootstrap.scheduler;
+    let bootstrap_live_rpc_config = bootstrap.live_rpc_config;
+    let rebuild_scheduler_from_rpc = bootstrap.rebuild_scheduler_from_rpc;
+    let bootstrap_scheduler_snapshot_writer_abort = bootstrap.scheduler_snapshot_writer_abort;
     let runtime_builder = NodeRuntimeBuilder::from_env()?;
     let ingest_mode = runtime_builder.ingest_mode();
     let runtime = runtime_builder
         .with_startup(move || {
             if matches!(ingest_mode, IngestMode::Rpc | IngestMode::Hybrid) {
-                start_live_rpc_feed(
-                    bootstrap.storage,
-                    bootstrap.writer,
-                    bootstrap.scheduler,
-                    bootstrap.live_rpc_config,
+                start_live_rpc_feed_with_bootstrap(
+                    bootstrap_storage.clone(),
+                    bootstrap_writer.clone(),
+                    bootstrap_scheduler.clone(),
+                    bootstrap_live_rpc_config.clone(),
+                    rebuild_scheduler_from_rpc,
+                );
+            } else if rebuild_scheduler_from_rpc {
+                start_live_rpc_pending_pool_rebuild(
+                    bootstrap_storage.clone(),
+                    bootstrap_writer.clone(),
+                    bootstrap_scheduler.clone(),
+                    bootstrap_live_rpc_config.clone(),
                 );
             } else {
                 tracing::info!(
@@ -40,6 +54,7 @@ async fn main() -> Result<()> {
     );
     axum::serve(listener, app).await?;
     runtime.shutdown().await?;
+    bootstrap_scheduler_snapshot_writer_abort.abort();
     Ok(())
 }
 

@@ -13,6 +13,7 @@ feature-engine = { path = "../feature-engine" }
 hashbrown = { workspace = true }
 reqwest = { workspace = true }
 replay = { path = "../replay" }
+scheduler = { path = "../scheduler" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

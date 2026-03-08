@@ -9,6 +9,7 @@ use common::{Address, PeerId, SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, GlobalSequencer, cmp_deterministic};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
+use scheduler::PersistedSchedulerSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
@@ -160,6 +161,13 @@ pub fn scan_events_cursor_start(events: &[EventEnvelope], from_seq_id: u64) -> u
     events.partition_point(|event| event.seq_id <= from_seq_id)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SchedulerRehydrationPlan {
+    pub snapshot: Option<PersistedSchedulerSnapshot>,
+    pub replay_events: Vec<EventEnvelope>,
+    pub requires_rpc_rebuild: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct InMemoryStorage {
     config: StorageConfig,
@@ -180,6 +188,8 @@ pub struct InMemoryStorage {
     tx_lifecycle_counts: FastMap<TxHash, usize>,
     tx_lifecycle_lookup: FastMap<TxHash, TxLifecycleRecord>,
     peer_stats: VecDeque<PeerStatsRecord>,
+    scheduler_snapshot: Option<PersistedSchedulerSnapshot>,
+    latest_finalized_block_unix_ms: Option<i64>,
     write_latency_ns: VecDeque<u64>,
     recent_tx_order: VecDeque<TxHash>,
     recent_tx_counts: FastMap<TxHash, usize>,
@@ -222,6 +232,8 @@ impl InMemoryStorage {
             tx_lifecycle_counts: FastMap::default(),
             tx_lifecycle_lookup: FastMap::default(),
             peer_stats: VecDeque::new(),
+            scheduler_snapshot: None,
+            latest_finalized_block_unix_ms: None,
             write_latency_ns: VecDeque::new(),
             recent_tx_order: VecDeque::new(),
             recent_tx_counts: FastMap::default(),
@@ -332,6 +344,17 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    pub fn write_scheduler_snapshot(&mut self, snapshot: PersistedSchedulerSnapshot) {
+        let start = Instant::now();
+        let mut snapshot = snapshot;
+        // Snapshots are generated with `event_seq_hi = 0`; storage stamps the
+        // latest durable event watermark at write time.
+        snapshot.event_seq_hi = self.latest_seq_id().unwrap_or(0);
+        self.scheduler_snapshot = Some(snapshot);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
+    }
+
     pub fn tx_seen(&self) -> &VecDeque<TxSeenRecord> {
         &self.tx_seen
     }
@@ -435,6 +458,36 @@ impl InMemoryStorage {
 
     pub fn peer_stats(&self) -> &VecDeque<PeerStatsRecord> {
         &self.peer_stats
+    }
+
+    pub fn scheduler_snapshot(&self) -> Option<&PersistedSchedulerSnapshot> {
+        self.scheduler_snapshot.as_ref()
+    }
+
+    pub fn scheduler_rehydration_plan(&self, max_finality_gap_ms: u64) -> SchedulerRehydrationPlan {
+        let Some(snapshot) = self.scheduler_snapshot.clone() else {
+            return SchedulerRehydrationPlan::default();
+        };
+
+        if self
+            .latest_finalized_block_unix_ms
+            .is_some_and(|finalized_unix_ms| {
+                finalized_unix_ms.saturating_sub(snapshot.captured_at_unix_ms)
+                    > max_finality_gap_ms.min(i64::MAX as u64) as i64
+            })
+        {
+            return SchedulerRehydrationPlan {
+                snapshot: None,
+                replay_events: Vec::new(),
+                requires_rpc_rebuild: true,
+            };
+        }
+
+        SchedulerRehydrationPlan {
+            replay_events: self.scan_events(snapshot.event_seq_hi, self.event_index.len().max(1)),
+            snapshot: Some(snapshot),
+            requires_rpc_rebuild: false,
+        }
     }
 
     pub fn recent_transactions(&self, limit: usize) -> Vec<RecentTransactionRecord> {
@@ -543,6 +596,14 @@ impl EventStore for InMemoryStorage {
                 source_id: event.source_id.0.clone(),
             });
         }
+        if let EventPayload::TxConfirmedFinal(confirmed) = &event.payload {
+            let _ = confirmed;
+            self.latest_finalized_block_unix_ms = Some(
+                self.latest_finalized_block_unix_ms
+                    .unwrap_or_default()
+                    .max(event.ingest_ts_unix_ms),
+            );
+        }
 
         let lifecycle_update = match &event.payload {
             EventPayload::TxDecoded(decoded) => Some(TxLifecycleRecord {
@@ -593,7 +654,9 @@ impl EventStore for InMemoryStorage {
             | EventPayload::TxFetched(_)
             | EventPayload::OppDetected(_)
             | EventPayload::SimCompleted(_)
-            | EventPayload::BundleSubmitted(_) => None,
+            | EventPayload::BundleSubmitted(_)
+            | EventPayload::TxReady(_)
+            | EventPayload::TxBlocked(_) => None,
         };
         if let Some(record) = lifecycle_update {
             self.upsert_tx_lifecycle(record);
@@ -656,6 +719,7 @@ pub enum StorageWriteOp {
     UpsertOpportunity(OpportunityRecord),
     UpsertTxLifecycle(TxLifecycleRecord),
     UpsertPeerStats(PeerStatsRecord),
+    WriteSchedulerSnapshot(PersistedSchedulerSnapshot),
 }
 
 #[derive(Clone, Debug)]
@@ -716,6 +780,15 @@ impl StorageWriteHandle {
         op: StorageWriteOp,
     ) -> std::result::Result<(), StorageTryEnqueueError> {
         self.tx.try_send(op).map_err(|err| match err {
+            TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
+            TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,
+        })
+    }
+
+    pub fn try_reserve(
+        &self,
+    ) -> std::result::Result<mpsc::Permit<'_, StorageWriteOp>, StorageTryEnqueueError> {
+        self.tx.try_reserve().map_err(|err| match err {
             TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
             TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,
         })
@@ -927,6 +1000,9 @@ fn apply_write_op(
         StorageWriteOp::UpsertOpportunity(record) => storage.upsert_opportunity(record),
         StorageWriteOp::UpsertTxLifecycle(record) => storage.upsert_tx_lifecycle(record),
         StorageWriteOp::UpsertPeerStats(record) => storage.upsert_peer_stats(record),
+        StorageWriteOp::WriteSchedulerSnapshot(snapshot) => {
+            storage.write_scheduler_snapshot(snapshot);
+        }
     }
 }
 
@@ -1474,11 +1550,13 @@ mod tests {
                 seq_hi: 1,
                 timestamp_unix_ms: 1_700_000_000_000,
                 pending: vec![hash(3)],
+                sender_queues: Vec::new(),
             },
             ReplayFrame {
                 seq_hi: 2,
                 timestamp_unix_ms: 1_700_000_000_100,
                 pending: vec![hash(3), hash(4)],
+                sender_queues: Vec::new(),
             },
         ];
         let json_a = export_replay_frames_json(&frames).expect("json");
@@ -1497,6 +1575,7 @@ mod tests {
             seq_hi: 1,
             timestamp_unix_ms: 1_700_000_000_000,
             pending: vec![hash(9)],
+            sender_queues: Vec::new(),
         }];
         let err = exporter
             .export_replay_frames_parquet(&frames, "/tmp/replay.parquet")

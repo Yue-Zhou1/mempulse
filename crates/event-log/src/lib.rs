@@ -63,6 +63,8 @@ pub enum EventPayload {
     TxSeen(TxSeen),
     TxFetched(TxFetched),
     TxDecoded(TxDecoded),
+    TxReady(TxReady),
+    TxBlocked(TxBlocked),
     OppDetected(OppDetected),
     SimCompleted(SimCompleted),
     BundleSubmitted(BundleSubmitted),
@@ -79,6 +81,8 @@ impl EventPayload {
             EventPayload::TxSeen(e) => e.hash,
             EventPayload::TxFetched(e) => e.hash,
             EventPayload::TxDecoded(e) => e.hash,
+            EventPayload::TxReady(e) => e.hash,
+            EventPayload::TxBlocked(e) => e.hash,
             EventPayload::OppDetected(e) => e.hash,
             EventPayload::SimCompleted(e) => e.hash,
             EventPayload::BundleSubmitted(e) => e.hash,
@@ -129,6 +133,22 @@ pub struct TxDecoded {
     pub max_fee_per_blob_gas_wei: Option<u128>,
     #[serde(default)]
     pub calldata_len: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxReady {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxBlocked {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+    #[serde(default)]
+    pub expected_nonce: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

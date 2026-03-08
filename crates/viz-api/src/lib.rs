@@ -26,21 +26,30 @@ use replay::{
     replay_from_checkpoint,
 };
 use scheduler::{
-    SchedulerConfig, SchedulerHandle, SchedulerMetrics, SchedulerSnapshot, spawn_scheduler,
+    SchedulerConfig, SchedulerHandle, SchedulerMetrics, SchedulerSnapshot, ValidatedTransaction,
+    spawn_scheduler_with_rehydration,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
-    NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
+    NoopClickHouseSink, StorageTryEnqueueError, StorageWriteHandle, StorageWriteOp,
+    StorageWriterConfig, spawn_single_writer,
 };
 use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
+
+const ENV_SCHEDULER_SNAPSHOT_INTERVAL_MS: &str = "VIZ_API_SCHEDULER_SNAPSHOT_INTERVAL_MS";
+const DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
+const ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: &str =
+    "VIZ_API_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS";
+const DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: u64 = 300_000;
+static SCHEDULER_SNAPSHOT_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 #[cfg(test)]
 use builder::RelayAttemptTrace;
@@ -49,9 +58,22 @@ use common::SourceId;
 #[cfg(test)]
 use event_log::{OppDetected, TxConfirmed, TxDecoded, TxFetched, TxReorged, TxSeen};
 #[cfg(test)]
-use scheduler::{ValidatedTransaction, scheduler_channel};
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use scheduler::scheduler_channel;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerRehydrationConfig {
+    pub snapshot_interval_ms: u64,
+    pub snapshot_max_finality_age_ms: u64,
+}
+
+impl Default for SchedulerRehydrationConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval_ms: DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS,
+            snapshot_max_finality_age_ms: DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,13 +89,22 @@ pub struct AppState {
     pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
 }
 
-#[derive(Clone)]
 pub struct RuntimeBootstrap {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
     pub scheduler: SchedulerHandle,
     pub live_rpc_config: LiveRpcConfig,
+    /// When true, the caller should rebuild the scheduler from the RPC pending pool
+    /// before relying on live ingest to converge pending state.
+    pub rebuild_scheduler_from_rpc: bool,
+    pub scheduler_snapshot_writer_abort: tokio::task::AbortHandle,
     pub ingest_mode: IngestSourceMode,
+}
+
+impl RuntimeBootstrap {
+    pub fn abort_background_tasks(&self) {
+        self.scheduler_snapshot_writer_abort.abort();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1018,6 +1049,31 @@ pub fn build_router(state: AppState) -> Router {
 
 pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    default_state_with_runtime_from_storage(storage)
+}
+
+pub fn default_state_with_runtime_from_storage(
+    storage: Arc<RwLock<InMemoryStorage>>,
+) -> (AppState, RuntimeBootstrap) {
+    default_state_with_runtime_from_storage_and_rehydration(
+        storage,
+        SchedulerRehydrationConfig {
+            snapshot_interval_ms: resolve_scheduler_snapshot_interval_ms(
+                env::var(ENV_SCHEDULER_SNAPSHOT_INTERVAL_MS).ok().as_deref(),
+            ),
+            snapshot_max_finality_age_ms: resolve_scheduler_snapshot_max_finality_age_ms(
+                env::var(ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
+                    .ok()
+                    .as_deref(),
+            ),
+        },
+    )
+}
+
+pub fn default_state_with_runtime_from_storage_and_rehydration(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> (AppState, RuntimeBootstrap) {
     let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
         Ok(Some(sink)) => Arc::new(sink),
         Ok(None) => Arc::new(NoopClickHouseSink),
@@ -1027,7 +1083,38 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         }
     };
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
-    let scheduler = spawn_scheduler(SchedulerConfig::default());
+    let rehydration_plan = storage
+        .read()
+        .ok()
+        .map(|guard| guard.scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms))
+        .unwrap_or_default();
+    let mut rebuild_scheduler_from_rpc = rehydration_plan.requires_rpc_rebuild;
+    let replay_events = rehydration_plan.replay_events;
+    let sanitized_snapshot = rehydration_plan
+        .snapshot
+        .map(|snapshot| sanitize_scheduler_snapshot_for_rehydration(snapshot, &replay_events));
+    let replay_transactions = replay_events
+        .iter()
+        .filter_map(validated_transaction_from_event)
+        .collect::<Vec<_>>();
+    let scheduler = match spawn_scheduler_with_rehydration(
+        SchedulerConfig::default(),
+        sanitized_snapshot,
+        replay_transactions,
+    ) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(?error, "failed to rehydrate scheduler from storage plan");
+            rebuild_scheduler_from_rpc = true;
+            spawn_scheduler_with_rehydration(SchedulerConfig::default(), None, Vec::new())
+                .expect("empty scheduler rehydration should succeed")
+        }
+    };
+    let snapshot_writer = spawn_scheduler_snapshot_writer(
+        writer.clone(),
+        scheduler.clone(),
+        rehydration.snapshot_interval_ms,
+    );
     let live_rpc_config = match LiveRpcConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -1094,6 +1181,8 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
             writer,
             scheduler,
             live_rpc_config,
+            rebuild_scheduler_from_rpc,
+            scheduler_snapshot_writer_abort: snapshot_writer.abort_handle(),
             ingest_mode,
         },
     )
@@ -1101,6 +1190,117 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
 
 pub fn default_state() -> AppState {
     default_state_with_runtime().0
+}
+
+pub fn spawn_scheduler_snapshot_writer(
+    writer: StorageWriteHandle,
+    scheduler: SchedulerHandle,
+    interval_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            match writer.try_reserve() {
+                Ok(permit) => {
+                    let snapshot =
+                        scheduler.persisted_snapshot(current_unix_ms(), current_mono_ns());
+                    permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot));
+                }
+                Err(StorageTryEnqueueError::QueueFull) => {
+                    tracing::warn!(
+                        "scheduler snapshot write dropped because storage queue is full"
+                    );
+                }
+                Err(StorageTryEnqueueError::QueueClosed) => {
+                    tracing::warn!(
+                        "scheduler snapshot writer stopped because storage queue closed"
+                    );
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn sanitize_scheduler_snapshot_for_rehydration(
+    mut snapshot: scheduler::PersistedSchedulerSnapshot,
+    replay_events: &[EventEnvelope],
+) -> scheduler::PersistedSchedulerSnapshot {
+    let mut removed_hashes = BTreeSet::new();
+
+    for event in replay_events {
+        match &event.payload {
+            EventPayload::TxDecoded(decoded) => {
+                removed_hashes.remove(&decoded.hash);
+            }
+            EventPayload::TxReorged(reorged) => {
+                removed_hashes.remove(&reorged.hash);
+            }
+            EventPayload::TxDropped(dropped) => {
+                removed_hashes.insert(dropped.hash);
+            }
+            EventPayload::TxReplaced(replaced) => {
+                removed_hashes.insert(replaced.hash);
+            }
+            EventPayload::TxConfirmedProvisional(confirmed)
+            | EventPayload::TxConfirmedFinal(confirmed) => {
+                removed_hashes.insert(confirmed.hash);
+            }
+            EventPayload::TxSeen(_)
+            | EventPayload::TxFetched(_)
+            | EventPayload::OppDetected(_)
+            | EventPayload::SimCompleted(_)
+            | EventPayload::BundleSubmitted(_)
+            | EventPayload::TxReady(_)
+            | EventPayload::TxBlocked(_) => {}
+        }
+    }
+
+    if removed_hashes.is_empty() {
+        return snapshot;
+    }
+
+    snapshot
+        .pending
+        .retain(|tx| !removed_hashes.contains(&tx.hash()));
+    snapshot
+        .executable_frontier
+        .retain(|hash| !removed_hashes.contains(hash));
+    for queue in &mut snapshot.sender_queues {
+        queue
+            .queued
+            .retain(|entry| !removed_hashes.contains(&entry.hash));
+    }
+    snapshot
+        .sender_queues
+        .retain(|queue| !queue.queued.is_empty());
+    snapshot
+}
+
+fn resolve_scheduler_snapshot_interval_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS)
+}
+
+fn resolve_scheduler_snapshot_max_finality_age_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
+}
+
+fn validated_transaction_from_event(event: &EventEnvelope) -> Option<ValidatedTransaction> {
+    match &event.payload {
+        EventPayload::TxDecoded(decoded) => Some(ValidatedTransaction {
+            source_id: event.source_id.clone(),
+            observed_at_unix_ms: event.ingest_ts_unix_ms,
+            observed_at_mono_ns: event.ingest_ts_mono_ns,
+            decoded: decoded.clone(),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1135,12 +1335,19 @@ fn hash_from_seq(seq: u64) -> [u8; 32] {
     hash
 }
 
-#[cfg(test)]
 fn current_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn current_mono_ns() -> u64 {
+    SCHEDULER_SNAPSHOT_MONO_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 fn format_bytes(bytes: &[u8]) -> String {
@@ -1187,6 +1394,8 @@ fn event_payload_type(payload: &EventPayload) -> &str {
         EventPayload::TxSeen(_) => "TxSeen",
         EventPayload::TxFetched(_) => "TxFetched",
         EventPayload::TxDecoded(_) => "TxDecoded",
+        EventPayload::TxReady(_) => "TxReady",
+        EventPayload::TxBlocked(_) => "TxBlocked",
         EventPayload::OppDetected(_) => "OppDetected",
         EventPayload::SimCompleted(_) => "SimCompleted",
         EventPayload::BundleSubmitted(_) => "BundleSubmitted",
