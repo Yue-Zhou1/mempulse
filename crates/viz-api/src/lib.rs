@@ -84,6 +84,20 @@ impl Default for SchedulerRehydrationConfig {
     }
 }
 
+pub type LiveRpcChainStatusProvider = Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+pub type LiveRpcDropMetricsProvider = Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSearcherMetricsProvider =
+    Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSimulationMetricsProvider =
+    Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+pub type ReplayRuntimeMetricsProvider = Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSimulationStatusProvider =
+    Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+pub type SchedulerSnapshotProvider = Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+pub type SchedulerMetricsProvider = Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+pub type BuilderSnapshotProvider = Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+pub type BuilderMetricsProvider = Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
@@ -93,36 +107,29 @@ pub struct AppState {
     pub alert_thresholds: AlertThresholdConfig,
     pub api_auth: ApiAuthConfig,
     pub api_rate_limiter: ApiRateLimiter,
-    pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
-    pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
-    pub live_rpc_searcher_metrics_provider:
-        Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
-    pub live_rpc_simulation_metrics_provider:
-        Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>,
-    pub replay_runtime_metrics_provider:
-        Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>,
-    pub live_rpc_simulation_status_provider:
-        Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>,
-    pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
-    pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
-    pub builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
-    pub builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+    pub live_rpc_chain_status_provider: LiveRpcChainStatusProvider,
+    pub live_rpc_drop_metrics_provider: LiveRpcDropMetricsProvider,
+    pub live_rpc_searcher_metrics_provider: LiveRpcSearcherMetricsProvider,
+    pub live_rpc_simulation_metrics_provider: LiveRpcSimulationMetricsProvider,
+    pub replay_runtime_metrics_provider: ReplayRuntimeMetricsProvider,
+    pub live_rpc_simulation_status_provider: LiveRpcSimulationStatusProvider,
+    pub scheduler_snapshot_provider: SchedulerSnapshotProvider,
+    pub scheduler_metrics_provider: SchedulerMetricsProvider,
+    pub builder_snapshot_provider: BuilderSnapshotProvider,
+    pub builder_metrics_provider: BuilderMetricsProvider,
 }
 
 #[derive(Clone)]
 pub struct RuntimeCoreViewProviders {
-    pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
-    pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
-    pub live_rpc_searcher_metrics_provider:
-        Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
-    pub live_rpc_simulation_metrics_provider:
-        Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>,
-    pub live_rpc_simulation_status_provider:
-        Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>,
-    pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
-    pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
-    pub builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
-    pub builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+    pub live_rpc_chain_status_provider: LiveRpcChainStatusProvider,
+    pub live_rpc_drop_metrics_provider: LiveRpcDropMetricsProvider,
+    pub live_rpc_searcher_metrics_provider: LiveRpcSearcherMetricsProvider,
+    pub live_rpc_simulation_metrics_provider: LiveRpcSimulationMetricsProvider,
+    pub live_rpc_simulation_status_provider: LiveRpcSimulationStatusProvider,
+    pub scheduler_snapshot_provider: SchedulerSnapshotProvider,
+    pub scheduler_metrics_provider: SchedulerMetricsProvider,
+    pub builder_snapshot_provider: BuilderSnapshotProvider,
+    pub builder_metrics_provider: BuilderMetricsProvider,
 }
 
 impl RuntimeCoreViewProviders {
@@ -1525,6 +1532,7 @@ pub fn spawn_scheduler_snapshot_writer(
     interval_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
     let writer = runtime_core.writer().clone();
+    let storage = runtime_core.storage().clone();
     let scheduler = runtime_core.scheduler().clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
@@ -1534,8 +1542,14 @@ pub fn spawn_scheduler_snapshot_writer(
             ticker.tick().await;
             match writer.try_reserve() {
                 Ok(permit) => {
-                    let snapshot =
+                    let event_seq_hi = storage
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.latest_seq_id())
+                        .unwrap_or(0);
+                    let mut snapshot =
                         scheduler.persisted_snapshot(current_unix_ms(), runtime_core.mono_ns());
+                    snapshot.event_seq_hi = event_seq_hi;
                     permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot));
                 }
                 Err(StorageTryEnqueueError::QueueFull) => {

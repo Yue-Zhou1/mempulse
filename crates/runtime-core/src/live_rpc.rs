@@ -471,17 +471,17 @@ async fn apply_simulation_task_outcome(
             return Ok(());
         }
 
-        if outcome.status == RemoteSimulationStatus::Ok {
-            if !append_event_with_owner(
+        if outcome.status == RemoteSimulationStatus::Ok
+            && !append_event_with_owner(
                 &task.state_owner,
                 &task.writer,
                 &task.chain,
                 &task.next_seq_id,
                 finished_unix_ms,
                 build_bundle_submitted_payload(&candidate.opportunity.record, &sim_event),
-            )? {
-                return Ok(());
-            }
+            )?
+        {
+            return Ok(());
         }
     }
 
@@ -616,24 +616,25 @@ pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> Li
     }
 }
 
+#[derive(Clone, Debug)]
+struct ChainStatusUpdate<'a> {
+    endpoint: &'a RpcEndpoint,
+    endpoint_index: usize,
+    state: &'a str,
+    last_error: Option<String>,
+    observed_pending: bool,
+    increment_rotation: bool,
+}
+
 impl LiveRpcStateOwner {
-    fn update_chain_status(
-        &self,
-        chain: &ChainRpcConfig,
-        endpoint: &RpcEndpoint,
-        endpoint_index: usize,
-        state: &str,
-        last_error: Option<String>,
-        observed_pending: bool,
-        increment_rotation: bool,
-    ) {
+    fn update_chain_status(&self, chain: &ChainRpcConfig, update: ChainStatusUpdate<'_>) {
         let now_unix_ms = current_unix_ms();
         let existing = self
             .handle()
             .chain_status()
             .into_iter()
             .find(|status| status.chain_key == chain.chain_key);
-        let last_pending_unix_ms = if observed_pending || state == "subscribed" {
+        let last_pending_unix_ms = if update.observed_pending || update.state == "subscribed" {
             Some(now_unix_ms)
         } else {
             existing
@@ -644,20 +645,20 @@ impl LiveRpcStateOwner {
             .as_ref()
             .map(|status| status.rotation_count)
             .unwrap_or(0)
-            .saturating_add(u64::from(increment_rotation));
+            .saturating_add(u64::from(update.increment_rotation));
         self.handle().upsert_chain_status(LiveRpcChainStatus {
             chain_key: chain.chain_key.clone(),
             chain_id: chain.chain_id,
             source_id: chain.source_id.to_string(),
-            state: state.to_owned(),
-            endpoint_index,
+            state: update.state.to_owned(),
+            endpoint_index: update.endpoint_index,
             endpoint_count: chain.endpoints.len(),
-            ws_url: endpoint.ws_url.clone(),
-            http_url: endpoint.http_url.clone(),
+            ws_url: update.endpoint.ws_url.clone(),
+            http_url: update.endpoint.http_url.clone(),
             last_pending_unix_ms,
             silent_for_ms: None,
             updated_unix_ms: now_unix_ms,
-            last_error,
+            last_error: update.last_error,
             rotation_count,
         });
     }
@@ -1127,23 +1128,19 @@ fn start_live_rpc_feed_with_owner(
 
     for chain in config.chains {
         let state_owner = state_owner.clone();
-        let writer = state_owner.handle().writer().clone();
-        let next_seq_id = next_seq_id.clone();
-        let scheduler = state_owner.handle().scheduler().clone();
-        let bootstrap_from_pending_pool = bootstrap_from_pending_pool;
+        let worker = LiveRpcChainWorkerContext {
+            writer: state_owner.handle().writer().clone(),
+            scheduler: state_owner.handle().scheduler().clone(),
+            next_seq_id: next_seq_id.clone(),
+            state_owner,
+            chain,
+            bootstrap_from_pending_pool,
+            max_seen_hashes,
+            batch_fetch,
+            silent_chain_timeout_secs,
+        };
         handle.spawn(async move {
-            run_chain_worker(
-                state_owner,
-                writer,
-                scheduler,
-                chain,
-                bootstrap_from_pending_pool,
-                max_seen_hashes,
-                batch_fetch,
-                silent_chain_timeout_secs,
-                next_seq_id,
-            )
-            .await;
+            run_chain_worker(worker).await;
         });
     }
 }
@@ -1189,7 +1186,7 @@ fn start_live_rpc_pending_pool_rebuild_with_owner(
     }
 }
 
-async fn run_chain_worker(
+struct LiveRpcChainWorkerContext {
     state_owner: LiveRpcStateOwner,
     writer: StorageWriteHandle,
     scheduler: SchedulerHandle,
@@ -1199,7 +1196,20 @@ async fn run_chain_worker(
     batch_fetch: BatchFetchConfig,
     silent_chain_timeout_secs: u64,
     next_seq_id: Arc<AtomicU64>,
-) {
+}
+
+async fn run_chain_worker(worker: LiveRpcChainWorkerContext) {
+    let LiveRpcChainWorkerContext {
+        state_owner,
+        writer,
+        scheduler,
+        chain,
+        bootstrap_from_pending_pool,
+        max_seen_hashes,
+        batch_fetch,
+        silent_chain_timeout_secs,
+        next_seq_id,
+    } = worker;
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
         .build()
@@ -1258,12 +1268,14 @@ async fn run_chain_worker(
     if let Some(initial_endpoint) = chain.endpoints.first() {
         state_owner.update_chain_status(
             &chain,
-            initial_endpoint,
-            endpoint_index,
-            "booting",
-            None,
-            false,
-            false,
+            ChainStatusUpdate {
+                endpoint: initial_endpoint,
+                endpoint_index,
+                state: "booting",
+                last_error: None,
+                observed_pending: false,
+                increment_rotation: false,
+            },
         );
     }
 
@@ -1271,12 +1283,14 @@ async fn run_chain_worker(
         let endpoint = &chain.endpoints[endpoint_index];
         state_owner.update_chain_status(
             &chain,
-            endpoint,
-            endpoint_index,
-            "connecting",
-            None,
-            false,
-            false,
+            ChainStatusUpdate {
+                endpoint,
+                endpoint_index,
+                state: "connecting",
+                last_error: None,
+                observed_pending: false,
+                increment_rotation: false,
+            },
         );
         tracing::info!(
             chain_key = %chain.chain_key,
@@ -1314,12 +1328,14 @@ async fn run_chain_worker(
             };
             state_owner.update_chain_status(
                 &chain,
-                endpoint,
-                endpoint_index,
-                state,
-                Some(error_chain.clone()),
-                false,
-                false,
+                ChainStatusUpdate {
+                    endpoint,
+                    endpoint_index,
+                    state,
+                    last_error: Some(error_chain.clone()),
+                    observed_pending: false,
+                    increment_rotation: false,
+                },
             );
             tracing::warn!(
                 error = %err,
@@ -1334,22 +1350,26 @@ async fn run_chain_worker(
             let next_endpoint = &chain.endpoints[endpoint_index];
             state_owner.update_chain_status(
                 &chain,
-                next_endpoint,
-                endpoint_index,
-                "rotating",
-                Some(error_chain),
-                false,
-                true,
+                ChainStatusUpdate {
+                    endpoint: next_endpoint,
+                    endpoint_index,
+                    state: "rotating",
+                    last_error: Some(error_chain),
+                    observed_pending: false,
+                    increment_rotation: true,
+                },
             );
         } else {
             state_owner.update_chain_status(
                 &chain,
-                endpoint,
-                endpoint_index,
-                "disconnected",
-                None,
-                false,
-                false,
+                ChainStatusUpdate {
+                    endpoint,
+                    endpoint_index,
+                    state: "disconnected",
+                    last_error: None,
+                    observed_pending: false,
+                    increment_rotation: false,
+                },
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1428,6 +1448,31 @@ struct LiveRpcSessionContext<'a> {
     next_seq_id: &'a Arc<AtomicU64>,
 }
 
+#[derive(Clone, Copy)]
+struct PendingTxProcessContext<'a> {
+    state_owner: &'a LiveRpcStateOwner,
+    writer: &'a StorageWriteHandle,
+    scheduler: &'a SchedulerHandle,
+    chain: &'a ChainRpcConfig,
+    next_seq_id: &'a Arc<AtomicU64>,
+}
+
+fn pending_tx_process_context<'a>(
+    state_owner: &'a LiveRpcStateOwner,
+    writer: &'a StorageWriteHandle,
+    scheduler: &'a SchedulerHandle,
+    chain: &'a ChainRpcConfig,
+    next_seq_id: &'a Arc<AtomicU64>,
+) -> PendingTxProcessContext<'a> {
+    PendingTxProcessContext {
+        state_owner,
+        writer,
+        scheduler,
+        chain,
+        next_seq_id,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingHashObservation {
     hash_hex: String,
@@ -1463,12 +1508,14 @@ async fn run_ws_session(
     );
     session.state_owner.update_chain_status(
         session.chain,
-        session.endpoint,
-        session.endpoint_index,
-        "subscribed",
-        None,
-        false,
-        false,
+        ChainStatusUpdate {
+            endpoint: session.endpoint,
+            endpoint_index: session.endpoint_index,
+            state: "subscribed",
+            last_error: None,
+            observed_pending: false,
+            increment_rotation: false,
+        },
     );
 
     let mut subscription_id: Option<String> = None;
@@ -1492,12 +1539,14 @@ async fn run_ws_session(
                             last_pending_unix_ms = observed_at_unix_ms;
                             session.state_owner.update_chain_status(
                                 session.chain,
-                                session.endpoint,
-                                session.endpoint_index,
-                                "active",
-                                None,
-                                true,
-                                false,
+                                ChainStatusUpdate {
+                                    endpoint: session.endpoint,
+                                    endpoint_index: session.endpoint_index,
+                                    state: "active",
+                                    last_error: None,
+                                    observed_pending: true,
+                                    increment_rotation: false,
+                                },
                             );
                         }
                     }
@@ -1716,14 +1765,16 @@ async fn process_pending_hash_batch(
         .zip(fetched.into_iter())
     {
         process_pending_hash_with_fetched_tx_with_owner(
-            &session.state_owner,
-            session.writer,
-            session.scheduler,
-            session.chain,
+            pending_tx_process_context(
+                &session.state_owner,
+                session.writer,
+                session.scheduler,
+                session.chain,
+                session.next_seq_id,
+            ),
             observation,
             hash,
             fetched_tx,
-            session.next_seq_id,
         )
         .await?;
     }
@@ -1787,15 +1838,18 @@ impl SchedulerPersistenceDecision {
 }
 
 async fn process_pending_hash_with_fetched_tx_with_owner(
-    state_owner: &LiveRpcStateOwner,
-    writer: &StorageWriteHandle,
-    scheduler: &SchedulerHandle,
-    chain: &ChainRpcConfig,
+    context: PendingTxProcessContext<'_>,
     observation: &PendingHashObservation,
     hash: TxHash,
     fetched_tx: Option<LiveTx>,
-    next_seq_id: &Arc<AtomicU64>,
 ) -> Result<()> {
+    let PendingTxProcessContext {
+        state_owner,
+        writer,
+        scheduler,
+        chain,
+        next_seq_id,
+    } = context;
     let processed_at_unix_ms = current_unix_ms();
     let feature_analysis = fetched_tx
         .as_ref()
@@ -2226,14 +2280,10 @@ async fn rebuild_scheduler_from_pending_transactions_with_owner(
             observed_at_mono_ns: state_owner.current_mono_ns(),
         };
         process_pending_hash_with_fetched_tx_with_owner(
-            state_owner,
-            writer,
-            scheduler,
-            chain,
+            pending_tx_process_context(state_owner, writer, scheduler, chain, next_seq_id),
             &observation,
             tx.hash,
             Some(tx.clone()),
-            next_seq_id,
         )
         .await?;
         rebuilt = rebuilt.saturating_add(1);
@@ -3770,11 +3820,10 @@ mod tests {
         quiet_ms: u64,
     ) -> Vec<StorageWriteOp> {
         let mut ops = Vec::new();
-        loop {
-            match tokio::time::timeout(Duration::from_millis(quiet_ms), storage_rx.recv()).await {
-                Ok(Some(op)) => ops.push(op),
-                Ok(None) | Err(_) => break,
-            }
+        while let Ok(Some(op)) =
+            tokio::time::timeout(Duration::from_millis(quiet_ms), storage_rx.recv()).await
+        {
+            ops.push(op);
         }
         ops
     }
@@ -4107,14 +4156,10 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(tx.hash, 1_700_000_000_003, 303),
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process tx");
@@ -4177,14 +4222,10 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(tx.hash, 1_700_000_000_008, 808),
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process tx");
@@ -4244,14 +4285,16 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &LiveRpcStateOwner::runtime_core(runtime_core.clone()),
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(
+                &LiveRpcStateOwner::runtime_core(runtime_core.clone()),
+                &writer,
+                &scheduler,
+                &chain,
+                &next_seq_id,
+            ),
             &sample_pending_observation(tx.hash, 1_700_000_000_007, 707),
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process tx");
@@ -4345,14 +4388,10 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(tx.hash, 1_700_000_000_004, 404),
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process tx");
@@ -4411,27 +4450,19 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(incumbent.hash, 1_700_000_000_005, 505),
             incumbent.hash,
             Some(incumbent.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process incumbent");
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(replacement.hash, 1_700_000_000_006, 606),
             replacement.hash,
             Some(replacement.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process replacement");
@@ -4503,14 +4534,10 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &observation,
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process tx");
@@ -4545,28 +4572,20 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(incumbent.hash, 1_700_000_000_001, 101),
             incumbent.hash,
             Some(incumbent.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process incumbent");
         let _ = drain_storage_ops(&mut storage_rx);
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(replacement.hash, 1_700_000_000_002, 202),
             replacement.hash,
             Some(replacement.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process replacement");
@@ -4612,14 +4631,10 @@ mod tests {
             .expect("fill scheduler handoff queue");
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(tx.hash, 1_700_000_000_003, 303),
             tx.hash,
             Some(tx.clone()),
-            &next_seq_id,
         )
         .await
         .expect("queue full falls back to legacy comparison writes");
@@ -4658,14 +4673,10 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         let error = process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(tx.hash, 1_700_000_000_010, 404),
             tx.hash,
             Some(tx),
-            &next_seq_id,
         )
         .await
         .expect_err("closed scheduler should fail before storage writes");
@@ -4690,28 +4701,20 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_7.hash, 1_700_000_000_001, 101),
             nonce_7.hash,
             Some(nonce_7.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 7");
         let _ = drain_storage_ops(&mut storage_rx);
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_9.hash, 1_700_000_000_002, 202),
             nonce_9.hash,
             Some(nonce_9.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 9");
@@ -4724,14 +4727,10 @@ mod tests {
         )));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_8.hash, 1_700_000_000_003, 303),
             nonce_8.hash,
             Some(nonce_8.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 8");
@@ -4770,28 +4769,20 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_7.hash, 1_700_000_000_001, 101),
             nonce_7.hash,
             Some(nonce_7),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 7");
         let _ = drain_storage_ops(&mut storage_rx);
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_9.hash, 1_700_000_000_002, 202),
             nonce_9.hash,
             Some(nonce_9.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 9");
@@ -4818,14 +4809,10 @@ mod tests {
         )));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_8.hash, 1_700_000_000_003, 303),
             nonce_8.hash,
             Some(nonce_8.clone()),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 8");
@@ -4870,42 +4857,30 @@ mod tests {
         let next_seq_id = Arc::new(AtomicU64::new(1));
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_7.hash, 1_700_000_000_011, 111),
             nonce_7.hash,
             Some(nonce_7),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 7");
         let _ = drain_storage_ops(&mut storage_rx);
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_9.hash, 1_700_000_000_012, 222),
             nonce_9.hash,
             Some(nonce_9),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 9");
         let _ = drain_storage_ops(&mut storage_rx);
 
         process_pending_hash_with_fetched_tx_with_owner(
-            &state_owner,
-            &writer,
-            &scheduler,
-            &chain,
+            pending_tx_process_context(&state_owner, &writer, &scheduler, &chain, &next_seq_id),
             &sample_pending_observation(nonce_8.hash, 1_700_000_000_013, 333),
             nonce_8.hash,
             Some(nonce_8),
-            &next_seq_id,
         )
         .await
         .expect("process nonce 8");

@@ -34,12 +34,14 @@ impl Default for IngestMode {
     }
 }
 
+type StartupHookFactory =
+    dyn FnOnce(Option<RuntimeCoreHandle>) -> Result<Option<ShutdownHook>> + Send;
+
 #[derive(Default)]
 pub struct NodeRuntimeBuilder {
     ingest_mode: IngestMode,
     runtime_core_start_args: Option<RuntimeCoreStartArgs>,
-    startup:
-        Option<Box<dyn FnOnce(Option<RuntimeCoreHandle>) -> Result<Option<ShutdownHook>> + Send>>,
+    startup: Option<Box<StartupHookFactory>>,
 }
 
 impl NodeRuntimeBuilder {

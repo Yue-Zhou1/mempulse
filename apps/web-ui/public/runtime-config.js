@@ -12,7 +12,7 @@ window.__MEMPULSE_UI_CONFIG__ = {
   // samplingLagThresholdMs: 30,
   // samplingStride: 5,
   // samplingFlushIdleMs: 500,
-  // heapEmergencyPurgeMb: 400,
+  // heapEmergencyPurgeMb: 250,
   // txRetentionMs: 240000,
   // detailCacheLimit: 128,
 };

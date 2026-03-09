@@ -373,10 +373,6 @@ impl InMemoryStorage {
 
     pub fn write_scheduler_snapshot(&mut self, snapshot: PersistedSchedulerSnapshot) {
         let start = Instant::now();
-        let mut snapshot = snapshot;
-        // Snapshots are generated with `event_seq_hi = 0`; storage stamps the
-        // latest durable event watermark at write time.
-        snapshot.event_seq_hi = self.latest_seq_id().unwrap_or(0);
         self.scheduler_snapshot = Some(snapshot);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();

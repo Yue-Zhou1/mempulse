@@ -1,11 +1,11 @@
 use common::{Address, SourceId};
-use event_log::TxDecoded;
+use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use runtime_core::{
     RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
 };
 use scheduler::{SchedulerConfig, ValidatedTransaction, scheduler_channel};
 use std::sync::{Arc, RwLock};
-use storage::{InMemoryStorage, NoopClickHouseSink, spawn_single_writer};
+use storage::{EventStore, InMemoryStorage, NoopClickHouseSink, spawn_single_writer};
 use tokio::time::{Duration, Instant, sleep};
 use viz_api::spawn_scheduler_snapshot_writer;
 
@@ -34,6 +34,16 @@ fn sample_validated_tx(hash_seed: u8, sender: Address, nonce: u64) -> ValidatedT
             max_fee_per_blob_gas_wei: None,
             calldata_len: Some(4),
         },
+    }
+}
+
+fn decoded_event(seq_id: u64, tx: &ValidatedTransaction) -> EventEnvelope {
+    EventEnvelope {
+        seq_id,
+        ingest_ts_unix_ms: tx.observed_at_unix_ms,
+        ingest_ts_mono_ns: tx.observed_at_mono_ns,
+        source_id: tx.source_id.clone(),
+        payload: EventPayload::TxDecoded(tx.decoded.clone()),
     }
 }
 
@@ -83,6 +93,52 @@ async fn scheduler_snapshot_writer_periodically_persists_scheduler_state() {
             .ok()
             .and_then(|guard| guard.scheduler_snapshot().cloned())
             .is_some_and(|snapshot| snapshot.pending.len() == 1)
+    })
+    .await;
+
+    snapshot_task.abort();
+    runtime_task.abort();
+}
+
+#[tokio::test]
+async fn scheduler_snapshot_writer_stamps_capture_time_event_watermark() {
+    let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    let writer = spawn_single_writer(
+        storage.clone(),
+        Arc::new(NoopClickHouseSink),
+        storage::StorageWriterConfig::default(),
+    );
+    let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+    let runtime_task = tokio::spawn(runtime.run());
+    let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
+        deps: RuntimeCoreDeps {
+            storage: storage.clone(),
+            writer,
+            scheduler: scheduler.clone(),
+        },
+        config: RuntimeCoreConfig {
+            ingest_mode: RuntimeIngestMode::Rpc,
+            rebuild_scheduler_from_rpc: false,
+        },
+    })
+    .expect("runtime core should start");
+    let snapshot_task = spawn_scheduler_snapshot_writer(runtime_core, 10);
+    let already_durable = sample_validated_tx(1, sender(0xa1), 7);
+    let pending = sample_validated_tx(2, sender(0xa1), 8);
+
+    storage
+        .write()
+        .expect("storage writable")
+        .append_event(decoded_event(1, &already_durable));
+
+    scheduler.admit(pending).await.expect("admit tx");
+
+    wait_for(|| {
+        storage
+            .read()
+            .ok()
+            .and_then(|guard| guard.scheduler_snapshot().cloned())
+            .is_some_and(|snapshot| snapshot.pending.len() == 1 && snapshot.event_seq_hi == 1)
     })
     .await;
 

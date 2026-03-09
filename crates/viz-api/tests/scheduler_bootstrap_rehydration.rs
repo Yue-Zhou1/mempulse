@@ -176,7 +176,7 @@ async fn binary_bootstrap_replays_post_snapshot_decoded_tail_events() {
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
-            event_seq_hi: 0,
+            event_seq_hi: 1,
             pending: vec![ready.clone()],
             executable_frontier: vec![ready.hash()],
             sender_queues: vec![PersistedSenderQueueSnapshot {
@@ -211,7 +211,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_confirmed_in_wal_tail() {
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
-            event_seq_hi: 0,
+            event_seq_hi: 1,
             pending: vec![ready.clone()],
             executable_frontier: vec![ready.hash()],
             sender_queues: vec![PersistedSenderQueueSnapshot {
@@ -251,7 +251,7 @@ async fn binary_bootstrap_recovers_reorged_transaction_without_tail_decode_event
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
-            event_seq_hi: 0,
+            event_seq_hi: 2,
             pending: Vec::new(),
             executable_frontier: Vec::new(),
             sender_queues: Vec::new(),
@@ -292,7 +292,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_replaced_in_wal_tail() {
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
-            event_seq_hi: 0,
+            event_seq_hi: 1,
             pending: vec![replaced.clone()],
             executable_frontier: vec![replaced.hash()],
             sender_queues: vec![PersistedSenderQueueSnapshot {

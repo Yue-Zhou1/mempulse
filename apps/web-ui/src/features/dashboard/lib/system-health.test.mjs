@@ -21,13 +21,25 @@ test('system health enters and exits sampling mode based on frame deltas', () =>
 test('system health triggers emergency purge on heap threshold breach', () => {
   let purged = 0;
   const monitor = createSystemHealthMonitor({
-    heapEmergencyPurgeMb: 400,
+    heapEmergencyPurgeMb: 250,
     onEmergencyPurge: () => {
       purged += 1;
     },
   });
 
-  monitor.recordHeapBytes(420 * 1024 * 1024);
+  monitor.recordHeapBytes(260 * 1024 * 1024);
+  assert.equal(purged, 1);
+});
+
+test('system health defaults emergency purge threshold to 250 MB', () => {
+  let purged = 0;
+  const monitor = createSystemHealthMonitor({
+    onEmergencyPurge: () => {
+      purged += 1;
+    },
+  });
+
+  monitor.recordHeapBytes(260 * 1024 * 1024);
   assert.equal(purged, 1);
 });
 

@@ -108,6 +108,63 @@ async fn storage_writer_persists_scheduler_snapshot() {
     assert_eq!(persisted, snapshot);
 }
 
+#[tokio::test]
+async fn storage_writer_preserves_snapshot_watermark_from_capture_time() {
+    let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    let handle = spawn_single_writer(
+        storage.clone(),
+        Arc::new(NoopClickHouseSink),
+        StorageWriterConfig::default(),
+    );
+    let ready = sample_validated_tx(1, sender(0xa1), 7);
+    let next = sample_validated_tx(2, sender(0xa1), 8);
+
+    handle
+        .enqueue(StorageWriteOp::AppendEvent(decoded_event(0, &ready)))
+        .await
+        .expect("enqueue initial decoded event");
+    sleep(Duration::from_millis(25)).await;
+
+    let snapshot = PersistedSchedulerSnapshot {
+        captured_at_unix_ms: 1_700_000_000_321,
+        captured_at_mono_ns: 321,
+        event_seq_hi: 1,
+        pending: vec![ready.clone()],
+        executable_frontier: vec![ready.hash()],
+        sender_queues: vec![PersistedSenderQueueSnapshot {
+            sender: sender(0xa1),
+            queued: vec![PersistedSenderQueueEntry {
+                nonce: 7,
+                hash: ready.hash(),
+            }],
+        }],
+    };
+
+    let permit = handle.try_reserve().expect("reserve snapshot slot");
+    handle
+        .enqueue(StorageWriteOp::AppendEvent(decoded_event(0, &next)))
+        .await
+        .expect("enqueue intervening decoded event");
+    permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot.clone()));
+    sleep(Duration::from_millis(25)).await;
+
+    let guard = storage.read().expect("storage readable");
+    let persisted = guard
+        .scheduler_snapshot()
+        .cloned()
+        .expect("scheduler snapshot persisted");
+    assert_eq!(persisted.event_seq_hi, snapshot.event_seq_hi);
+
+    let plan = guard.scheduler_rehydration_plan(60_000);
+    assert_eq!(
+        plan.replay_events
+            .into_iter()
+            .map(|event| event.seq_id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
 #[test]
 fn storage_rehydration_plan_returns_valid_snapshot_and_tail_events_after_watermark() {
     let mut storage = InMemoryStorage::default();
@@ -118,7 +175,7 @@ fn storage_rehydration_plan_returns_valid_snapshot_and_tail_events_after_waterma
     storage.write_scheduler_snapshot(PersistedSchedulerSnapshot {
         captured_at_unix_ms: 1_700_000_000_321,
         captured_at_mono_ns: 321,
-        event_seq_hi: 0,
+        event_seq_hi: 1,
         pending: vec![ready.clone()],
         executable_frontier: vec![ready.hash()],
         sender_queues: vec![PersistedSenderQueueSnapshot {

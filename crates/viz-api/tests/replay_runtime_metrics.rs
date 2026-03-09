@@ -95,7 +95,7 @@ async fn metrics_route_reports_replay_lag_checkpoint_duration_and_reorg_tail_dep
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
-            event_seq_hi: 0,
+            event_seq_hi: 1,
             pending: vec![tx.clone()],
             executable_frontier: vec![tx.hash()],
             sender_queues: Vec::new(),

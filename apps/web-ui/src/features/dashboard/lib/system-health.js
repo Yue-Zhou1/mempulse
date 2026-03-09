@@ -18,7 +18,7 @@ export function createSystemHealthMonitor(options = {}) {
   );
   const samplingStride = normalizeInt(options.samplingStride, 5, 1, 20);
   const samplingFlushIdleMs = normalizeInt(options.samplingFlushIdleMs, 500, 100, 2000);
-  const heapEmergencyPurgeMb = normalizeInt(options.heapEmergencyPurgeMb, 400, 128, 1024);
+  const heapEmergencyPurgeMb = normalizeInt(options.heapEmergencyPurgeMb, 250, 128, 1024);
   const emergencyPurgeThresholdBytes = heapEmergencyPurgeMb * 1024 * 1024;
   const setTimeoutFn = options.setTimeoutFn ?? globalThis?.setTimeout?.bind(globalThis);
   const clearTimeoutFn = options.clearTimeoutFn ?? globalThis?.clearTimeout?.bind(globalThis);

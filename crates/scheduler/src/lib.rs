@@ -113,8 +113,8 @@ pub struct PersistedSenderQueueSnapshot {
 pub struct PersistedSchedulerSnapshot {
     pub captured_at_unix_ms: i64,
     pub captured_at_mono_ns: u64,
-    /// Populated by the persistence layer when the snapshot is written.
-    /// Scheduler-generated snapshots leave this as `0`.
+    /// Filled by the caller with the event watermark captured alongside this
+    /// snapshot. Scheduler-generated snapshots leave this as `0` until stamped.
     #[serde(default)]
     pub event_seq_hi: u64,
     pub pending: Vec<ValidatedTransaction>,
@@ -187,7 +187,7 @@ pub struct SchedulerAdmissionOutcome {
 #[derive(Debug)]
 enum SchedulerCommand {
     Admit {
-        tx: ValidatedTransaction,
+        tx: Box<ValidatedTransaction>,
         reply_tx: Option<oneshot::Sender<SchedulerAdmissionOutcome>>,
     },
     RegisterCandidates {
@@ -220,7 +220,7 @@ impl SchedulerHandle {
         tx: ValidatedTransaction,
     ) -> Result<SchedulerAdmissionOutcome, SchedulerEnqueueError> {
         self.send_command_with_reply(|reply_tx| SchedulerCommand::Admit {
-            tx,
+            tx: Box::new(tx),
             reply_tx: Some(reply_tx),
         })
         .await
@@ -236,7 +236,10 @@ impl SchedulerHandle {
     }
 
     pub fn try_admit(&self, tx: ValidatedTransaction) -> Result<(), SchedulerEnqueueError> {
-        self.try_send_command(SchedulerCommand::Admit { tx, reply_tx: None })
+        self.try_send_command(SchedulerCommand::Admit {
+            tx: Box::new(tx),
+            reply_tx: None,
+        })
     }
 
     pub async fn register_candidates(
@@ -339,8 +342,8 @@ impl SchedulerHandle {
         captured_at_unix_ms: i64,
         captured_at_mono_ns: u64,
     ) -> PersistedSchedulerSnapshot {
-        // `event_seq_hi` is always left at 0 here and must be populated by the
-        // persistence layer when the snapshot is written.
+        // Callers must stamp `event_seq_hi` with the event watermark captured
+        // alongside this snapshot before persisting it.
         let state = self
             .shared
             .state
@@ -403,7 +406,7 @@ impl SchedulerRuntime {
         while let Some(command) = self.ingress_rx.recv().await {
             match command {
                 SchedulerCommand::Admit { tx, reply_tx } => {
-                    let result = self.shared.admit(tx);
+                    let result = self.shared.admit(*tx);
                     if let Some(reply_tx) = reply_tx {
                         let _ = reply_tx.send(result);
                     }
