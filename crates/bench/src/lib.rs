@@ -444,7 +444,10 @@ fn synthetic_scheduler_snapshot(
             handle.admit(transaction).await.expect("admit transaction");
         }
 
-        let snapshot = handle.persisted_snapshot(1_700_000_000_500, 500);
+        let mut snapshot = handle.persisted_snapshot(1_700_000_000_500, 500);
+        // The synthetic storage template preloads one decoded event per pending
+        // transaction, so the persisted snapshot must point at that prefix.
+        snapshot.event_seq_hi = transactions.len() as u64;
         runtime_task.abort();
         let _ = runtime_task.await;
         snapshot
