@@ -1649,8 +1649,11 @@ fn sanitize_scheduler_snapshot_for_rehydration(
             }
             EventPayload::TxSeen(_)
             | EventPayload::TxFetched(_)
+            | EventPayload::CandidateQueued(_)
+            | EventPayload::SimDispatched(_)
             | EventPayload::OppDetected(_)
             | EventPayload::SimCompleted(_)
+            | EventPayload::AssemblyDecisionApplied(_)
             | EventPayload::BundleSubmitted(_)
             | EventPayload::TxReady(_)
             | EventPayload::TxBlocked(_) => {}
@@ -1858,8 +1861,11 @@ fn event_payload_type(payload: &EventPayload) -> &str {
         EventPayload::TxDecoded(_) => "TxDecoded",
         EventPayload::TxReady(_) => "TxReady",
         EventPayload::TxBlocked(_) => "TxBlocked",
+        EventPayload::CandidateQueued(_) => "CandidateQueued",
+        EventPayload::SimDispatched(_) => "SimDispatched",
         EventPayload::OppDetected(_) => "OppDetected",
         EventPayload::SimCompleted(_) => "SimCompleted",
+        EventPayload::AssemblyDecisionApplied(_) => "AssemblyDecisionApplied",
         EventPayload::BundleSubmitted(_) => "BundleSubmitted",
         EventPayload::TxReplaced(_) => "TxReplaced",
         EventPayload::TxDropped(_) => "TxDropped",
@@ -4109,6 +4115,7 @@ mod tests {
             ready_total: 4,
             blocked_total: 2,
             sender_total: 3,
+            stale_simulation_drop_total: 8,
             queue_depth: 9,
             queue_depth_peak: 12,
             handoff_queue_capacity: 128,

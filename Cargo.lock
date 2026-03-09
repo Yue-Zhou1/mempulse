@@ -593,9 +593,12 @@ dependencies = [
  "common",
  "criterion",
  "event-log",
+ "scheduler",
  "searcher",
  "serde",
  "serde_json",
+ "storage",
+ "tokio",
 ]
 
 [[package]]

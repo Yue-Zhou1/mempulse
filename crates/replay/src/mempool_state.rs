@@ -3,7 +3,7 @@ use common::{Address, BlockHash, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxBlocked, TxDecoded, TxDropped, TxReady, TxReorged};
 use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<T> = HashSet<T, RandomState>;
@@ -25,6 +25,53 @@ pub struct ReplaySenderQueueEntry {
 pub struct ReplaySenderQueue {
     pub sender: Address,
     pub queued: Vec<ReplaySenderQueueEntry>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateLifecycleEntry {
+    #[serde(default)]
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+    #[serde(default)]
+    pub strategy: String,
+    #[serde(default)]
+    pub score: u32,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub feature_engine_version: String,
+    #[serde(default)]
+    pub scorer_version: String,
+    #[serde(default)]
+    pub strategy_version: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub detected_unix_ms: i64,
+    #[serde(default)]
+    pub simulation_status: Option<String>,
+    #[serde(default)]
+    pub assembly_status: Option<String>,
+    #[serde(default)]
+    pub simulation_block_number: Option<u64>,
+    #[serde(default)]
+    pub assembly_block_number: Option<u64>,
+    #[serde(default)]
+    pub assembly_reason: Option<String>,
+    #[serde(default)]
+    pub replaced_candidate_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateLifecycleSnapshot {
+    pub seq_id: u64,
+    #[serde(default)]
+    pub candidates: BTreeMap<String, CandidateLifecycleEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +145,12 @@ pub struct MempoolState {
     txs: FastMap<TxHash, TxEntry>,
     sender_queues: BTreeMap<Address, BTreeMap<u64, TxHash>>,
     block_confirmations: FastMap<BlockHash, FastSet<TxHash>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CandidateLifecycleState {
+    candidates: BTreeMap<String, CandidateLifecycleEntry>,
+    tx_candidates: BTreeMap<TxHash, BTreeSet<String>>,
 }
 
 impl MempoolState {
@@ -227,8 +280,11 @@ impl MempoolState {
             }
             EventPayload::TxSeen(_)
             | EventPayload::TxFetched(_)
+            | EventPayload::CandidateQueued(_)
+            | EventPayload::SimDispatched(_)
             | EventPayload::OppDetected(_)
             | EventPayload::SimCompleted(_)
+            | EventPayload::AssemblyDecisionApplied(_)
             | EventPayload::BundleSubmitted(_) => Vec::new(),
         }
     }
@@ -516,6 +572,77 @@ impl MempoolState {
                 entry.queue_state = Some(state);
             }
         }
+    }
+}
+
+impl CandidateLifecycleState {
+    pub fn apply_event(&mut self, event: &EventEnvelope) {
+        match &event.payload {
+            EventPayload::CandidateQueued(queued) => {
+                self.index_candidate(&queued.candidate_id, queued.tx_hash);
+                let entry = self.candidates.entry(queued.candidate_id.clone()).or_default();
+                entry.tx_hash = queued.tx_hash;
+                entry.member_tx_hashes = queued.member_tx_hashes.clone();
+                entry.chain_id = queued.chain_id;
+                entry.strategy = queued.strategy.clone();
+                entry.score = queued.score;
+                entry.protocol = queued.protocol.clone();
+                entry.category = queued.category.clone();
+                entry.feature_engine_version = queued.feature_engine_version.clone();
+                entry.scorer_version = queued.scorer_version.clone();
+                entry.strategy_version = queued.strategy_version.clone();
+                entry.reasons = queued.reasons.clone();
+                entry.detected_unix_ms = queued.detected_unix_ms;
+            }
+            EventPayload::SimDispatched(dispatched) => {
+                self.index_candidate(&dispatched.candidate_id, dispatched.tx_hash);
+                let entry = self
+                    .candidates
+                    .entry(dispatched.candidate_id.clone())
+                    .or_default();
+                entry.tx_hash = dispatched.tx_hash;
+                if entry.member_tx_hashes.is_empty() {
+                    entry.member_tx_hashes = dispatched.member_tx_hashes.clone();
+                }
+                entry.simulation_block_number = Some(dispatched.block_number);
+            }
+            EventPayload::SimCompleted(completed) => {
+                let candidate_ids = self
+                    .tx_candidates
+                    .get(&completed.hash)
+                    .cloned()
+                    .unwrap_or_default();
+                for candidate_id in candidate_ids {
+                    let entry = self.candidates.entry(candidate_id).or_default();
+                    entry.tx_hash = completed.hash;
+                    entry.simulation_status = Some(completed.status.clone());
+                }
+            }
+            EventPayload::AssemblyDecisionApplied(applied) => {
+                self.index_candidate(&applied.candidate_id, applied.tx_hash);
+                let entry = self.candidates.entry(applied.candidate_id.clone()).or_default();
+                entry.tx_hash = applied.tx_hash;
+                entry.assembly_status = Some(applied.decision.clone());
+                entry.assembly_block_number = Some(applied.block_number);
+                entry.assembly_reason = applied.reason.clone();
+                entry.replaced_candidate_ids = applied.replaced_candidate_ids.clone();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn snapshot(&self, seq_id: u64) -> CandidateLifecycleSnapshot {
+        CandidateLifecycleSnapshot {
+            seq_id,
+            candidates: self.candidates.clone(),
+        }
+    }
+
+    fn index_candidate(&mut self, candidate_id: &str, tx_hash: TxHash) {
+        self.tx_candidates
+            .entry(tx_hash)
+            .or_default()
+            .insert(candidate_id.to_owned());
     }
 }
 

@@ -42,6 +42,55 @@ impl Default for SchedulerConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerCandidate {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    pub score: u32,
+    pub strategy: String,
+    pub detected_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimulationTaskSpec {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    pub block_number: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerCandidateDispatch {
+    pub simulation_tasks: Vec<SimulationTaskSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSimulationResult {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    pub block_number: u64,
+    pub generation: u64,
+    pub approved: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerBuilderHandoff {
+    pub candidate: SchedulerCandidate,
+    pub block_number: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSimulationApplyOutcome {
+    pub builder_handoffs: Vec<SchedulerBuilderHandoff>,
+    pub stale_result_drop_total: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SenderQueueSnapshot {
     pub sender: Address,
@@ -79,6 +128,7 @@ pub struct SchedulerSnapshot {
     pub ready: Vec<ValidatedTransaction>,
     pub blocked: Vec<ValidatedTransaction>,
     pub sender_queues: Vec<SenderQueueSnapshot>,
+    pub candidates: Vec<SchedulerCandidate>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,6 +143,7 @@ pub struct SchedulerMetrics {
     pub ready_total: usize,
     pub blocked_total: usize,
     pub sender_total: usize,
+    pub stale_simulation_drop_total: u64,
     pub queue_depth: usize,
     pub queue_depth_peak: usize,
     pub handoff_queue_capacity: usize,
@@ -139,6 +190,22 @@ enum SchedulerCommand {
         tx: ValidatedTransaction,
         reply_tx: Option<oneshot::Sender<SchedulerAdmissionOutcome>>,
     },
+    RegisterCandidates {
+        candidates: Vec<SchedulerCandidate>,
+        reply_tx: oneshot::Sender<SchedulerCandidateDispatch>,
+    },
+    ApplySimulationResult {
+        result: SchedulerSimulationResult,
+        reply_tx: oneshot::Sender<SchedulerSimulationApplyOutcome>,
+    },
+    InvalidateCandidateHash {
+        hash: TxHash,
+        reply_tx: oneshot::Sender<()>,
+    },
+    AdvanceHead {
+        block_number: u64,
+        reply_tx: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -152,14 +219,11 @@ impl SchedulerHandle {
         &self,
         tx: ValidatedTransaction,
     ) -> Result<SchedulerAdmissionOutcome, SchedulerEnqueueError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.try_send_command(SchedulerCommand::Admit {
+        self.send_command_with_reply(|reply_tx| SchedulerCommand::Admit {
             tx,
             reply_tx: Some(reply_tx),
-        })?;
-        reply_rx
-            .await
-            .map_err(|_| SchedulerEnqueueError::QueueClosed)
+        })
+        .await
     }
 
     pub async fn admit(
@@ -173,6 +237,58 @@ impl SchedulerHandle {
 
     pub fn try_admit(&self, tx: ValidatedTransaction) -> Result<(), SchedulerEnqueueError> {
         self.try_send_command(SchedulerCommand::Admit { tx, reply_tx: None })
+    }
+
+    pub async fn register_candidates(
+        &self,
+        candidates: Vec<SchedulerCandidate>,
+    ) -> Result<SchedulerCandidateDispatch, SchedulerEnqueueError> {
+        self.send_command_with_reply(|reply_tx| SchedulerCommand::RegisterCandidates {
+            candidates,
+            reply_tx,
+        })
+        .await
+    }
+
+    pub async fn apply_simulation_result(
+        &self,
+        result: SchedulerSimulationResult,
+    ) -> Result<SchedulerSimulationApplyOutcome, SchedulerEnqueueError> {
+        self.send_command_with_reply(|reply_tx| SchedulerCommand::ApplySimulationResult {
+            result,
+            reply_tx,
+        })
+        .await
+    }
+
+    pub async fn invalidate_candidate_hash(
+        &self,
+        hash: TxHash,
+    ) -> Result<(), SchedulerEnqueueError> {
+        self.send_command_with_reply(|reply_tx| SchedulerCommand::InvalidateCandidateHash {
+            hash,
+            reply_tx,
+        })
+        .await
+    }
+
+    pub async fn advance_head(&self, block_number: u64) -> Result<(), SchedulerEnqueueError> {
+        self.send_command_with_reply(|reply_tx| SchedulerCommand::AdvanceHead {
+            block_number,
+            reply_tx,
+        })
+        .await
+    }
+
+    async fn send_command_with_reply<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<T>) -> SchedulerCommand,
+    ) -> Result<T, SchedulerEnqueueError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.try_send_command(build(reply_tx))?;
+        reply_rx
+            .await
+            .map_err(|_| SchedulerEnqueueError::QueueClosed)
     }
 
     fn try_send_command(&self, command: SchedulerCommand) -> Result<(), SchedulerEnqueueError> {
@@ -253,6 +369,7 @@ impl SchedulerHandle {
             ready_total: state.ready_total,
             blocked_total: state.blocked_total,
             sender_total: state.sender_queues.len(),
+            stale_simulation_drop_total: state.stale_simulation_drop_total,
             queue_depth,
             queue_depth_peak: self.shared.queue_depth_peak.load(Ordering::Relaxed),
             handoff_queue_capacity,
@@ -290,6 +407,26 @@ impl SchedulerRuntime {
                     if let Some(reply_tx) = reply_tx {
                         let _ = reply_tx.send(result);
                     }
+                }
+                SchedulerCommand::RegisterCandidates {
+                    candidates,
+                    reply_tx,
+                } => {
+                    let _ = reply_tx.send(self.shared.register_candidates(candidates));
+                }
+                SchedulerCommand::ApplySimulationResult { result, reply_tx } => {
+                    let _ = reply_tx.send(self.shared.apply_simulation_result(result));
+                }
+                SchedulerCommand::InvalidateCandidateHash { hash, reply_tx } => {
+                    self.shared.invalidate_candidate_hash(hash);
+                    let _ = reply_tx.send(());
+                }
+                SchedulerCommand::AdvanceHead {
+                    block_number,
+                    reply_tx,
+                } => {
+                    self.shared.advance_head(block_number);
+                    let _ = reply_tx.send(());
                 }
             }
         }
@@ -388,6 +525,14 @@ fn normalize_config(config: SchedulerConfig) -> SchedulerConfig {
     }
 }
 
+fn normalized_member_hashes(tx_hash: TxHash, members: &[TxHash]) -> Vec<TxHash> {
+    if members.is_empty() {
+        vec![tx_hash]
+    } else {
+        members.to_vec()
+    }
+}
+
 #[derive(Debug)]
 struct SharedState {
     config: SchedulerConfig,
@@ -404,6 +549,48 @@ impl SharedState {
             .unwrap_or_else(|poison| poison.into_inner());
         state.admit(tx, self.config)
     }
+
+    fn register_candidates(&self, candidates: Vec<SchedulerCandidate>) -> SchedulerCandidateDispatch {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.register_candidates(candidates)
+    }
+
+    fn apply_simulation_result(
+        &self,
+        result: SchedulerSimulationResult,
+    ) -> SchedulerSimulationApplyOutcome {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.apply_simulation_result(result)
+    }
+
+    fn advance_head(&self, block_number: u64) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.advance_head(block_number);
+    }
+
+    fn invalidate_candidate_hash(&self, hash: TxHash) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.invalidate_candidate_hash(hash);
+    }
+}
+
+#[derive(Debug)]
+struct CandidateEntry {
+    candidate: SchedulerCandidate,
+    block_number: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -411,11 +598,14 @@ struct SchedulerState {
     pending: BTreeMap<TxHash, ValidatedTransaction>,
     sender_queues: BTreeMap<Address, BTreeMap<u64, TxHash>>,
     sender_queue_counts: BTreeMap<Address, SenderQueueCounts>,
+    candidates: BTreeMap<String, CandidateEntry>,
+    head_block_number: u64,
     admitted_total: u64,
     duplicate_total: u64,
     replacement_total: u64,
     underpriced_replacement_total: u64,
     sender_limit_drop_total: u64,
+    stale_simulation_drop_total: u64,
     ready_total: usize,
     blocked_total: usize,
 }
@@ -447,6 +637,11 @@ impl SchedulerState {
             ready: classification.ready,
             blocked: classification.blocked,
             sender_queues: self.sender_queue_snapshots(),
+            candidates: self
+                .candidates
+                .values()
+                .map(|entry| entry.candidate.clone())
+                .collect(),
         }
     }
 
@@ -493,11 +688,14 @@ impl SchedulerState {
             pending,
             sender_queues,
             sender_queue_counts: BTreeMap::new(),
+            candidates: BTreeMap::new(),
+            head_block_number: 0,
             admitted_total: 0,
             duplicate_total: 0,
             replacement_total: 0,
             underpriced_replacement_total: 0,
             sender_limit_drop_total: 0,
+            stale_simulation_drop_total: 0,
             ready_total: 0,
             blocked_total: 0,
         };
@@ -604,6 +802,111 @@ impl SchedulerState {
         SchedulerAdmissionOutcome {
             admission: SchedulerAdmission::Admitted,
             queue_transitions: self.queue_transitions(sender, &previous_positions),
+        }
+    }
+
+    fn register_candidates(
+        &mut self,
+        candidates: Vec<SchedulerCandidate>,
+    ) -> SchedulerCandidateDispatch {
+        let simulation_tasks = candidates
+            .into_iter()
+            .map(|candidate| {
+                let generation = self
+                    .candidates
+                    .get(&candidate.candidate_id)
+                    .map(|entry| entry.generation.saturating_add(1).max(1))
+                    .unwrap_or(1);
+                let task = SimulationTaskSpec {
+                    candidate_id: candidate.candidate_id.clone(),
+                    tx_hash: candidate.tx_hash,
+                    member_tx_hashes: normalized_member_hashes(
+                        candidate.tx_hash,
+                        &candidate.member_tx_hashes,
+                    ),
+                    block_number: self.head_block_number,
+                    generation,
+                };
+                self.candidates.insert(
+                    candidate.candidate_id.clone(),
+                    CandidateEntry {
+                        candidate,
+                        block_number: self.head_block_number,
+                        generation,
+                    },
+                );
+                task
+            })
+            .collect();
+
+        SchedulerCandidateDispatch { simulation_tasks }
+    }
+
+    fn apply_simulation_result(
+        &mut self,
+        result: SchedulerSimulationResult,
+    ) -> SchedulerSimulationApplyOutcome {
+        let Some(entry) = self.candidates.get(&result.candidate_id) else {
+            return self.record_stale_simulation_result();
+        };
+        let expected_members =
+            normalized_member_hashes(entry.candidate.tx_hash, &entry.candidate.member_tx_hashes);
+        let actual_members = normalized_member_hashes(result.tx_hash, &result.member_tx_hashes);
+        if entry.candidate.tx_hash != result.tx_hash
+            || expected_members != actual_members
+            || entry.block_number != result.block_number
+            || entry.generation != result.generation
+            || result.block_number != self.head_block_number
+        {
+            return self.record_stale_simulation_result();
+        }
+
+        let next_generation = entry.generation.saturating_add(1).max(1);
+        let handoff = result.approved.then(|| SchedulerBuilderHandoff {
+            candidate: entry.candidate.clone(),
+            block_number: result.block_number,
+        });
+
+        if let Some(entry) = self.candidates.get_mut(&result.candidate_id) {
+            entry.generation = next_generation;
+        }
+
+        SchedulerSimulationApplyOutcome {
+            builder_handoffs: handoff.into_iter().collect(),
+            stale_result_drop_total: 0,
+        }
+    }
+
+    fn advance_head(&mut self, block_number: u64) {
+        self.head_block_number = block_number;
+    }
+
+    fn invalidate_candidate_hash(&mut self, hash: TxHash) {
+        let candidate_ids = self
+            .candidates
+            .iter()
+            .filter_map(|(candidate_id, entry)| {
+                let members = normalized_member_hashes(
+                    entry.candidate.tx_hash,
+                    &entry.candidate.member_tx_hashes,
+                );
+                (entry.candidate.tx_hash == hash || members.contains(&hash))
+                    .then(|| candidate_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for candidate_id in candidate_ids {
+            if let Some(entry) = self.candidates.get_mut(&candidate_id) {
+                entry.generation = entry.generation.saturating_add(1).max(1);
+            }
+        }
+    }
+
+    fn record_stale_simulation_result(&mut self) -> SchedulerSimulationApplyOutcome {
+        self.stale_simulation_drop_total = self.stale_simulation_drop_total.saturating_add(1);
+        SchedulerSimulationApplyOutcome {
+            builder_handoffs: Vec::new(),
+            stale_result_drop_total: 1,
         }
     }
 

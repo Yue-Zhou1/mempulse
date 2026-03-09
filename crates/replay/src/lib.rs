@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use mempool_state::{
-    MempoolState, ReplayQueueState, ReplaySenderQueue, ReplaySenderQueueEntry, StateTransition,
+    CandidateLifecycleEntry, CandidateLifecycleSnapshot, CandidateLifecycleState, MempoolState,
+    ReplayQueueState, ReplaySenderQueue, ReplaySenderQueueEntry, StateTransition,
     TxLifecycleStatus,
 };
 pub use sim_engine::{
@@ -101,6 +102,24 @@ pub fn lifecycle_snapshot(
     lifecycle_checkpoints(events, &[checkpoint_seq_id])
         .into_iter()
         .next()
+}
+
+pub fn candidate_lifecycle_snapshot(
+    events: &[EventEnvelope],
+    checkpoint_seq_id: u64,
+) -> Option<CandidateLifecycleSnapshot> {
+    let mut sorted = events.to_vec();
+    sort_deterministic(&mut sorted);
+
+    let mut state = CandidateLifecycleState::default();
+    for event in sorted {
+        state.apply_event(&event);
+        if event.seq_id == checkpoint_seq_id {
+            return Some(state.snapshot(event.seq_id));
+        }
+    }
+
+    None
 }
 
 pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {

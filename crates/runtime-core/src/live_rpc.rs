@@ -9,8 +9,9 @@ use anyhow::{Context, Result, anyhow};
 use builder::{AssemblyCandidate, AssemblyDecision};
 use common::{Address, SourceId, TxHash};
 use event_log::{
-    BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxBlocked, TxDecoded, TxDropped,
-    TxFetched, TxReady, TxReplaced, TxSeen,
+    AssemblyDecisionApplied, BundleSubmitted, CandidateQueued, EventPayload, OppDetected,
+    SimCompleted, SimDispatched, TxBlocked, TxDecoded, TxDropped, TxFetched, TxReady, TxReplaced,
+    TxSeen,
 };
 use feature_engine::{
     FeatureAnalysis, FeatureInput, analyze_transaction, version as feature_engine_version,
@@ -18,8 +19,9 @@ use feature_engine::{
 use futures::{SinkExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
 use scheduler::{
-    SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, SchedulerQueueState,
-    SchedulerQueueTransition, ValidatedTransaction,
+    SchedulerAdmission, SchedulerCandidate, SchedulerEnqueueError, SchedulerHandle,
+    SchedulerQueueState, SchedulerQueueTransition, SchedulerSimulationResult,
+    SimulationTaskSpec, ValidatedTransaction,
 };
 use searcher::{OpportunityCandidate, SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, de::IgnoredAny};
@@ -109,14 +111,24 @@ enum RemoteSimulationStatus {
 #[derive(Clone)]
 struct SimulationTask {
     state_owner: LiveRpcStateOwner,
-    task_key: String,
-    generation: u64,
     chain: ChainRpcConfig,
     request: RemoteSimulationRequest,
-    opportunities: Vec<ExecutableOpportunity>,
+    candidates: Vec<RegisteredSimulationCandidate>,
     writer: StorageWriteHandle,
     next_seq_id: Arc<AtomicU64>,
     enqueued_unix_ms: i64,
+}
+
+#[derive(Clone)]
+struct RegisteredSimulationCandidate {
+    spec: SimulationTaskSpec,
+    opportunity: ExecutableOpportunity,
+}
+
+struct BuilderDecisionRecord {
+    tx_hash: TxHash,
+    block_number: u64,
+    decision: AssemblyDecision,
 }
 
 #[derive(Clone)]
@@ -261,12 +273,8 @@ impl LiveRpcStateOwner {
         self.handle().mono_ns()
     }
 
-    fn enqueue_simulation_task(&self, task: SimulationTask) -> Result<()> {
+    fn enqueue_simulation_task(&self, task: SimulationTask) -> Result<bool> {
         self.simulation_service.enqueue(self, task)
-    }
-
-    fn invalidate_simulation_hash(&self, hash: TxHash) {
-        self.handle().invalidate_simulation_hash(hash);
     }
 }
 
@@ -317,25 +325,18 @@ impl LiveRpcSimulationService {
         runtime.clone()
     }
 
-    fn enqueue(&self, owner: &LiveRpcStateOwner, mut task: SimulationTask) -> Result<()> {
+    fn enqueue(&self, owner: &LiveRpcStateOwner, task: SimulationTask) -> Result<bool> {
         let runtime = self.runtime();
-        let task_key = task.task_key.clone();
-        let next_generation = owner.handle().next_simulation_generation(&task_key);
-        task.generation = next_generation;
-        let members = task.request.member_tx_hashes.clone();
         match runtime.ingress_tx.try_send(task) {
             Ok(()) => {
-                owner
-                    .handle()
-                    .commit_simulation_enqueue(&task_key, next_generation, &members);
                 owner.configure_simulation_queue(self.queue_capacity, self.worker_total);
                 owner.observe_simulation_enqueue();
-                Ok(())
+                Ok(true)
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 owner.configure_simulation_queue(self.queue_capacity, self.worker_total);
                 owner.observe_simulation_queue_full_drop();
-                Ok(())
+                Ok(false)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Err(anyhow!("live rpc simulation queue closed"))
@@ -378,16 +379,6 @@ async fn run_simulation_worker(receiver: Arc<Mutex<mpsc::Receiver<SimulationTask
 
         task.state_owner.observe_simulation_dequeue();
 
-        let is_current = task
-            .state_owner
-            .handle()
-            .is_current_simulation_task(&task.task_key, task.generation);
-        if !is_current {
-            task.state_owner.observe_simulation_stale_drop();
-            task.state_owner.observe_simulation_finish();
-            continue;
-        }
-
         let started_unix_ms = current_unix_ms();
         let outcome = simulate_remote_request_with_owner(
             &task.state_owner,
@@ -398,16 +389,6 @@ async fn run_simulation_worker(receiver: Arc<Mutex<mpsc::Receiver<SimulationTask
         .await;
         let finished_unix_ms = current_unix_ms();
 
-        let still_current = task
-            .state_owner
-            .handle()
-            .is_current_simulation_task(&task.task_key, task.generation);
-        if !still_current {
-            task.state_owner.observe_simulation_stale_drop();
-            task.state_owner.observe_simulation_finish();
-            continue;
-        }
-
         match outcome {
             Ok(outcome) => {
                 if let Err(err) = apply_simulation_task_outcome(
@@ -415,7 +396,9 @@ async fn run_simulation_worker(receiver: Arc<Mutex<mpsc::Receiver<SimulationTask
                     &outcome,
                     started_unix_ms,
                     finished_unix_ms,
-                ) {
+                )
+                .await
+                {
                     tracing::warn!(
                         error = %err,
                         chain_key = %task.chain.chain_key,
@@ -434,22 +417,16 @@ async fn run_simulation_worker(receiver: Arc<Mutex<mpsc::Receiver<SimulationTask
             }
         }
 
-        {
-            task.state_owner
-                .handle()
-                .complete_simulation_task(&task.task_key, task.generation);
-        }
         task.state_owner.observe_simulation_finish();
     }
 }
 
-fn apply_simulation_task_outcome(
+async fn apply_simulation_task_outcome(
     task: &SimulationTask,
     outcome: &RemoteSimulationOutcome,
     started_unix_ms: i64,
     finished_unix_ms: i64,
 ) -> Result<()> {
-    apply_builder_assembly_state_with_owner(&task.state_owner, task, outcome);
     task.state_owner
         .record_simulation_status(build_simulation_status_snapshot(
             task,
@@ -458,8 +435,31 @@ fn apply_simulation_task_outcome(
             finished_unix_ms,
         ));
 
-    for opportunity in &task.opportunities {
-        let sim_event = build_sim_completed_payload(&opportunity.record, outcome);
+    let mut accepted_candidate_ids = BTreeSet::new();
+    for candidate in &task.candidates {
+        let applied = task
+            .state_owner
+            .handle()
+            .scheduler()
+            .apply_simulation_result(SchedulerSimulationResult {
+                candidate_id: candidate.spec.candidate_id.clone(),
+                tx_hash: candidate.spec.tx_hash,
+                member_tx_hashes: candidate.spec.member_tx_hashes.clone(),
+                block_number: candidate.spec.block_number,
+                generation: candidate.spec.generation,
+                approved: outcome.status == RemoteSimulationStatus::Ok,
+            })
+            .await
+            .map_err(|error| anyhow!("scheduler simulation apply failed: {error:?}"))?;
+        if applied.stale_result_drop_total > 0 {
+            task.state_owner.observe_simulation_stale_drop();
+            continue;
+        }
+        if !applied.builder_handoffs.is_empty() {
+            accepted_candidate_ids.insert(candidate.spec.candidate_id.clone());
+        }
+
+        let sim_event = build_sim_completed_payload(&candidate.opportunity.record, outcome);
         if !append_event_with_owner(
             &task.state_owner,
             &task.writer,
@@ -478,15 +478,31 @@ fn apply_simulation_task_outcome(
                 &task.chain,
                 &task.next_seq_id,
                 finished_unix_ms,
-                build_bundle_submitted_payload(&opportunity.record, &sim_event),
+                build_bundle_submitted_payload(&candidate.opportunity.record, &sim_event),
             )? {
                 return Ok(());
             }
-            if !try_enqueue_storage_write_with_owner(
+        }
+    }
+
+    if !accepted_candidate_ids.is_empty() {
+        for decision_record in apply_builder_assembly_state_with_owner(
+            &task.state_owner,
+            task,
+            outcome,
+            &accepted_candidate_ids,
+        ) {
+            if !append_event_with_owner(
                 &task.state_owner,
                 &task.writer,
                 &task.chain,
-                StorageWriteOp::UpsertOpportunity(opportunity.record.clone()),
+                &task.next_seq_id,
+                finished_unix_ms,
+                build_assembly_decision_payload(
+                    decision_record.tx_hash,
+                    decision_record.block_number,
+                    &decision_record.decision,
+                ),
             )? {
                 return Ok(());
             }
@@ -503,9 +519,9 @@ fn build_simulation_status_snapshot(
     finished_unix_ms: i64,
 ) -> LiveRpcSimulationStatusSnapshot {
     let bundle_id = task
-        .opportunities
+        .candidates
         .first()
-        .map(|opportunity| bundle_id_for_opportunity(&opportunity.record))
+        .map(|candidate| bundle_id_for_opportunity(&candidate.opportunity.record))
         .unwrap_or_else(|| build_bundle_id(task.request.tx_hash, task.request.detected_unix_ms));
     LiveRpcSimulationStatusSnapshot {
         id: outcome.sim_id.clone(),
@@ -524,18 +540,31 @@ fn apply_builder_assembly_state_with_owner(
     state_owner: &LiveRpcStateOwner,
     task: &SimulationTask,
     outcome: &RemoteSimulationOutcome,
-) {
+    accepted_candidate_ids: &BTreeSet<String>,
+) -> Vec<BuilderDecisionRecord> {
     let Some(batch) = outcome.simulation_batch.as_ref() else {
-        return;
+        return Vec::new();
     };
 
-    for opportunity in &task.opportunities {
-        match AssemblyCandidate::from_simulated_opportunity(&opportunity.candidate, batch) {
-            Ok(candidate) => {
-                let simulation_block_number = candidate.simulation.block_number;
+    let mut decisions = Vec::new();
+    for registered_candidate in &task.candidates {
+        if !accepted_candidate_ids.contains(&registered_candidate.spec.candidate_id) {
+            continue;
+        }
+        match AssemblyCandidate::from_simulated_opportunity(
+            &registered_candidate.opportunity.candidate,
+            batch,
+        ) {
+            Ok(builder_candidate) => {
+                let simulation_block_number = builder_candidate.simulation.block_number;
                 let decision = state_owner
                     .handle()
-                    .with_builder_engine_mut(|engine| engine.insert(candidate));
+                    .with_builder_engine_mut(|engine| engine.insert(builder_candidate));
+                decisions.push(BuilderDecisionRecord {
+                    tx_hash: registered_candidate.opportunity.record.tx_hash,
+                    block_number: simulation_block_number,
+                    decision: decision.clone(),
+                });
                 match decision {
                     AssemblyDecision::Inserted {
                         candidate_id,
@@ -543,7 +572,9 @@ fn apply_builder_assembly_state_with_owner(
                     } => {
                         tracing::debug!(
                             candidate_id,
-                            tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                            tx_hash = %format_fixed_hex(
+                                &registered_candidate.opportunity.record.tx_hash
+                            ),
                             simulation_block_number,
                             replaced_candidate_ids = ?replaced_candidate_ids,
                             "builder candidate inserted into live assembly state"
@@ -555,7 +586,9 @@ fn apply_builder_assembly_state_with_owner(
                     } => {
                         tracing::debug!(
                             candidate_id,
-                            tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                            tx_hash = %format_fixed_hex(
+                                &registered_candidate.opportunity.record.tx_hash
+                            ),
                             simulation_block_number,
                             reason,
                             "builder candidate rejected from live assembly state"
@@ -566,12 +599,14 @@ fn apply_builder_assembly_state_with_owner(
             Err(err) => {
                 tracing::warn!(
                     error = ?err,
-                    tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                    tx_hash = %format_fixed_hex(&registered_candidate.opportunity.record.tx_hash),
                     "failed to materialize builder candidate from simulation result"
                 );
             }
         }
     }
+
+    decisions
 }
 
 pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> LiveRpcDropReason {
@@ -1963,7 +1998,10 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
             )? {
                 return Ok(());
             }
-            state_owner.invalidate_simulation_hash(replaced_hash);
+            scheduler
+                .invalidate_candidate_hash(replaced_hash)
+                .await
+                .map_err(|error| anyhow!("scheduler candidate invalidation failed: {error:?}"))?;
         }
         if scheduler_decision.emits_decoded()
             && !append_event_with_owner(
@@ -2034,20 +2072,90 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
                 return Ok(());
             }
         }
-        for (task_key, request, opportunities) in
-            build_simulation_batches(&executable_opportunities, &simulation_context_transactions)
-        {
-            state_owner.enqueue_simulation_task(SimulationTask {
-                state_owner: state_owner.clone(),
-                task_key,
-                generation: 0,
-                chain: chain.clone(),
-                request,
-                opportunities,
-                writer: writer.clone(),
-                next_seq_id: next_seq_id.clone(),
-                enqueued_unix_ms: processed_at_unix_ms,
-            })?;
+        let prepared_simulation_tasks = executable_opportunities
+            .iter()
+            .filter_map(|opportunity| {
+                build_remote_simulation_request(opportunity, &simulation_context_transactions)
+                    .map(|request| {
+                        (
+                            scheduler_candidate_from_executable_opportunity(opportunity),
+                            request,
+                            opportunity.clone(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !prepared_simulation_tasks.is_empty() {
+            let dispatch = scheduler
+                .register_candidates(
+                    prepared_simulation_tasks
+                        .iter()
+                        .map(|(candidate, _, _)| candidate.clone())
+                        .collect(),
+                )
+                .await
+                .map_err(|error| anyhow!("scheduler candidate registration failed: {error:?}"))?;
+            let mut grouped_tasks =
+                BTreeMap::<String, (RemoteSimulationRequest, Vec<RegisteredSimulationCandidate>)>::new();
+            for (task_spec, (candidate, request, opportunity)) in dispatch
+                .simulation_tasks
+                .into_iter()
+                .zip(prepared_simulation_tasks.into_iter())
+            {
+                if !append_event_with_owner(
+                    state_owner,
+                    writer,
+                    chain,
+                    next_seq_id,
+                    processed_at_unix_ms,
+                    build_candidate_queued_payload(&candidate, &opportunity.record),
+                )? {
+                    return Ok(());
+                }
+                let task_key = simulation_task_key(&request);
+                grouped_tasks
+                    .entry(task_key)
+                    .and_modify(|(_, candidates)| {
+                        candidates.push(RegisteredSimulationCandidate {
+                            spec: task_spec.clone(),
+                            opportunity: opportunity.clone(),
+                        });
+                    })
+                    .or_insert_with(|| {
+                        (
+                            request,
+                            vec![RegisteredSimulationCandidate {
+                                spec: task_spec,
+                                opportunity,
+                            }],
+                        )
+                    });
+            }
+            for (_, (request, candidates)) in grouped_tasks {
+                let enqueued = state_owner.enqueue_simulation_task(SimulationTask {
+                    state_owner: state_owner.clone(),
+                    chain: chain.clone(),
+                    request,
+                    candidates: candidates.clone(),
+                    writer: writer.clone(),
+                    next_seq_id: next_seq_id.clone(),
+                    enqueued_unix_ms: processed_at_unix_ms,
+                })?;
+                if enqueued {
+                    for candidate in &candidates {
+                        if !append_event_with_owner(
+                            state_owner,
+                            writer,
+                            chain,
+                            next_seq_id,
+                            processed_at_unix_ms,
+                            build_sim_dispatched_payload(&candidate.spec),
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2456,30 +2564,55 @@ fn build_opportunity_detected_payload(opportunity: &OpportunityRecord) -> EventP
     })
 }
 
-fn build_simulation_batches(
-    opportunities: &[ExecutableOpportunity],
-    executable: &[ValidatedTransaction],
-) -> Vec<(String, RemoteSimulationRequest, Vec<ExecutableOpportunity>)> {
-    let mut batches =
-        BTreeMap::<String, (RemoteSimulationRequest, Vec<ExecutableOpportunity>)>::new();
+fn build_candidate_queued_payload(
+    candidate: &SchedulerCandidate,
+    opportunity: &OpportunityRecord,
+) -> EventPayload {
+    EventPayload::CandidateQueued(CandidateQueued {
+        candidate_id: candidate.candidate_id.clone(),
+        tx_hash: candidate.tx_hash,
+        member_tx_hashes: candidate.member_tx_hashes.clone(),
+        chain_id: opportunity.chain_id,
+        strategy: candidate.strategy.clone(),
+        score: candidate.score,
+        protocol: opportunity.protocol.clone(),
+        category: opportunity.category.clone(),
+        feature_engine_version: opportunity.feature_engine_version.clone(),
+        scorer_version: opportunity.scorer_version.clone(),
+        strategy_version: opportunity.strategy_version.clone(),
+        reasons: opportunity.reasons.clone(),
+        detected_unix_ms: candidate.detected_unix_ms,
+    })
+}
 
-    for opportunity in opportunities {
-        let Some(request) = build_remote_simulation_request(opportunity, executable) else {
-            continue;
-        };
-        let task_key = simulation_task_key(&request);
-        batches
-            .entry(task_key)
-            .and_modify(|(_, grouped)| grouped.push(opportunity.clone()))
-            .or_insert_with(|| (request, vec![opportunity.clone()]));
+fn build_sim_dispatched_payload(spec: &SimulationTaskSpec) -> EventPayload {
+    EventPayload::SimDispatched(SimDispatched {
+        candidate_id: spec.candidate_id.clone(),
+        tx_hash: spec.tx_hash,
+        member_tx_hashes: spec.member_tx_hashes.clone(),
+        block_number: spec.block_number,
+    })
+}
+
+fn scheduler_candidate_from_executable_opportunity(
+    opportunity: &ExecutableOpportunity,
+) -> SchedulerCandidate {
+    SchedulerCandidate {
+        candidate_id: format!(
+            "{:?}:{}",
+            opportunity.candidate.strategy,
+            format_fixed_hex(&opportunity.record.tx_hash)
+        ),
+        tx_hash: opportunity.record.tx_hash,
+        member_tx_hashes: if opportunity.candidate.member_tx_hashes.is_empty() {
+            vec![opportunity.record.tx_hash]
+        } else {
+            opportunity.candidate.member_tx_hashes.clone()
+        },
+        score: opportunity.record.score,
+        strategy: opportunity.record.strategy.clone(),
+        detected_unix_ms: opportunity.record.detected_unix_ms,
     }
-
-    batches
-        .into_iter()
-        .map(|(task_key, (request, grouped_opportunities))| {
-            (task_key, request, grouped_opportunities)
-        })
-        .collect()
 }
 
 fn build_remote_simulation_request(
@@ -2637,6 +2770,37 @@ fn build_sim_completed_payload(
         fail_category: outcome.fail_category.clone(),
         latency_ms: Some(outcome.latency_ms),
         tx_count: Some(outcome.tx_count),
+    }
+}
+
+fn build_assembly_decision_payload(
+    tx_hash: TxHash,
+    block_number: u64,
+    decision: &AssemblyDecision,
+) -> EventPayload {
+    match decision {
+        AssemblyDecision::Inserted {
+            candidate_id,
+            replaced_candidate_ids,
+        } => EventPayload::AssemblyDecisionApplied(AssemblyDecisionApplied {
+            candidate_id: candidate_id.clone(),
+            tx_hash,
+            decision: "inserted".to_owned(),
+            replaced_candidate_ids: replaced_candidate_ids.clone(),
+            reason: None,
+            block_number,
+        }),
+        AssemblyDecision::Rejected {
+            candidate_id,
+            reason,
+        } => EventPayload::AssemblyDecisionApplied(AssemblyDecisionApplied {
+            candidate_id: candidate_id.clone(),
+            tx_hash,
+            decision: "rejected".to_owned(),
+            replaced_candidate_ids: Vec::new(),
+            reason: Some(reason.clone()),
+            block_number,
+        }),
     }
 }
 
@@ -3995,6 +4159,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_pending_hash_with_fetched_tx_emits_scheduler_lifecycle_events() {
+        let (_rpc_state, rpc_addr, server) =
+            start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
+        let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
+        let writer = StorageWriteHandle::from_sender(storage_tx);
+        let (scheduler, runtime) =
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+        let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
+
+        let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
+        let tx = sample_swap_live_tx(0xd1, 0x51, 7, 120);
+        let next_seq_id = Arc::new(AtomicU64::new(1));
+
+        process_pending_hash_with_fetched_tx_with_owner(
+            &state_owner,
+            &writer,
+            &scheduler,
+            &chain,
+            &sample_pending_observation(tx.hash, 1_700_000_000_008, 808),
+            tx.hash,
+            Some(tx.clone()),
+            &next_seq_id,
+        )
+        .await
+        .expect("process tx");
+
+        let ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::CandidateQueued(queued),
+                ..
+            } if queued.tx_hash == tx.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::SimDispatched(dispatched),
+                ..
+            } if dispatched.tx_hash == tx.hash
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::AssemblyDecisionApplied(decision),
+                ..
+            } if decision.tx_hash == tx.hash && decision.decision == "inserted"
+        )));
+
+        runtime_task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn process_pending_hash_with_runtime_core_owner_updates_runtime_core_views() {
         let (rpc_state, rpc_addr, server) =
             start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
@@ -4038,6 +4257,13 @@ mod tests {
         let metrics = runtime_core.simulation_metrics();
         assert_eq!(metrics.completed_total, 1);
         assert_eq!(metrics.ok_total, 1);
+        assert!(
+            runtime_core
+                .scheduler_snapshot()
+                .candidates
+                .iter()
+                .any(|candidate| candidate.tx_hash == tx.hash)
+        );
         assert_eq!(runtime_core.builder_snapshot().candidates.len(), 1);
         assert_eq!(runtime_core.builder_metrics().inserted_total, 1);
         assert_eq!(
@@ -4136,9 +4362,12 @@ mod tests {
                 ..
             } if sim.hash == tx.hash
         )));
-        assert!(!immediate_ops.iter().any(|op| matches!(
+        assert!(immediate_ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::CandidateQueued(queued),
+                ..
+            } if queued.tx_hash == tx.hash
         )));
 
         let eventual_ops = drain_storage_ops_until_quiet(&mut storage_rx, 250).await;
@@ -4151,7 +4380,10 @@ mod tests {
         )));
         assert!(eventual_ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::AssemblyDecisionApplied(decision),
+                ..
+            } if decision.tx_hash == tx.hash && decision.decision == "inserted"
         )));
 
         runtime_task.abort();
@@ -4168,7 +4400,7 @@ mod tests {
         let (scheduler, runtime) =
             scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
         let runtime_task = tokio::spawn(runtime.run());
-        let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
+        let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
         let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let incumbent = sample_swap_live_tx(0xc5, 0x45, 7, 120);
@@ -4211,7 +4443,10 @@ mod tests {
         )));
         assert!(!ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == incumbent.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::AssemblyDecisionApplied(decision),
+                ..
+            } if decision.tx_hash == incumbent.hash
         )));
         assert!(ops.iter().any(|op| matches!(
             op,
@@ -4222,8 +4457,12 @@ mod tests {
         )));
         assert!(ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == replacement.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::AssemblyDecisionApplied(decision),
+                ..
+            } if decision.tx_hash == replacement.hash && decision.decision == "inserted"
         )));
+        assert!(runtime_core.scheduler_metrics().stale_simulation_drop_total >= 1);
 
         runtime_task.abort();
         server.abort();
@@ -4394,7 +4633,10 @@ mod tests {
         )));
         assert!(!ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == tx.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::CandidateQueued(queued),
+                ..
+            } if queued.tx_hash == tx.hash
         )));
     }
 
@@ -4566,7 +4808,10 @@ mod tests {
         )));
         assert!(!blocked_ops.iter().any(|op| matches!(
             op,
-            StorageWriteOp::UpsertOpportunity(record) if record.tx_hash == nonce_9.hash
+            StorageWriteOp::AppendPayload {
+                payload: EventPayload::CandidateQueued(queued),
+                ..
+            } if queued.tx_hash == nonce_9.hash
         )));
 
         process_pending_hash_with_fetched_tx_with_owner(

@@ -6,7 +6,10 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::{Address, PeerId, SourceId, TxHash};
-use event_log::{EventEnvelope, EventPayload, GlobalSequencer, cmp_deterministic};
+use event_log::{
+    AssemblyDecisionApplied, CandidateQueued, EventEnvelope, EventPayload, GlobalSequencer,
+    cmp_deterministic,
+};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
 use scheduler::PersistedSchedulerSnapshot;
@@ -105,6 +108,17 @@ pub struct OpportunityRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuilderLifecycleRecord {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    pub decision: String,
+    pub replaced_candidate_ids: Vec<String>,
+    pub reason: Option<String>,
+    pub block_number: u64,
+    pub updated_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxLifecycleRecord {
     pub hash: TxHash,
     pub status: String,
@@ -184,6 +198,7 @@ pub struct InMemoryStorage {
     tx_features_lookup: FastMap<TxHash, TxFeaturesRecord>,
     feature_summary_counts: FastMap<(String, String), u64>,
     opportunities: VecDeque<OpportunityRecord>,
+    builder_lifecycle: VecDeque<BuilderLifecycleRecord>,
     tx_lifecycle: VecDeque<TxLifecycleRecord>,
     tx_lifecycle_counts: FastMap<TxHash, usize>,
     tx_lifecycle_lookup: FastMap<TxHash, TxLifecycleRecord>,
@@ -228,6 +243,7 @@ impl InMemoryStorage {
             tx_features_lookup: FastMap::default(),
             feature_summary_counts: FastMap::default(),
             opportunities: VecDeque::new(),
+            builder_lifecycle: VecDeque::new(),
             tx_lifecycle: VecDeque::new(),
             tx_lifecycle_counts: FastMap::default(),
             tx_lifecycle_lookup: FastMap::default(),
@@ -323,6 +339,13 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    pub fn upsert_builder_lifecycle(&mut self, record: BuilderLifecycleRecord) {
+        let start = Instant::now();
+        push_bounded(&mut self.builder_lifecycle, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
+    }
+
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
         push_bounded_hash_indexed(
@@ -388,6 +411,10 @@ impl InMemoryStorage {
                 .then_with(|| a.strategy.cmp(&b.strategy))
         });
         out
+    }
+
+    pub fn builder_lifecycle(&self) -> &VecDeque<BuilderLifecycleRecord> {
+        &self.builder_lifecycle
     }
 
     pub fn dashboard_feature_summary(&self, limit: usize) -> Vec<FeatureSummaryBucket> {
@@ -605,6 +632,17 @@ impl EventStore for InMemoryStorage {
             );
         }
 
+        // Event append is the authority boundary; flat tables are derived here.
+        if let EventPayload::CandidateQueued(queued) = &event.payload {
+            self.upsert_opportunity(project_opportunity_from_candidate(queued));
+        }
+        if let EventPayload::AssemblyDecisionApplied(applied) = &event.payload {
+            self.upsert_builder_lifecycle(project_builder_lifecycle(
+                applied,
+                event.ingest_ts_unix_ms,
+            ));
+        }
+
         let lifecycle_update = match &event.payload {
             EventPayload::TxDecoded(decoded) => Some(TxLifecycleRecord {
                 hash: decoded.hash,
@@ -652,8 +690,11 @@ impl EventStore for InMemoryStorage {
             }),
             EventPayload::TxSeen(_)
             | EventPayload::TxFetched(_)
+            | EventPayload::CandidateQueued(_)
+            | EventPayload::SimDispatched(_)
             | EventPayload::OppDetected(_)
             | EventPayload::SimCompleted(_)
+            | EventPayload::AssemblyDecisionApplied(_)
             | EventPayload::BundleSubmitted(_)
             | EventPayload::TxReady(_)
             | EventPayload::TxBlocked(_) => None,
@@ -1132,6 +1173,37 @@ fn format_hash(hash: &TxHash) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn project_opportunity_from_candidate(payload: &CandidateQueued) -> OpportunityRecord {
+    OpportunityRecord {
+        tx_hash: payload.tx_hash,
+        chain_id: payload.chain_id,
+        strategy: payload.strategy.clone(),
+        score: payload.score,
+        protocol: payload.protocol.clone(),
+        category: payload.category.clone(),
+        feature_engine_version: payload.feature_engine_version.clone(),
+        scorer_version: payload.scorer_version.clone(),
+        strategy_version: payload.strategy_version.clone(),
+        reasons: payload.reasons.clone(),
+        detected_unix_ms: payload.detected_unix_ms,
+    }
+}
+
+fn project_builder_lifecycle(
+    payload: &AssemblyDecisionApplied,
+    updated_unix_ms: i64,
+) -> BuilderLifecycleRecord {
+    BuilderLifecycleRecord {
+        candidate_id: payload.candidate_id.clone(),
+        tx_hash: payload.tx_hash,
+        decision: payload.decision.clone(),
+        replaced_candidate_ids: payload.replaced_candidate_ids.clone(),
+        reason: payload.reason.clone(),
+        block_number: payload.block_number,
+        updated_unix_ms,
+    }
 }
 
 #[cfg(test)]
