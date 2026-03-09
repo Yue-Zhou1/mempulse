@@ -1,5 +1,8 @@
 use common::{Address, SourceId};
 use event_log::TxDecoded;
+use runtime_core::{
+    RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
+};
 use scheduler::{SchedulerConfig, ValidatedTransaction, scheduler_channel};
 use std::sync::{Arc, RwLock};
 use storage::{InMemoryStorage, NoopClickHouseSink, spawn_single_writer};
@@ -55,7 +58,19 @@ async fn scheduler_snapshot_writer_periodically_persists_scheduler_state() {
     );
     let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
     let runtime_task = tokio::spawn(runtime.run());
-    let snapshot_task = spawn_scheduler_snapshot_writer(writer, scheduler.clone(), 10);
+    let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
+        deps: RuntimeCoreDeps {
+            storage: storage.clone(),
+            writer,
+            scheduler: scheduler.clone(),
+        },
+        config: RuntimeCoreConfig {
+            ingest_mode: RuntimeIngestMode::Rpc,
+            rebuild_scheduler_from_rpc: false,
+        },
+    })
+    .expect("runtime core should start");
+    let snapshot_task = spawn_scheduler_snapshot_writer(runtime_core, 10);
 
     scheduler
         .admit(sample_validated_tx(1, sender(0xa1), 7))

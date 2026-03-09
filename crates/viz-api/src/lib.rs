@@ -19,13 +19,15 @@ use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
-    live_rpc_builder_metrics_snapshot, live_rpc_builder_snapshot, live_rpc_chain_status_snapshot,
-    live_rpc_drop_metrics_snapshot, live_rpc_searcher_metrics_snapshot,
-    live_rpc_simulation_metrics_snapshot, live_rpc_simulation_status_snapshot,
+    LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
+};
+use runtime_core::{
+    RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreHandle, RuntimeCoreStartArgs,
+    RuntimeIngestMode,
 };
 use scheduler::{
     SchedulerConfig, SchedulerHandle, SchedulerMetrics, SchedulerSnapshot, ValidatedTransaction,
@@ -35,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
@@ -51,7 +53,6 @@ const DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: &str =
     "VIZ_API_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS";
 const DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: u64 = 300_000;
-static SCHEDULER_SNAPSHOT_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 #[cfg(test)]
 use builder::{
@@ -83,6 +84,7 @@ impl Default for SchedulerRehydrationConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
+    pub dashboard_stream_broadcaster: Arc<DashboardStreamBroadcaster>,
     pub downsample_limit: usize,
     pub relay_dry_run_status: Arc<RwLock<RelayDryRunStatus>>,
     pub alert_thresholds: AlertThresholdConfig,
@@ -92,10 +94,73 @@ pub struct AppState {
     pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
     pub live_rpc_searcher_metrics_provider:
         Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
+    pub live_rpc_simulation_metrics_provider:
+        Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>,
+    pub live_rpc_simulation_status_provider:
+        Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>,
     pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
     pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
     pub builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
     pub builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeCoreViewProviders {
+    pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
+    pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+    pub live_rpc_searcher_metrics_provider:
+        Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
+    pub live_rpc_simulation_metrics_provider:
+        Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>,
+    pub live_rpc_simulation_status_provider:
+        Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>,
+    pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
+    pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
+    pub builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
+    pub builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+}
+
+impl RuntimeCoreViewProviders {
+    pub fn from_runtime_core(handle: RuntimeCoreHandle) -> Self {
+        Self {
+            live_rpc_chain_status_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.chain_status())
+            },
+            live_rpc_drop_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.drop_metrics())
+            },
+            live_rpc_searcher_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.searcher_metrics())
+            },
+            live_rpc_simulation_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.simulation_metrics())
+            },
+            live_rpc_simulation_status_provider: {
+                let handle = handle.clone();
+                Arc::new(move |id| handle.simulation_status(id))
+            },
+            scheduler_snapshot_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.scheduler_snapshot())
+            },
+            scheduler_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.scheduler_metrics())
+            },
+            builder_snapshot_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.builder_snapshot())
+            },
+            builder_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.builder_metrics())
+            },
+        }
+    }
 }
 
 pub struct RuntimeBootstrap {
@@ -106,13 +171,82 @@ pub struct RuntimeBootstrap {
     /// When true, the caller should rebuild the scheduler from the RPC pending pool
     /// before relying on live ingest to converge pending state.
     pub rebuild_scheduler_from_rpc: bool,
-    pub scheduler_snapshot_writer_abort: tokio::task::AbortHandle,
+    scheduler_snapshot_interval_ms: u64,
+    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     pub ingest_mode: IngestSourceMode,
+}
+
+#[derive(Clone)]
+pub struct RuntimeBootstrapStartup {
+    pub live_rpc_config: LiveRpcConfig,
+    pub rebuild_scheduler_from_rpc: bool,
+    scheduler_snapshot_interval_ms: u64,
+    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl RuntimeBootstrap {
     pub fn abort_background_tasks(&self) {
-        self.scheduler_snapshot_writer_abort.abort();
+        abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+    }
+
+    pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
+        start_scheduler_snapshot_writer_once(
+            &self.scheduler_snapshot_writer_abort,
+            self.scheduler_snapshot_interval_ms,
+            runtime_core,
+        );
+    }
+
+    pub fn runtime_core_start_args(&self, ingest_mode: RuntimeIngestMode) -> RuntimeCoreStartArgs {
+        RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: self.storage.clone(),
+                writer: self.writer.clone(),
+                scheduler: self.scheduler.clone(),
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode,
+                rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            },
+        }
+    }
+
+    pub fn into_runtime_startup(
+        self,
+        ingest_mode: RuntimeIngestMode,
+    ) -> (RuntimeCoreStartArgs, RuntimeBootstrapStartup) {
+        let start_args = RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: self.storage,
+                writer: self.writer,
+                scheduler: self.scheduler,
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode,
+                rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            },
+        };
+        let startup = RuntimeBootstrapStartup {
+            live_rpc_config: self.live_rpc_config,
+            rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            scheduler_snapshot_interval_ms: self.scheduler_snapshot_interval_ms,
+            scheduler_snapshot_writer_abort: self.scheduler_snapshot_writer_abort,
+        };
+        (start_args, startup)
+    }
+}
+
+impl RuntimeBootstrapStartup {
+    pub fn abort_background_tasks(&self) {
+        abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+    }
+
+    pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
+        start_scheduler_snapshot_writer_once(
+            &self.scheduler_snapshot_writer_abort,
+            self.scheduler_snapshot_interval_ms,
+            runtime_core,
+        );
     }
 }
 
@@ -1063,10 +1197,26 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
     default_state_with_runtime_from_storage(storage)
 }
 
+pub fn default_runtime_bootstrap() -> RuntimeBootstrap {
+    let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    runtime_bootstrap_from_storage(storage)
+}
+
 pub fn default_state_with_runtime_from_storage(
     storage: Arc<RwLock<InMemoryStorage>>,
 ) -> (AppState, RuntimeBootstrap) {
-    default_state_with_runtime_from_storage_and_rehydration(
+    let bootstrap = runtime_bootstrap_from_storage(storage);
+    let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
+    bootstrap.start_background_tasks(runtime_core.clone());
+    let state = app_state_from_runtime_core(
+        &runtime_core,
+        RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
+    );
+    (state, bootstrap)
+}
+
+pub fn runtime_bootstrap_from_storage(storage: Arc<RwLock<InMemoryStorage>>) -> RuntimeBootstrap {
+    runtime_bootstrap_from_storage_and_rehydration(
         storage,
         SchedulerRehydrationConfig {
             snapshot_interval_ms: resolve_scheduler_snapshot_interval_ms(
@@ -1085,6 +1235,105 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
     storage: Arc<RwLock<InMemoryStorage>>,
     rehydration: SchedulerRehydrationConfig,
 ) -> (AppState, RuntimeBootstrap) {
+    let bootstrap = runtime_bootstrap_from_storage_and_rehydration(storage, rehydration);
+    let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
+    bootstrap.start_background_tasks(runtime_core.clone());
+    let state = app_state_from_runtime_core(
+        &runtime_core,
+        RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
+    );
+    (state, bootstrap)
+}
+
+pub fn runtime_bootstrap_from_storage_and_rehydration(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> RuntimeBootstrap {
+    runtime_bootstrap_from_storage_and_rehydration_impl(storage, rehydration)
+}
+
+pub fn app_state_from_runtime_bootstrap(
+    bootstrap: &RuntimeBootstrap,
+    runtime_views: RuntimeCoreViewProviders,
+) -> AppState {
+    build_app_state(bootstrap.storage.clone(), runtime_views)
+}
+
+pub fn app_state_from_runtime_core(
+    runtime_core: &RuntimeCoreHandle,
+    runtime_views: RuntimeCoreViewProviders,
+) -> AppState {
+    build_app_state(runtime_core.storage().clone(), runtime_views)
+}
+
+fn build_app_state(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    runtime_views: RuntimeCoreViewProviders,
+) -> AppState {
+    let propagation = vec![
+        PropagationEdge {
+            source: "peer-a".to_owned(),
+            destination: "peer-b".to_owned(),
+            p50_delay_ms: 8,
+            p99_delay_ms: 24,
+        },
+        PropagationEdge {
+            source: "peer-a".to_owned(),
+            destination: "peer-c".to_owned(),
+            p50_delay_ms: 12,
+            p99_delay_ms: 36,
+        },
+    ];
+
+    let api_auth = ApiAuthConfig::from_env();
+    if api_auth.enabled && api_auth.api_keys.is_empty() {
+        tracing::warn!(
+            "api auth enabled but no API keys configured; all protected routes will return unauthorized"
+        );
+    }
+    let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
+    let provider = Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1));
+    let dashboard_stream_broadcaster = dashboard_stream_broadcaster(provider.clone());
+    AppState {
+        provider,
+        dashboard_stream_broadcaster,
+        downsample_limit: 1_000,
+        relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+        alert_thresholds: AlertThresholdConfig::default(),
+        api_auth,
+        api_rate_limiter,
+        live_rpc_chain_status_provider: runtime_views.live_rpc_chain_status_provider,
+        live_rpc_drop_metrics_provider: runtime_views.live_rpc_drop_metrics_provider,
+        live_rpc_searcher_metrics_provider: runtime_views.live_rpc_searcher_metrics_provider,
+        live_rpc_simulation_metrics_provider: runtime_views.live_rpc_simulation_metrics_provider,
+        live_rpc_simulation_status_provider: runtime_views.live_rpc_simulation_status_provider,
+        scheduler_snapshot_provider: runtime_views.scheduler_snapshot_provider,
+        scheduler_metrics_provider: runtime_views.scheduler_metrics_provider,
+        builder_snapshot_provider: runtime_views.builder_snapshot_provider,
+        builder_metrics_provider: runtime_views.builder_metrics_provider,
+    }
+}
+
+fn start_runtime_core_for_bootstrap(bootstrap: &RuntimeBootstrap) -> RuntimeCoreHandle {
+    RuntimeCore::start(
+        bootstrap
+            .runtime_core_start_args(runtime_ingest_mode_from_source_mode(bootstrap.ingest_mode)),
+    )
+    .expect("runtime core should start for viz-api state")
+}
+
+fn runtime_ingest_mode_from_source_mode(mode: IngestSourceMode) -> RuntimeIngestMode {
+    match mode {
+        IngestSourceMode::Rpc => RuntimeIngestMode::Rpc,
+        IngestSourceMode::P2p => RuntimeIngestMode::P2p,
+        IngestSourceMode::Hybrid => RuntimeIngestMode::Hybrid,
+    }
+}
+
+fn runtime_bootstrap_from_storage_and_rehydration_impl(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> RuntimeBootstrap {
     let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
         Ok(Some(sink)) => Arc::new(sink),
         Ok(None) => Arc::new(NoopClickHouseSink),
@@ -1127,11 +1376,6 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
                 .expect("empty scheduler rehydration should succeed")
         }
     };
-    let snapshot_writer = spawn_scheduler_snapshot_writer(
-        writer.clone(),
-        scheduler.clone(),
-        rehydration.snapshot_interval_ms,
-    );
     let live_rpc_config = match LiveRpcConfig::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -1141,77 +1385,16 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
     };
     let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
 
-    let propagation = vec![
-        PropagationEdge {
-            source: "peer-a".to_owned(),
-            destination: "peer-b".to_owned(),
-            p50_delay_ms: 8,
-            p99_delay_ms: 24,
-        },
-        PropagationEdge {
-            source: "peer-a".to_owned(),
-            destination: "peer-c".to_owned(),
-            p50_delay_ms: 12,
-            p99_delay_ms: 36,
-        },
-    ];
-
-    let api_auth = ApiAuthConfig::from_env();
-    if api_auth.enabled && api_auth.api_keys.is_empty() {
-        tracing::warn!(
-            "api auth enabled but no API keys configured; all protected routes will return unauthorized"
-        );
+    RuntimeBootstrap {
+        storage: storage.clone(),
+        writer,
+        scheduler,
+        live_rpc_config,
+        rebuild_scheduler_from_rpc,
+        scheduler_snapshot_interval_ms: rehydration.snapshot_interval_ms,
+        scheduler_snapshot_writer_abort: Arc::new(Mutex::new(None)),
+        ingest_mode,
     }
-    let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
-    let live_rpc_chain_status_provider = Arc::new(live_rpc_chain_status_snapshot)
-        as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
-    let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
-        as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
-    let live_rpc_searcher_metrics_provider = Arc::new(live_rpc_searcher_metrics_snapshot)
-        as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
-    let scheduler_for_snapshot = scheduler.clone();
-    let scheduler_for_metrics = scheduler.clone();
-    let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
-        as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
-    let scheduler_metrics_provider = Arc::new(move || scheduler_for_metrics.metrics())
-        as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
-    let builder_snapshot_provider =
-        Arc::new(live_rpc_builder_snapshot) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
-    let builder_metrics_provider = Arc::new(live_rpc_builder_metrics_snapshot)
-        as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
-
-    let state = AppState {
-        provider: Arc::new(InMemoryVizProvider::new(
-            storage.clone(),
-            Arc::new(propagation),
-            1,
-        )),
-        downsample_limit: 1_000,
-        relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
-        alert_thresholds: AlertThresholdConfig::default(),
-        api_auth,
-        api_rate_limiter,
-        live_rpc_chain_status_provider,
-        live_rpc_drop_metrics_provider,
-        live_rpc_searcher_metrics_provider,
-        scheduler_snapshot_provider,
-        scheduler_metrics_provider,
-        builder_snapshot_provider,
-        builder_metrics_provider,
-    };
-
-    (
-        state,
-        RuntimeBootstrap {
-            storage: storage.clone(),
-            writer,
-            scheduler,
-            live_rpc_config,
-            rebuild_scheduler_from_rpc,
-            scheduler_snapshot_writer_abort: snapshot_writer.abort_handle(),
-            ingest_mode,
-        },
-    )
 }
 
 pub fn default_state() -> AppState {
@@ -1219,10 +1402,11 @@ pub fn default_state() -> AppState {
 }
 
 pub fn spawn_scheduler_snapshot_writer(
-    writer: StorageWriteHandle,
-    scheduler: SchedulerHandle,
+    runtime_core: RuntimeCoreHandle,
     interval_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
+    let writer = runtime_core.writer().clone();
+    let scheduler = runtime_core.scheduler().clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1232,7 +1416,7 @@ pub fn spawn_scheduler_snapshot_writer(
             match writer.try_reserve() {
                 Ok(permit) => {
                     let snapshot =
-                        scheduler.persisted_snapshot(current_unix_ms(), current_mono_ns());
+                        scheduler.persisted_snapshot(current_unix_ms(), runtime_core.mono_ns());
                     permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot));
                 }
                 Err(StorageTryEnqueueError::QueueFull) => {
@@ -1249,6 +1433,32 @@ pub fn spawn_scheduler_snapshot_writer(
             }
         }
     })
+}
+
+fn start_scheduler_snapshot_writer_once(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    interval_ms: u64,
+    runtime_core: RuntimeCoreHandle,
+) {
+    let mut guard = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_some() {
+        return;
+    }
+
+    let task = spawn_scheduler_snapshot_writer(runtime_core, interval_ms);
+    *guard = Some(task.abort_handle());
+}
+
+fn abort_scheduler_snapshot_writer(abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>) {
+    let handle = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+    }
 }
 
 fn sanitize_scheduler_snapshot_for_rehydration(
@@ -1373,14 +1583,6 @@ fn current_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn current_mono_ns() -> u64 {
-    SCHEDULER_SNAPSHOT_MONO_EPOCH
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
 }
 
 fn format_bytes(bytes: &[u8]) -> String {
@@ -1886,7 +2088,7 @@ async fn sim_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SimDetail>, StatusCode> {
-    if let Some(status) = live_rpc_simulation_status_snapshot(&id) {
+    if let Some(status) = (state.live_rpc_simulation_status_provider)(&id) {
         return Ok(Json(SimDetail {
             id: status.id,
             bundle_id: status.bundle_id,
@@ -2243,7 +2445,7 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
     out.push_str("mempulse_replay_reorg_depth 0\n");
 
-    let sim_metrics = live_rpc_simulation_metrics_snapshot();
+    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
     out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
     out.push_str(&format!(
         "mempulse_sim_enqueued_total {}\n",
@@ -2437,41 +2639,19 @@ const DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY: usize = 256;
 const DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT: usize = 20;
 const DASHBOARD_STREAM_BROADCAST_INTERVAL_MS: u64 = 1_000;
 
-fn dashboard_stream_broadcaster_registry()
--> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>>> =
-        OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn dashboard_stream_provider_key(provider: &Arc<dyn VizDataProvider>) -> usize {
-    Arc::as_ptr(provider) as *const () as usize
-}
-
-fn resolve_dashboard_stream_broadcaster(
+fn dashboard_stream_broadcaster(
     provider: Arc<dyn VizDataProvider>,
 ) -> Arc<DashboardStreamBroadcaster> {
-    let key = dashboard_stream_provider_key(&provider);
-    let registry = dashboard_stream_broadcaster_registry();
-    if let Ok(guard) = registry.lock()
-        && let Some(existing) = guard.get(&key)
-    {
-        return existing.clone();
-    }
+    let broadcaster = empty_dashboard_stream_broadcaster();
+    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
+    broadcaster
+}
 
-    let broadcaster = Arc::new(DashboardStreamBroadcaster::new(
+fn empty_dashboard_stream_broadcaster() -> Arc<DashboardStreamBroadcaster> {
+    Arc::new(DashboardStreamBroadcaster::new(
         DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY,
         DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY,
-    ));
-    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
-
-    if let Ok(mut guard) = registry.lock() {
-        guard.entry(key).or_insert_with(|| broadcaster.clone());
-        if let Some(existing) = guard.get(&key) {
-            return existing.clone();
-        }
-    }
-    broadcaster
+    ))
 }
 
 fn spawn_dashboard_stream_broadcaster_producer(
@@ -2546,7 +2726,7 @@ async fn events_v1(
         query.after,
     );
     let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
-    let broadcaster = resolve_dashboard_stream_broadcaster(state.provider.clone());
+    let broadcaster = state.dashboard_stream_broadcaster.clone();
     let (initial_events, receiver) = broadcaster.subscribe_from(after_seq_id);
 
     struct EventsV1LoopState {
@@ -3064,16 +3244,6 @@ mod tests {
     use axum::http::{HeaderValue, Method};
     use tower::util::ServiceExt;
 
-    static LIVE_RPC_STATE_TEST_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
-    fn live_rpc_state_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        LIVE_RPC_STATE_TEST_MUTEX
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
     #[derive(Clone)]
     struct MockProvider;
 
@@ -3379,6 +3549,12 @@ mod tests {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
         let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
@@ -3389,6 +3565,7 @@ mod tests {
             Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -3397,6 +3574,8 @@ mod tests {
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
             builder_snapshot_provider,
@@ -3412,6 +3591,12 @@ mod tests {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
         let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
@@ -3422,6 +3607,7 @@ mod tests {
             Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(relay_status)),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -3430,6 +3616,8 @@ mod tests {
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
             builder_snapshot_provider,
@@ -3473,12 +3661,19 @@ mod tests {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
         let builder_snapshot_provider =
             Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
         let builder_metrics_provider =
             Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -3487,6 +3682,8 @@ mod tests {
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
             builder_snapshot_provider,
@@ -3506,8 +3703,15 @@ mod tests {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -3516,6 +3720,8 @@ mod tests {
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            live_rpc_simulation_status_provider,
             scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
             scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
             builder_snapshot_provider,
@@ -3585,8 +3791,6 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_prometheus_route_returns_prometheus_text_series() {
-        let _guard = live_rpc_state_test_guard();
-        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
         let app = build_router(test_state(100));
 
         let response = app
@@ -3726,6 +3930,7 @@ mod tests {
         let api_auth = ApiAuthConfig::default();
         let state = AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: 100,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -3751,6 +3956,10 @@ mod tests {
                 executable_only_candidates_total: 8,
                 legacy_only_candidates_total: 4,
             }),
+            live_rpc_simulation_metrics_provider: Arc::new(
+                LiveRpcSimulationMetricsSnapshot::default,
+            ),
+            live_rpc_simulation_status_provider: Arc::new(|_| None),
             scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
             scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
             builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
@@ -4469,8 +4678,6 @@ mod tests {
 
     #[tokio::test]
     async fn sim_route_returns_latest_sim_detail() {
-        let _guard = live_rpc_state_test_guard();
-        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
         let app = build_router(test_state_with_relay(100, seeded_relay_status()));
 
         let response = app
@@ -4490,27 +4697,30 @@ mod tests {
         assert_eq!(payload.relay_url, "https://relay.example");
         assert_eq!(payload.status, "fail");
         assert_eq!(payload.fail_category.as_deref(), Some("relay_exhausted"));
-        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
     }
 
     #[tokio::test]
     async fn sim_route_prefers_live_rpc_simulation_status_when_present() {
-        let _guard = live_rpc_state_test_guard();
-        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
-        crate::live_rpc::seed_live_rpc_simulation_status(
-            crate::live_rpc::LiveRpcSimulationStatusSnapshot {
-                id: "sim-local-1".to_owned(),
-                bundle_id: "bundle-local-1".to_owned(),
-                status: "ok".to_owned(),
-                relay_url: "not_submitted".to_owned(),
-                attempt_count: 0,
-                accepted: true,
-                fail_category: None,
-                started_unix_ms: 1_700_000_123_000,
-                finished_unix_ms: 1_700_000_123_111,
-            },
-        );
-        let app = build_router(test_state_with_relay(100, seeded_relay_status()));
+        let seeded_status = LiveRpcSimulationStatusSnapshot {
+            id: "sim-local-1".to_owned(),
+            bundle_id: "bundle-local-1".to_owned(),
+            status: "ok".to_owned(),
+            relay_url: "not_submitted".to_owned(),
+            attempt_count: 0,
+            accepted: true,
+            fail_category: None,
+            started_unix_ms: 1_700_000_123_000,
+            finished_unix_ms: 1_700_000_123_111,
+        };
+        let mut state = test_state_with_relay(100, seeded_relay_status());
+        state.live_rpc_simulation_status_provider = Arc::new(move |id: &str| {
+            if id == "latest" || id == "sim-local-1" {
+                Some(seeded_status.clone())
+            } else {
+                None
+            }
+        });
+        let app = build_router(state);
 
         let response = app
             .oneshot(
@@ -4530,7 +4740,117 @@ mod tests {
         assert_eq!(payload.status, "ok");
         assert_eq!(payload.relay_url, "not_submitted");
         assert!(payload.accepted);
-        crate::live_rpc::reset_live_rpc_simulation_runtime_state();
+    }
+
+    #[tokio::test]
+    async fn sim_route_reads_runtime_core_status_provider_when_injected() {
+        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
+        let handle = RuntimeCore::start(RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: Arc::new(RwLock::new(InMemoryStorage::default())),
+                writer: StorageWriteHandle::from_sender(storage_tx),
+                scheduler,
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode: RuntimeIngestMode::Rpc,
+                rebuild_scheduler_from_rpc: false,
+            },
+        })
+        .expect("runtime core should start");
+        handle.record_simulation_status(LiveRpcSimulationStatusSnapshot {
+            id: "sim-core-1".to_owned(),
+            bundle_id: "bundle-core-1".to_owned(),
+            status: "ok".to_owned(),
+            relay_url: "runtime-core".to_owned(),
+            attempt_count: 0,
+            accepted: true,
+            fail_category: None,
+            started_unix_ms: 1_700_000_111_000,
+            finished_unix_ms: 1_700_000_111_050,
+        });
+        let providers = RuntimeCoreViewProviders::from_runtime_core(handle);
+        let api_auth = ApiAuthConfig::default();
+        let app = build_router(AppState {
+            provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
+            downsample_limit: 100,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider: providers.live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider: providers.live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider: providers.live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider: providers.live_rpc_simulation_metrics_provider,
+            live_rpc_simulation_status_provider: providers.live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider: providers.scheduler_snapshot_provider,
+            scheduler_metrics_provider: providers.scheduler_metrics_provider,
+            builder_snapshot_provider: providers.builder_snapshot_provider,
+            builder_metrics_provider: providers.builder_metrics_provider,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sim/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SimDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.id, "sim-core-1");
+        assert_eq!(payload.bundle_id, "bundle-core-1");
+        assert_eq!(payload.relay_url, "runtime-core");
+        assert!(payload.accepted);
+    }
+
+    #[tokio::test]
+    async fn app_state_from_runtime_bootstrap_reads_runtime_core_builder_views() {
+        let (_legacy_state, bootstrap) = default_state_with_runtime();
+        let handle = RuntimeCore::start(bootstrap.runtime_core_start_args(RuntimeIngestMode::Rpc))
+            .expect("runtime core should start");
+        handle.with_builder_engine_mut(|engine| {
+            let _ = engine.insert(AssemblyCandidate {
+                candidate_id: "cand-runtime-1".to_owned(),
+                tx_hashes: vec![[0x31; 32]],
+                priority_score: 123,
+                gas_used: 21_000,
+                kind: AssemblyCandidateKind::Transaction,
+                simulation: SimulationApproval {
+                    sim_id: "sim-runtime-1".to_owned(),
+                    block_number: 17,
+                    approved: true,
+                },
+            });
+        });
+
+        let app = build_router(app_state_from_runtime_bootstrap(
+            &bootstrap,
+            RuntimeCoreViewProviders::from_runtime_core(handle),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblySnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.candidates.len(), 1);
+        assert_eq!(payload.candidates[0].candidate_id, "cand-runtime-1");
+
+        bootstrap.abort_background_tasks();
     }
 
     #[test]

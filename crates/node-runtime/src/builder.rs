@@ -1,4 +1,5 @@
 use anyhow::Result;
+use runtime_core::{RuntimeCore, RuntimeCoreHandle, RuntimeCoreStartArgs};
 
 use crate::handle::{NodeRuntime, ShutdownHook};
 
@@ -36,7 +37,9 @@ impl Default for IngestMode {
 #[derive(Default)]
 pub struct NodeRuntimeBuilder {
     ingest_mode: IngestMode,
-    startup: Option<Box<dyn FnOnce() -> Result<Option<ShutdownHook>> + Send>>,
+    runtime_core_start_args: Option<RuntimeCoreStartArgs>,
+    startup:
+        Option<Box<dyn FnOnce(Option<RuntimeCoreHandle>) -> Result<Option<ShutdownHook>> + Send>>,
 }
 
 impl NodeRuntimeBuilder {
@@ -44,6 +47,7 @@ impl NodeRuntimeBuilder {
         let ingest_mode = IngestMode::parse(std::env::var("VIZ_API_INGEST_MODE").ok().as_deref());
         Ok(Self {
             ingest_mode,
+            runtime_core_start_args: None,
             startup: None,
         })
     }
@@ -52,19 +56,28 @@ impl NodeRuntimeBuilder {
         self.ingest_mode
     }
 
+    pub fn with_runtime_core_start_args(mut self, args: RuntimeCoreStartArgs) -> Self {
+        self.runtime_core_start_args = Some(args);
+        self
+    }
+
     pub fn with_startup<F>(mut self, startup: F) -> Self
     where
-        F: FnOnce() -> Result<Option<ShutdownHook>> + Send + 'static,
+        F: FnOnce(Option<RuntimeCoreHandle>) -> Result<Option<ShutdownHook>> + Send + 'static,
     {
         self.startup = Some(Box::new(startup));
         self
     }
 
     pub fn build(self) -> Result<NodeRuntime> {
+        let runtime_core = self
+            .runtime_core_start_args
+            .map(RuntimeCore::start)
+            .transpose()?;
         let shutdown = match self.startup {
-            Some(startup) => startup()?,
+            Some(startup) => startup(runtime_core.clone())?,
             None => None,
         };
-        Ok(NodeRuntime::new(shutdown))
+        Ok(NodeRuntime::new(runtime_core, shutdown))
     }
 }

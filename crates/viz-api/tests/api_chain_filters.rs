@@ -11,6 +11,7 @@ use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{
     LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+    LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
 };
 use viz_api::{
     AppState, DashboardSnapshotV2, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
@@ -123,6 +124,9 @@ fn build_test_app() -> axum::Router {
         Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
     let state = AppState {
         provider,
+        dashboard_stream_broadcaster: Arc::new(
+            viz_api::stream_broadcast::DashboardStreamBroadcaster::new(256, 256),
+        ),
         downsample_limit: 100,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
@@ -131,6 +135,10 @@ fn build_test_app() -> axum::Router {
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
+        live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        live_rpc_simulation_status_provider: Arc::new(|_: &str| {
+            Option::<LiveRpcSimulationStatusSnapshot>::None
+        }),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
         builder_snapshot_provider: Arc::new(AssemblySnapshot::default),

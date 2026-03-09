@@ -1,6 +1,9 @@
 use axum::{body::Body, http::Request};
 use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
+use runtime_core::{
+    RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
+};
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::sync::{Arc, RwLock};
 use storage::{
@@ -11,8 +14,8 @@ use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
 use viz_api::live_rpc::{
     LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcDropReason,
-    LiveRpcSearcherMetricsSnapshot, classify_storage_enqueue_drop_reason,
-    live_rpc_drop_metrics_snapshot, observe_live_rpc_drop_reason, reset_live_rpc_drop_metrics,
+    LiveRpcSearcherMetricsSnapshot, LiveRpcSimulationMetricsSnapshot,
+    LiveRpcSimulationStatusSnapshot, classify_storage_enqueue_drop_reason,
 };
 use viz_api::{AppState, InMemoryVizProvider, VizDataProvider, build_router};
 
@@ -57,25 +60,48 @@ fn queue_drop_policy_bounds_queue_and_classifies_full_vs_closed() {
 
 #[tokio::test]
 async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
-    reset_live_rpc_drop_metrics();
-    observe_live_rpc_drop_reason(LiveRpcDropReason::StorageQueueFull);
-    observe_live_rpc_drop_reason(LiveRpcDropReason::StorageQueueFull);
-    observe_live_rpc_drop_reason(LiveRpcDropReason::StorageQueueClosed);
-
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    let (scheduler, _runtime) = scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+    let (storage_tx, _storage_rx) = mpsc::channel(8);
+    let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
+        deps: RuntimeCoreDeps {
+            storage: storage.clone(),
+            writer: StorageWriteHandle::from_sender(storage_tx),
+            scheduler,
+        },
+        config: RuntimeCoreConfig {
+            ingest_mode: RuntimeIngestMode::Rpc,
+            rebuild_scheduler_from_rpc: false,
+        },
+    })
+    .expect("runtime core");
+    runtime_core.observe_drop_reason(LiveRpcDropReason::StorageQueueFull);
+    runtime_core.observe_drop_reason(LiveRpcDropReason::StorageQueueFull);
+    runtime_core.observe_drop_reason(LiveRpcDropReason::StorageQueueClosed);
+
     let provider: Arc<dyn VizDataProvider> =
         Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
+    let runtime_core_for_drop_metrics = runtime_core.clone();
     let state = AppState {
         provider,
+        dashboard_stream_broadcaster: Arc::new(
+            viz_api::stream_broadcast::DashboardStreamBroadcaster::new(256, 256),
+        ),
         downsample_limit: 100,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
         api_auth: ApiAuthConfig::default(),
         api_rate_limiter: ApiRateLimiter::new(600),
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
-        live_rpc_drop_metrics_provider: Arc::new(live_rpc_drop_metrics_snapshot)
+        live_rpc_drop_metrics_provider: Arc::new(move || {
+            runtime_core_for_drop_metrics.drop_metrics()
+        })
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
+        live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        live_rpc_simulation_status_provider: Arc::new(|_: &str| {
+            Option::<LiveRpcSimulationStatusSnapshot>::None
+        }),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
         builder_snapshot_provider: Arc::new(AssemblySnapshot::default),

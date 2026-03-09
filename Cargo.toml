@@ -12,6 +12,7 @@ members = [
   "crates/sim-engine",
   "crates/searcher",
   "crates/builder",
+  "crates/runtime-core",
   "crates/bench",
 ]
 resolver = "2"

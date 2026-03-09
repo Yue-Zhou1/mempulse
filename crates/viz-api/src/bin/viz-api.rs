@@ -1,39 +1,40 @@
 use anyhow::Result;
 use node_runtime::{IngestMode, NodeRuntimeBuilder};
+use runtime_core::RuntimeIngestMode;
+use runtime_core::live_rpc::{
+    start_live_rpc_feed_with_runtime_core, start_live_rpc_pending_pool_rebuild_with_runtime_core,
+};
 use std::env;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-use viz_api::live_rpc::{start_live_rpc_feed_with_bootstrap, start_live_rpc_pending_pool_rebuild};
-use viz_api::{build_router, default_state_with_runtime};
+use viz_api::{
+    RuntimeCoreViewProviders, app_state_from_runtime_core, build_router, default_runtime_bootstrap,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(env::var("RUST_LOG").ok().as_deref());
-    let (state, bootstrap) = default_state_with_runtime();
-    let bootstrap_storage = bootstrap.storage;
-    let bootstrap_writer = bootstrap.writer;
-    let bootstrap_scheduler = bootstrap.scheduler;
-    let bootstrap_live_rpc_config = bootstrap.live_rpc_config;
-    let rebuild_scheduler_from_rpc = bootstrap.rebuild_scheduler_from_rpc;
-    let bootstrap_scheduler_snapshot_writer_abort = bootstrap.scheduler_snapshot_writer_abort;
+    let bootstrap = default_runtime_bootstrap();
     let runtime_builder = NodeRuntimeBuilder::from_env()?;
     let ingest_mode = runtime_builder.ingest_mode();
+    let (runtime_core_start_args, startup) =
+        bootstrap.into_runtime_startup(runtime_ingest_mode(ingest_mode));
+    let live_rpc_config = startup.live_rpc_config.clone();
+    let rebuild_scheduler_from_rpc = startup.rebuild_scheduler_from_rpc;
     let runtime = runtime_builder
-        .with_startup(move || {
+        .with_runtime_core_start_args(runtime_core_start_args)
+        .with_startup(move |runtime_core| {
+            let runtime_core = runtime_core.expect("runtime core handle");
             if matches!(ingest_mode, IngestMode::Rpc | IngestMode::Hybrid) {
-                start_live_rpc_feed_with_bootstrap(
-                    bootstrap_storage.clone(),
-                    bootstrap_writer.clone(),
-                    bootstrap_scheduler.clone(),
-                    bootstrap_live_rpc_config.clone(),
+                start_live_rpc_feed_with_runtime_core(
+                    runtime_core.clone(),
+                    live_rpc_config.clone(),
                     rebuild_scheduler_from_rpc,
                 );
             } else if rebuild_scheduler_from_rpc {
-                start_live_rpc_pending_pool_rebuild(
-                    bootstrap_storage.clone(),
-                    bootstrap_writer.clone(),
-                    bootstrap_scheduler.clone(),
-                    bootstrap_live_rpc_config.clone(),
+                start_live_rpc_pending_pool_rebuild_with_runtime_core(
+                    runtime_core,
+                    live_rpc_config.clone(),
                 );
             } else {
                 tracing::info!(
@@ -44,6 +45,12 @@ async fn main() -> Result<()> {
             Ok(None)
         })
         .build()?;
+    let runtime_core = runtime.runtime_core().expect("runtime core handle");
+    startup.start_background_tasks(runtime_core.clone());
+    let state = app_state_from_runtime_core(
+        &runtime_core,
+        RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
+    );
     let app = build_router(state);
     let bind_addr = resolve_bind_addr(env::var("VIZ_API_BIND").ok().as_deref());
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -53,9 +60,17 @@ async fn main() -> Result<()> {
         "viz-api listening"
     );
     axum::serve(listener, app).await?;
+    startup.abort_background_tasks();
     runtime.shutdown().await?;
-    bootstrap_scheduler_snapshot_writer_abort.abort();
     Ok(())
+}
+
+fn runtime_ingest_mode(mode: IngestMode) -> RuntimeIngestMode {
+    match mode {
+        IngestMode::Rpc => RuntimeIngestMode::Rpc,
+        IngestMode::P2p => RuntimeIngestMode::P2p,
+        IngestMode::Hybrid => RuntimeIngestMode::Hybrid,
+    }
 }
 
 fn resolve_bind_addr(env_override: Option<&str>) -> String {
@@ -103,6 +118,22 @@ mod tests {
     fn resolve_bind_addr_uses_env_override() {
         let bind = super::resolve_bind_addr(Some("127.0.0.1:9000"));
         assert_eq!(bind, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn runtime_ingest_mode_matches_node_runtime_mode() {
+        assert_eq!(
+            super::runtime_ingest_mode(node_runtime::IngestMode::Rpc),
+            runtime_core::RuntimeIngestMode::Rpc
+        );
+        assert_eq!(
+            super::runtime_ingest_mode(node_runtime::IngestMode::P2p),
+            runtime_core::RuntimeIngestMode::P2p
+        );
+        assert_eq!(
+            super::runtime_ingest_mode(node_runtime::IngestMode::Hybrid),
+            runtime_core::RuntimeIngestMode::Hybrid
+        );
     }
 
     #[test]

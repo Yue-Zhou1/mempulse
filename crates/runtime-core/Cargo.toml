@@ -1,34 +1,27 @@
 [package]
-name = "viz-api"
+name = "runtime-core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-axum = { workspace = true }
 builder = { path = "../builder" }
 common = { path = "../common" }
 event-log = { path = "../event-log" }
 feature-engine = { path = "../feature-engine" }
 futures = { workspace = true }
 hashbrown = { workspace = true }
-node-runtime = { path = "../node-runtime" }
-replay = { path = "../replay" }
-runtime-core = { path = "../runtime-core" }
+reqwest = { workspace = true }
 scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }
-sim-engine = { path = "../sim-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sim-engine = { path = "../sim-engine" }
 storage = { path = "../storage" }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.6", features = ["cors"] }
-reqwest = { workspace = true }
 
 [dev-dependencies]
-tower = "0.5"
-serde_json = { workspace = true }
+axum = { workspace = true }

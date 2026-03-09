@@ -1959,6 +1959,9 @@ name = "node-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "runtime-core",
+ "scheduler",
+ "storage",
  "tokio",
 ]
 
@@ -2776,6 +2779,31 @@ name = "ruint-macro"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
+
+[[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "axum",
+ "builder",
+ "common",
+ "event-log",
+ "feature-engine",
+ "futures",
+ "hashbrown 0.16.1",
+ "reqwest",
+ "scheduler",
+ "searcher",
+ "serde",
+ "serde_json",
+ "sim-engine",
+ "storage",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
 
 [[package]]
 name = "rustc-hash"
@@ -3667,6 +3695,7 @@ dependencies = [
  "node-runtime",
  "replay",
  "reqwest",
+ "runtime-core",
  "scheduler",
  "searcher",
  "serde",
