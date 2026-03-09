@@ -593,9 +593,12 @@ dependencies = [
  "common",
  "criterion",
  "event-log",
+ "scheduler",
  "searcher",
  "serde",
  "serde_json",
+ "storage",
+ "tokio",
 ]
 
 [[package]]
@@ -706,9 +709,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "common",
+ "hex",
  "reqwest",
+ "searcher",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "sim-engine",
  "tokio",
  "tracing",
 ]
@@ -1954,6 +1962,9 @@ name = "node-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "runtime-core",
+ "scheduler",
+ "storage",
  "tokio",
 ]
 
@@ -2773,6 +2784,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 
 [[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "axum",
+ "builder",
+ "common",
+ "event-log",
+ "feature-engine",
+ "futures",
+ "hashbrown 0.16.1",
+ "reqwest",
+ "scheduler",
+ "searcher",
+ "serde",
+ "serde_json",
+ "sim-engine",
+ "storage",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2881,6 +2917,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scheduler"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "event-log",
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3174,6 +3221,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "replay",
  "reqwest",
+ "scheduler",
  "serde",
  "serde_json",
  "tokio",
@@ -3650,9 +3698,12 @@ dependencies = [
  "node-runtime",
  "replay",
  "reqwest",
+ "runtime-core",
+ "scheduler",
  "searcher",
  "serde",
  "serde_json",
+ "sim-engine",
  "storage",
  "tokio",
  "tokio-tungstenite",

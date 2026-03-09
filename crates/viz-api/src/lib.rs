@@ -13,57 +13,272 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum::{middleware, response::Response};
-use builder::{RelayDryRunResult, RelayDryRunStatus};
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
-    LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, live_rpc_chain_status_snapshot,
-    live_rpc_drop_metrics_snapshot,
+    LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+    LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
 };
+use runtime_core::{
+    RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreHandle, RuntimeCoreStartArgs,
+    RuntimeIngestMode,
+};
+use scheduler::{
+    SchedulerConfig, SchedulerHandle, SchedulerMetrics, SchedulerSnapshot, ValidatedTransaction,
+    spawn_scheduler_with_rehydration,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
-    NoopClickHouseSink, StorageWriteHandle, StorageWriterConfig, spawn_single_writer,
+    NoopClickHouseSink, StorageTryEnqueueError, StorageWriteHandle, StorageWriteOp,
+    StorageWriterConfig, TxFullRecord, spawn_single_writer,
 };
 use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use tokio::time::MissedTickBehavior;
 use tower_http::cors::{Any, CorsLayer};
 
+const ENV_SCHEDULER_SNAPSHOT_INTERVAL_MS: &str = "VIZ_API_SCHEDULER_SNAPSHOT_INTERVAL_MS";
+const DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
+const ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: &str =
+    "VIZ_API_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS";
+const DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: u64 = 300_000;
+const ENV_SCHEDULER_HANDOFF_QUEUE_CAPACITY: &str = "VIZ_API_SCHEDULER_HANDOFF_QUEUE_CAPACITY";
+const ENV_SCHEDULER_MAX_PENDING_PER_SENDER: &str = "VIZ_API_SCHEDULER_MAX_PENDING_PER_SENDER";
+const ENV_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS: &str = "VIZ_API_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS";
+
 #[cfg(test)]
-use builder::RelayAttemptTrace;
+use builder::{
+    AssemblyCandidate, AssemblyCandidateKind, AssemblyConfig, AssemblyEngine, RelayAttemptTrace,
+    SimulationApproval,
+};
+#[cfg(test)]
+use common::SourceId;
 #[cfg(test)]
 use event_log::{OppDetected, TxConfirmed, TxDecoded, TxFetched, TxReorged, TxSeen};
 #[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
+use scheduler::scheduler_channel;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerRehydrationConfig {
+    pub snapshot_interval_ms: u64,
+    pub snapshot_max_finality_age_ms: u64,
+}
+
+impl Default for SchedulerRehydrationConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval_ms: DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS,
+            snapshot_max_finality_age_ms: DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS,
+        }
+    }
+}
+
+pub type LiveRpcChainStatusProvider = Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+pub type LiveRpcDropMetricsProvider = Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSearcherMetricsProvider =
+    Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSimulationMetricsProvider =
+    Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+pub type ReplayRuntimeMetricsProvider = Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>;
+pub type LiveRpcSimulationStatusProvider =
+    Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+pub type SchedulerSnapshotProvider = Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+pub type SchedulerMetricsProvider = Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+pub type BuilderSnapshotProvider = Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+pub type BuilderMetricsProvider = Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
+    pub dashboard_stream_broadcaster: Arc<DashboardStreamBroadcaster>,
     pub downsample_limit: usize,
     pub relay_dry_run_status: Arc<RwLock<RelayDryRunStatus>>,
     pub alert_thresholds: AlertThresholdConfig,
     pub api_auth: ApiAuthConfig,
     pub api_rate_limiter: ApiRateLimiter,
-    pub live_rpc_chain_status_provider: Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>,
-    pub live_rpc_drop_metrics_provider: Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
+    pub live_rpc_chain_status_provider: LiveRpcChainStatusProvider,
+    pub live_rpc_drop_metrics_provider: LiveRpcDropMetricsProvider,
+    pub live_rpc_searcher_metrics_provider: LiveRpcSearcherMetricsProvider,
+    pub live_rpc_simulation_metrics_provider: LiveRpcSimulationMetricsProvider,
+    pub replay_runtime_metrics_provider: ReplayRuntimeMetricsProvider,
+    pub live_rpc_simulation_status_provider: LiveRpcSimulationStatusProvider,
+    pub scheduler_snapshot_provider: SchedulerSnapshotProvider,
+    pub scheduler_metrics_provider: SchedulerMetricsProvider,
+    pub builder_snapshot_provider: BuilderSnapshotProvider,
+    pub builder_metrics_provider: BuilderMetricsProvider,
+}
+
+#[derive(Clone)]
+pub struct RuntimeCoreViewProviders {
+    pub live_rpc_chain_status_provider: LiveRpcChainStatusProvider,
+    pub live_rpc_drop_metrics_provider: LiveRpcDropMetricsProvider,
+    pub live_rpc_searcher_metrics_provider: LiveRpcSearcherMetricsProvider,
+    pub live_rpc_simulation_metrics_provider: LiveRpcSimulationMetricsProvider,
+    pub live_rpc_simulation_status_provider: LiveRpcSimulationStatusProvider,
+    pub scheduler_snapshot_provider: SchedulerSnapshotProvider,
+    pub scheduler_metrics_provider: SchedulerMetricsProvider,
+    pub builder_snapshot_provider: BuilderSnapshotProvider,
+    pub builder_metrics_provider: BuilderMetricsProvider,
+}
+
+impl RuntimeCoreViewProviders {
+    pub fn from_runtime_core(handle: RuntimeCoreHandle) -> Self {
+        Self {
+            live_rpc_chain_status_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.chain_status())
+            },
+            live_rpc_drop_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.drop_metrics())
+            },
+            live_rpc_searcher_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.searcher_metrics())
+            },
+            live_rpc_simulation_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.simulation_metrics())
+            },
+            live_rpc_simulation_status_provider: {
+                let handle = handle.clone();
+                Arc::new(move |id| handle.simulation_status(id))
+            },
+            scheduler_snapshot_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.scheduler_snapshot())
+            },
+            scheduler_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.scheduler_metrics())
+            },
+            builder_snapshot_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.builder_snapshot())
+            },
+            builder_metrics_provider: {
+                let handle = handle.clone();
+                Arc::new(move || handle.builder_metrics())
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct RuntimeBootstrap {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
+    pub scheduler: SchedulerHandle,
     pub live_rpc_config: LiveRpcConfig,
+    /// When true, the caller should rebuild the scheduler from the RPC pending pool
+    /// before relying on live ingest to converge pending state.
+    pub rebuild_scheduler_from_rpc: bool,
+    scheduler_snapshot_interval_ms: u64,
+    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
+    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     pub ingest_mode: IngestSourceMode,
+}
+
+#[derive(Clone)]
+pub struct RuntimeBootstrapStartup {
+    pub live_rpc_config: LiveRpcConfig,
+    pub rebuild_scheduler_from_rpc: bool,
+    scheduler_snapshot_interval_ms: u64,
+    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
+    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+impl RuntimeBootstrap {
+    pub fn abort_background_tasks(&self) {
+        abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+        abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
+    }
+
+    pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
+        start_scheduler_snapshot_writer_once(
+            &self.scheduler_snapshot_writer_abort,
+            self.scheduler_snapshot_interval_ms,
+            runtime_core.clone(),
+        );
+        start_replay_runtime_metrics_refresher_once(
+            &self.replay_runtime_metrics_abort,
+            self.scheduler_snapshot_interval_ms,
+            self.replay_runtime_metrics_cache.clone(),
+        );
+    }
+
+    pub fn runtime_core_start_args(&self, ingest_mode: RuntimeIngestMode) -> RuntimeCoreStartArgs {
+        RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: self.storage.clone(),
+                writer: self.writer.clone(),
+                scheduler: self.scheduler.clone(),
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode,
+                rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            },
+        }
+    }
+
+    pub fn into_runtime_startup(
+        self,
+        ingest_mode: RuntimeIngestMode,
+    ) -> (RuntimeCoreStartArgs, RuntimeBootstrapStartup) {
+        let start_args = RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: self.storage,
+                writer: self.writer,
+                scheduler: self.scheduler,
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode,
+                rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            },
+        };
+        let startup = RuntimeBootstrapStartup {
+            live_rpc_config: self.live_rpc_config,
+            rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
+            scheduler_snapshot_interval_ms: self.scheduler_snapshot_interval_ms,
+            scheduler_snapshot_writer_abort: self.scheduler_snapshot_writer_abort,
+            replay_runtime_metrics_cache: self.replay_runtime_metrics_cache,
+            replay_runtime_metrics_abort: self.replay_runtime_metrics_abort,
+        };
+        (start_args, startup)
+    }
+}
+
+impl RuntimeBootstrapStartup {
+    pub fn abort_background_tasks(&self) {
+        abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+        abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
+    }
+
+    pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
+        start_scheduler_snapshot_writer_once(
+            &self.scheduler_snapshot_writer_abort,
+            self.scheduler_snapshot_interval_ms,
+            runtime_core.clone(),
+        );
+        start_replay_runtime_metrics_refresher_once(
+            &self.replay_runtime_metrics_abort,
+            self.scheduler_snapshot_interval_ms,
+            self.replay_runtime_metrics_cache.clone(),
+        );
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -244,6 +459,42 @@ pub struct DashboardCacheMetrics {
     pub last_build_duration_ns: u64,
     pub total_build_duration_ns: u64,
     pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplayRuntimeMetricsSnapshot {
+    pub lag_events: u64,
+    pub checkpoint_duration_ms: u64,
+    // Counts reorged transactions in the replay tail, not block depth.
+    pub reorg_depth: u64,
+}
+
+#[derive(Clone)]
+struct ReplayRuntimeMetricsCache {
+    storage: Arc<RwLock<InMemoryStorage>>,
+    snapshot: Arc<RwLock<ReplayRuntimeMetricsSnapshot>>,
+}
+
+impl ReplayRuntimeMetricsCache {
+    fn new(storage: Arc<RwLock<InMemoryStorage>>) -> Self {
+        let cache = Self {
+            storage,
+            snapshot: Arc::new(RwLock::new(ReplayRuntimeMetricsSnapshot::default())),
+        };
+        cache.refresh();
+        cache
+    }
+
+    fn snapshot(&self) -> ReplayRuntimeMetricsSnapshot {
+        self.snapshot.read().map(|guard| *guard).unwrap_or_default()
+    }
+
+    fn refresh(&self) {
+        let next = build_replay_runtime_metrics(&self.storage);
+        if let Ok(mut guard) = self.snapshot.write() {
+            *guard = next;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -876,7 +1127,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
-        let hash = parse_fixed_hex::<32>(hash)?;
+        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
         self.storage.read().ok().and_then(|storage| {
             let seen = storage
                 .tx_seen()
@@ -989,6 +1240,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions", get(transactions))
         .route("/transactions/all", get(transactions_all))
         .route("/transactions/{hash}", get(transaction_by_hash))
+        .route("/scheduler/snapshot", get(scheduler_snapshot))
+        .route("/scheduler/metrics", get(scheduler_metrics))
+        .route("/builder/snapshot", get(builder_snapshot))
+        .route("/builder/metrics", get(builder_metrics))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
@@ -1006,24 +1261,92 @@ pub fn build_router(state: AppState) -> Router {
 
 pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
-    let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
-        Ok(Some(sink)) => Arc::new(sink),
-        Ok(None) => Arc::new(NoopClickHouseSink),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to initialize clickhouse sink, falling back to noop sink");
-            Arc::new(NoopClickHouseSink)
-        }
-    };
-    let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
-    let live_rpc_config = match LiveRpcConfig::from_env() {
-        Ok(config) => config,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to parse live rpc env overrides; using defaults");
-            LiveRpcConfig::default()
-        }
-    };
-    let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
+    default_state_with_runtime_from_storage(storage)
+}
 
+pub fn default_runtime_bootstrap() -> RuntimeBootstrap {
+    let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    runtime_bootstrap_from_storage(storage)
+}
+
+pub fn default_state_with_runtime_from_storage(
+    storage: Arc<RwLock<InMemoryStorage>>,
+) -> (AppState, RuntimeBootstrap) {
+    let bootstrap = runtime_bootstrap_from_storage(storage);
+    let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
+    bootstrap.start_background_tasks(runtime_core.clone());
+    let state = app_state_from_runtime_bootstrap(
+        &bootstrap,
+        RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
+    );
+    (state, bootstrap)
+}
+
+pub fn runtime_bootstrap_from_storage(storage: Arc<RwLock<InMemoryStorage>>) -> RuntimeBootstrap {
+    runtime_bootstrap_from_storage_and_rehydration(
+        storage,
+        SchedulerRehydrationConfig {
+            snapshot_interval_ms: resolve_scheduler_snapshot_interval_ms(
+                env::var(ENV_SCHEDULER_SNAPSHOT_INTERVAL_MS).ok().as_deref(),
+            ),
+            snapshot_max_finality_age_ms: resolve_scheduler_snapshot_max_finality_age_ms(
+                env::var(ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
+                    .ok()
+                    .as_deref(),
+            ),
+        },
+    )
+}
+
+pub fn default_state_with_runtime_from_storage_and_rehydration(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> (AppState, RuntimeBootstrap) {
+    let bootstrap = runtime_bootstrap_from_storage_and_rehydration(storage, rehydration);
+    let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
+    bootstrap.start_background_tasks(runtime_core.clone());
+    let state = app_state_from_runtime_bootstrap(
+        &bootstrap,
+        RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
+    );
+    (state, bootstrap)
+}
+
+pub fn runtime_bootstrap_from_storage_and_rehydration(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> RuntimeBootstrap {
+    runtime_bootstrap_from_storage_and_rehydration_impl(storage, rehydration)
+}
+
+pub fn app_state_from_runtime_bootstrap(
+    bootstrap: &RuntimeBootstrap,
+    runtime_views: RuntimeCoreViewProviders,
+) -> AppState {
+    build_app_state(
+        bootstrap.storage.clone(),
+        runtime_views,
+        replay_runtime_metrics_provider(bootstrap.replay_runtime_metrics_cache.clone()),
+    )
+}
+
+pub fn app_state_from_runtime_core(
+    runtime_core: &RuntimeCoreHandle,
+    runtime_views: RuntimeCoreViewProviders,
+) -> AppState {
+    let cache = ReplayRuntimeMetricsCache::new(runtime_core.storage().clone());
+    build_app_state(
+        runtime_core.storage().clone(),
+        runtime_views,
+        replay_runtime_metrics_provider(cache),
+    )
+}
+
+fn build_app_state(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    runtime_views: RuntimeCoreViewProviders,
+    replay_runtime_metrics_provider: Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>,
+) -> AppState {
     let propagation = vec![
         PropagationEdge {
             source: "peer-a".to_owned(),
@@ -1046,39 +1369,429 @@ pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
         );
     }
     let api_rate_limiter = ApiRateLimiter::new(api_auth.requests_per_minute);
-    let live_rpc_chain_status_provider = Arc::new(live_rpc_chain_status_snapshot)
-        as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
-    let live_rpc_drop_metrics_provider = Arc::new(live_rpc_drop_metrics_snapshot)
-        as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
-
-    let state = AppState {
-        provider: Arc::new(InMemoryVizProvider::new(
-            storage.clone(),
-            Arc::new(propagation),
-            1,
-        )),
+    let provider = Arc::new(InMemoryVizProvider::new(storage, Arc::new(propagation), 1));
+    let dashboard_stream_broadcaster = dashboard_stream_broadcaster(provider.clone());
+    AppState {
+        provider,
+        dashboard_stream_broadcaster,
         downsample_limit: 1_000,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
         api_auth,
         api_rate_limiter,
-        live_rpc_chain_status_provider,
-        live_rpc_drop_metrics_provider,
+        live_rpc_chain_status_provider: runtime_views.live_rpc_chain_status_provider,
+        live_rpc_drop_metrics_provider: runtime_views.live_rpc_drop_metrics_provider,
+        live_rpc_searcher_metrics_provider: runtime_views.live_rpc_searcher_metrics_provider,
+        live_rpc_simulation_metrics_provider: runtime_views.live_rpc_simulation_metrics_provider,
+        replay_runtime_metrics_provider,
+        live_rpc_simulation_status_provider: runtime_views.live_rpc_simulation_status_provider,
+        scheduler_snapshot_provider: runtime_views.scheduler_snapshot_provider,
+        scheduler_metrics_provider: runtime_views.scheduler_metrics_provider,
+        builder_snapshot_provider: runtime_views.builder_snapshot_provider,
+        builder_metrics_provider: runtime_views.builder_metrics_provider,
+    }
+}
+
+fn replay_runtime_metrics_provider(
+    cache: ReplayRuntimeMetricsCache,
+) -> Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync> {
+    Arc::new(move || cache.snapshot())
+}
+
+fn start_runtime_core_for_bootstrap(bootstrap: &RuntimeBootstrap) -> RuntimeCoreHandle {
+    RuntimeCore::start(
+        bootstrap
+            .runtime_core_start_args(runtime_ingest_mode_from_source_mode(bootstrap.ingest_mode)),
+    )
+    .expect("runtime core should start for viz-api state")
+}
+
+fn build_replay_runtime_metrics(
+    storage: &Arc<RwLock<InMemoryStorage>>,
+) -> ReplayRuntimeMetricsSnapshot {
+    let Ok(storage) = storage.read() else {
+        return ReplayRuntimeMetricsSnapshot::default();
     };
 
-    (
-        state,
-        RuntimeBootstrap {
-            storage: storage.clone(),
-            writer,
-            live_rpc_config,
-            ingest_mode,
-        },
-    )
+    let latest_seq_id = storage.latest_seq_id().unwrap_or(0);
+    let checkpoint_seq_id = storage
+        .scheduler_snapshot()
+        .map(|snapshot| snapshot.event_seq_hi)
+        .unwrap_or(latest_seq_id);
+    let replay_tail = storage.scan_events(checkpoint_seq_id, usize::MAX);
+    let replay_tail_reorgs = replay_tail
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::TxReorged(_)))
+        .count() as u64;
+
+    let checkpoint_duration_ms = if latest_seq_id == 0 {
+        0
+    } else {
+        let started_at = Instant::now();
+        let _ = replay::lifecycle_snapshot(&storage.list_events(), latest_seq_id);
+        started_at
+            .elapsed()
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u64::MAX as u128) as u64
+    };
+
+    ReplayRuntimeMetricsSnapshot {
+        lag_events: latest_seq_id.saturating_sub(checkpoint_seq_id),
+        checkpoint_duration_ms,
+        // Approximation from the replay tail until the event schema carries explicit block-depth data.
+        reorg_depth: replay_tail_reorgs,
+    }
+}
+
+fn runtime_ingest_mode_from_source_mode(mode: IngestSourceMode) -> RuntimeIngestMode {
+    match mode {
+        IngestSourceMode::Rpc => RuntimeIngestMode::Rpc,
+        IngestSourceMode::P2p => RuntimeIngestMode::P2p,
+        IngestSourceMode::Hybrid => RuntimeIngestMode::Hybrid,
+    }
+}
+
+fn runtime_bootstrap_from_storage_and_rehydration_impl(
+    storage: Arc<RwLock<InMemoryStorage>>,
+    rehydration: SchedulerRehydrationConfig,
+) -> RuntimeBootstrap {
+    let sink: Arc<dyn ClickHouseBatchSink> = match ClickHouseHttpSink::from_env() {
+        Ok(Some(sink)) => Arc::new(sink),
+        Ok(None) => Arc::new(NoopClickHouseSink),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to initialize clickhouse sink, falling back to noop sink");
+            Arc::new(NoopClickHouseSink)
+        }
+    };
+    let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
+    let rehydration_plan = storage
+        .read()
+        .ok()
+        .map(|guard| guard.scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms))
+        .unwrap_or_default();
+    let mut rebuild_scheduler_from_rpc = rehydration_plan.requires_rpc_rebuild;
+    let replay_events = rehydration_plan.replay_events;
+    let sanitized_snapshot = rehydration_plan
+        .snapshot
+        .map(|snapshot| sanitize_scheduler_snapshot_for_rehydration(snapshot, &replay_events));
+    let replay_transactions = storage
+        .read()
+        .ok()
+        .map(|guard| {
+            replay_events
+                .iter()
+                .filter_map(|event| validated_transaction_from_event(event, &guard))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let scheduler_config = resolve_scheduler_config();
+    let scheduler = match spawn_scheduler_with_rehydration(
+        scheduler_config,
+        sanitized_snapshot,
+        replay_transactions,
+    ) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(?error, "failed to rehydrate scheduler from storage plan");
+            rebuild_scheduler_from_rpc = true;
+            spawn_scheduler_with_rehydration(scheduler_config, None, Vec::new())
+                .expect("empty scheduler rehydration should succeed")
+        }
+    };
+    let live_rpc_config = match LiveRpcConfig::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to parse live rpc env overrides; using defaults");
+            LiveRpcConfig::default()
+        }
+    };
+    let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
+    let replay_runtime_metrics_cache = ReplayRuntimeMetricsCache::new(storage.clone());
+
+    RuntimeBootstrap {
+        storage: storage.clone(),
+        writer,
+        scheduler,
+        live_rpc_config,
+        rebuild_scheduler_from_rpc,
+        scheduler_snapshot_interval_ms: rehydration.snapshot_interval_ms,
+        scheduler_snapshot_writer_abort: Arc::new(Mutex::new(None)),
+        replay_runtime_metrics_cache,
+        replay_runtime_metrics_abort: Arc::new(Mutex::new(None)),
+        ingest_mode,
+    }
 }
 
 pub fn default_state() -> AppState {
     default_state_with_runtime().0
+}
+
+pub fn spawn_scheduler_snapshot_writer(
+    runtime_core: RuntimeCoreHandle,
+    interval_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    let writer = runtime_core.writer().clone();
+    let storage = runtime_core.storage().clone();
+    let scheduler = runtime_core.scheduler().clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            match writer.try_reserve() {
+                Ok(permit) => {
+                    let event_seq_hi = storage
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.latest_seq_id())
+                        .unwrap_or(0);
+                    let mut snapshot =
+                        scheduler.persisted_snapshot(current_unix_ms(), runtime_core.mono_ns());
+                    snapshot.event_seq_hi = event_seq_hi;
+                    permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot));
+                }
+                Err(StorageTryEnqueueError::QueueFull) => {
+                    tracing::warn!(
+                        "scheduler snapshot write dropped because storage queue is full"
+                    );
+                }
+                Err(StorageTryEnqueueError::QueueClosed) => {
+                    tracing::warn!(
+                        "scheduler snapshot writer stopped because storage queue closed"
+                    );
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn start_scheduler_snapshot_writer_once(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    interval_ms: u64,
+    runtime_core: RuntimeCoreHandle,
+) {
+    let mut guard = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_some() {
+        return;
+    }
+
+    let task = spawn_scheduler_snapshot_writer(runtime_core, interval_ms);
+    *guard = Some(task.abort_handle());
+}
+
+fn abort_scheduler_snapshot_writer(abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>) {
+    let handle = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
+fn spawn_replay_runtime_metrics_refresher(
+    cache: ReplayRuntimeMetricsCache,
+    interval_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            cache.refresh();
+        }
+    })
+}
+
+fn start_replay_runtime_metrics_refresher_once(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    interval_ms: u64,
+    cache: ReplayRuntimeMetricsCache,
+) {
+    let mut guard = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_some() {
+        return;
+    }
+
+    let task = spawn_replay_runtime_metrics_refresher(cache, interval_ms);
+    *guard = Some(task.abort_handle());
+}
+
+fn abort_replay_runtime_metrics_refresher(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+) {
+    let handle = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
+fn sanitize_scheduler_snapshot_for_rehydration(
+    mut snapshot: scheduler::PersistedSchedulerSnapshot,
+    replay_events: &[EventEnvelope],
+) -> scheduler::PersistedSchedulerSnapshot {
+    let mut removed_hashes = BTreeSet::new();
+
+    for event in replay_events {
+        match &event.payload {
+            EventPayload::TxDecoded(decoded) => {
+                removed_hashes.remove(&decoded.hash);
+            }
+            EventPayload::TxReorged(reorged) => {
+                removed_hashes.remove(&reorged.hash);
+            }
+            EventPayload::TxDropped(dropped) => {
+                removed_hashes.insert(dropped.hash);
+            }
+            EventPayload::TxReplaced(replaced) => {
+                removed_hashes.insert(replaced.hash);
+            }
+            EventPayload::TxConfirmedProvisional(confirmed)
+            | EventPayload::TxConfirmedFinal(confirmed) => {
+                removed_hashes.insert(confirmed.hash);
+            }
+            EventPayload::TxSeen(_)
+            | EventPayload::TxFetched(_)
+            | EventPayload::CandidateQueued(_)
+            | EventPayload::SimDispatched(_)
+            | EventPayload::OppDetected(_)
+            | EventPayload::SimCompleted(_)
+            | EventPayload::AssemblyDecisionApplied(_)
+            | EventPayload::BundleSubmitted(_)
+            | EventPayload::TxReady(_)
+            | EventPayload::TxBlocked(_) => {}
+        }
+    }
+
+    if removed_hashes.is_empty() {
+        return snapshot;
+    }
+
+    snapshot
+        .pending
+        .retain(|tx| !removed_hashes.contains(&tx.hash()));
+    snapshot
+        .executable_frontier
+        .retain(|hash| !removed_hashes.contains(hash));
+    for queue in &mut snapshot.sender_queues {
+        queue
+            .queued
+            .retain(|entry| !removed_hashes.contains(&entry.hash));
+    }
+    snapshot
+        .sender_queues
+        .retain(|queue| !queue.queued.is_empty());
+    snapshot
+}
+
+fn resolve_scheduler_snapshot_interval_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS)
+}
+
+fn resolve_scheduler_snapshot_max_finality_age_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
+}
+
+fn resolve_scheduler_config() -> SchedulerConfig {
+    let defaults = SchedulerConfig::default();
+    SchedulerConfig {
+        handoff_queue_capacity: resolve_positive_usize(
+            env::var(ENV_SCHEDULER_HANDOFF_QUEUE_CAPACITY)
+                .ok()
+                .as_deref(),
+            defaults.handoff_queue_capacity,
+        ),
+        max_pending_per_sender: resolve_positive_usize(
+            env::var(ENV_SCHEDULER_MAX_PENDING_PER_SENDER)
+                .ok()
+                .as_deref(),
+            defaults.max_pending_per_sender,
+        ),
+        replacement_fee_bump_bps: env::var(ENV_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS)
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .unwrap_or(defaults.replacement_fee_bump_bps),
+    }
+}
+
+fn resolve_positive_usize(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn validated_transaction_from_event(
+    event: &EventEnvelope,
+    storage: &InMemoryStorage,
+) -> Option<ValidatedTransaction> {
+    match &event.payload {
+        EventPayload::TxDecoded(decoded) => Some(ValidatedTransaction {
+            source_id: event.source_id.clone(),
+            observed_at_unix_ms: event.ingest_ts_unix_ms,
+            observed_at_mono_ns: event.ingest_ts_mono_ns,
+            calldata: storage
+                .tx_full_by_hash(&decoded.hash)
+                .map(|row| row.raw_tx.clone())
+                .unwrap_or_default(),
+            decoded: decoded.clone(),
+        }),
+        EventPayload::TxReorged(reorged) => storage.tx_full_by_hash(&reorged.hash).map(|row| {
+            // Reorg recovery re-admits the transaction at the reorg observation time, not the
+            // original decode time, because the tx became pending again at this event.
+            validated_transaction_from_storage_row(
+                &event.source_id,
+                event.ingest_ts_unix_ms,
+                event.ingest_ts_mono_ns,
+                row,
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn validated_transaction_from_storage_row(
+    source_id: &common::SourceId,
+    observed_at_unix_ms: i64,
+    observed_at_mono_ns: u64,
+    row: &TxFullRecord,
+) -> ValidatedTransaction {
+    ValidatedTransaction {
+        source_id: source_id.clone(),
+        observed_at_unix_ms,
+        observed_at_mono_ns,
+        calldata: row.raw_tx.clone(),
+        decoded: event_log::TxDecoded {
+            hash: row.hash,
+            tx_type: row.tx_type,
+            sender: row.sender,
+            nonce: row.nonce,
+            chain_id: row.chain_id,
+            to: row.to,
+            value_wei: row.value_wei,
+            gas_limit: row.gas_limit,
+            gas_price_wei: row.gas_price_wei,
+            max_fee_per_gas_wei: row.max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei: row.max_priority_fee_per_gas_wei,
+            max_fee_per_blob_gas_wei: row.max_fee_per_blob_gas_wei,
+            calldata_len: row
+                .calldata_len
+                .or(Some(row.raw_tx.len().min(u32::MAX as usize) as u32)),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1113,7 +1826,6 @@ fn hash_from_seq(seq: u64) -> [u8; 32] {
     hash
 }
 
-#[cfg(test)]
 fn current_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1122,11 +1834,7 @@ fn current_unix_ms() -> i64 {
 }
 
 fn format_bytes(bytes: &[u8]) -> String {
-    let mut out = String::from("0x");
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+    live_rpc::format_fixed_hex(bytes)
 }
 
 fn format_method_selector(method_selector: Option<[u8; 4]>) -> Option<String> {
@@ -1165,8 +1873,13 @@ fn event_payload_type(payload: &EventPayload) -> &str {
         EventPayload::TxSeen(_) => "TxSeen",
         EventPayload::TxFetched(_) => "TxFetched",
         EventPayload::TxDecoded(_) => "TxDecoded",
+        EventPayload::TxReady(_) => "TxReady",
+        EventPayload::TxBlocked(_) => "TxBlocked",
+        EventPayload::CandidateQueued(_) => "CandidateQueued",
+        EventPayload::SimDispatched(_) => "SimDispatched",
         EventPayload::OppDetected(_) => "OppDetected",
         EventPayload::SimCompleted(_) => "SimCompleted",
+        EventPayload::AssemblyDecisionApplied(_) => "AssemblyDecisionApplied",
         EventPayload::BundleSubmitted(_) => "BundleSubmitted",
         EventPayload::TxReplaced(_) => "TxReplaced",
         EventPayload::TxDropped(_) => "TxDropped",
@@ -1187,30 +1900,6 @@ fn parse_event_type_filters(raw: Option<&str>) -> Vec<String> {
     filters.sort_unstable();
     filters.dedup();
     filters
-}
-
-fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    let bytes = parse_hex_bytes(value)?;
-    if bytes.len() != N {
-        return None;
-    }
-    let mut out = [0_u8; N];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
-fn parse_hex_bytes(value: &str) -> Option<Vec<u8>> {
-    let trimmed = value.strip_prefix("0x").unwrap_or(value);
-    if trimmed.is_empty() {
-        return Some(Vec::new());
-    }
-    if !trimmed.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&trimmed[index..index + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()
 }
 
 pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
@@ -1260,6 +1949,22 @@ async fn health() -> (StatusCode, Json<HealthResponse>) {
 
 async fn metrics_snapshot(State(state): State<AppState>) -> Json<MetricSnapshot> {
     Json(state.provider.metric_snapshot())
+}
+
+async fn scheduler_snapshot(State(state): State<AppState>) -> Json<SchedulerSnapshot> {
+    Json((state.scheduler_snapshot_provider)())
+}
+
+async fn scheduler_metrics(State(state): State<AppState>) -> Json<SchedulerMetrics> {
+    Json((state.scheduler_metrics_provider)())
+}
+
+async fn builder_snapshot(State(state): State<AppState>) -> Json<AssemblySnapshot> {
+    Json((state.builder_snapshot_provider)())
+}
+
+async fn builder_metrics(State(state): State<AppState>) -> Json<AssemblyMetrics> {
+    Json((state.builder_metrics_provider)())
 }
 
 async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
@@ -1634,6 +2339,20 @@ async fn sim_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SimDetail>, StatusCode> {
+    if let Some(status) = (state.live_rpc_simulation_status_provider)(&id) {
+        return Ok(Json(SimDetail {
+            id: status.id,
+            bundle_id: status.bundle_id,
+            status: status.status,
+            relay_url: status.relay_url,
+            attempt_count: status.attempt_count,
+            accepted: status.accepted,
+            fail_category: status.fail_category,
+            started_unix_ms: status.started_unix_ms,
+            finished_unix_ms: status.finished_unix_ms,
+        }));
+    }
+
     let relay = state
         .relay_dry_run_status
         .read()
@@ -1736,6 +2455,219 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {}\n",
         drop_metrics.invalid_pending_hash
     ));
+    let scheduler_metrics = (state.scheduler_metrics_provider)();
+    out.push_str("# TYPE mempulse_scheduler_admitted_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_admitted_total {}\n",
+        scheduler_metrics.admitted_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_duplicate_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_duplicate_total {}\n",
+        scheduler_metrics.duplicate_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_replacement_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_replacement_total {}\n",
+        scheduler_metrics.replacement_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_underpriced_replacement_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_underpriced_replacement_total {}\n",
+        scheduler_metrics.underpriced_replacement_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_sender_limit_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_sender_limit_drop_total {}\n",
+        scheduler_metrics.sender_limit_drop_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_queue_full_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_full_drop_total {}\n",
+        scheduler_metrics.queue_full_drop_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_pending_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_pending_total {}\n",
+        scheduler_metrics.pending_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_ready_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_ready_total {}\n",
+        scheduler_metrics.ready_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_blocked_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_blocked_total {}\n",
+        scheduler_metrics.blocked_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_sender_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_sender_total {}\n",
+        scheduler_metrics.sender_total
+    ));
+    out.push_str("# TYPE mempulse_scheduler_queue_depth gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_depth {}\n",
+        scheduler_metrics.queue_depth
+    ));
+    out.push_str("# TYPE mempulse_scheduler_queue_depth_peak gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_depth_peak {}\n",
+        scheduler_metrics.queue_depth_peak
+    ));
+    out.push_str("# TYPE mempulse_scheduler_handoff_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_handoff_queue_capacity {}\n",
+        scheduler_metrics.handoff_queue_capacity
+    ));
+    let builder_metrics = (state.builder_metrics_provider)();
+    out.push_str("# TYPE mempulse_builder_inserted_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_inserted_total {}\n",
+        builder_metrics.inserted_total
+    ));
+    out.push_str("# TYPE mempulse_builder_replaced_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_replaced_total {}\n",
+        builder_metrics.replaced_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rejected_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rejected_total {}\n",
+        builder_metrics.rejected_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rejected_reason_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {}\n",
+        builder_metrics.rejected_simulation_not_approved_total
+    ));
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {}\n",
+        builder_metrics.rejected_objective_not_improved_total
+    ));
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {}\n",
+        builder_metrics.rejected_gas_limit_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rollback_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rollback_total {}\n",
+        builder_metrics.rollback_total
+    ));
+    out.push_str("# TYPE mempulse_builder_active_candidate_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_active_candidate_total {}\n",
+        builder_metrics.active_candidate_total
+    ));
+    out.push_str("# TYPE mempulse_builder_total_priority_score gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_priority_score {}\n",
+        builder_metrics.total_priority_score
+    ));
+    out.push_str("# TYPE mempulse_builder_total_gas_used gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_gas_used {}\n",
+        builder_metrics.total_gas_used
+    ));
+    out.push_str("# TYPE mempulse_builder_last_decision_latency_ns gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_last_decision_latency_ns {}\n",
+        builder_metrics.last_decision_latency_ns
+    ));
+    out.push_str("# TYPE mempulse_builder_max_decision_latency_ns gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_max_decision_latency_ns {}\n",
+        builder_metrics.max_decision_latency_ns
+    ));
+    out.push_str("# TYPE mempulse_builder_total_decision_latency_ns counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_decision_latency_ns {}\n",
+        builder_metrics.total_decision_latency_ns
+    ));
+    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
+    out.push_str("# TYPE mempulse_searcher_executable_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_batches_total {}\n",
+        searcher_metrics.executable_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_candidates_total {}\n",
+        searcher_metrics.executable_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_bundle_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_bundle_candidates_total {}\n",
+        searcher_metrics.executable_bundle_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge\n");
+    out.push_str(&format!(
+        "mempulse_searcher_max_executable_candidates_in_batch {}\n",
+        searcher_metrics.max_executable_candidates_in_batch
+    ));
+    // Compatibility-only legacy series retained for existing dashboards after the legacy shadow
+    // path was retired. They stay at zero in the current runtime path.
+    out.push_str("# TYPE mempulse_searcher_legacy_shadow_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_shadow_batches_total {}\n",
+        searcher_metrics.legacy_shadow_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_shadow_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_shadow_candidates_total {}\n",
+        searcher_metrics.legacy_shadow_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_max_legacy_shadow_candidates_in_batch gauge\n");
+    out.push_str(&format!(
+        "mempulse_searcher_max_legacy_shadow_candidates_in_batch {}\n",
+        searcher_metrics.max_legacy_shadow_candidates_in_batch
+    ));
+    out.push_str("# TYPE mempulse_searcher_comparison_batches_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_comparison_batches_total {}\n",
+        searcher_metrics.comparison_batches_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_top_score_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_top_score_total {}\n",
+        searcher_metrics.executable_top_score_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_top_score_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_top_score_total {}\n",
+        searcher_metrics.legacy_top_score_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_top_score_wins_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_top_score_wins_total {}\n",
+        searcher_metrics.executable_top_score_wins_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_top_score_wins_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_top_score_wins_total {}\n",
+        searcher_metrics.legacy_top_score_wins_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_top_score_ties_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_top_score_ties_total {}\n",
+        searcher_metrics.top_score_ties_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_overlapping_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_overlapping_candidates_total {}\n",
+        searcher_metrics.overlapping_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_executable_only_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_executable_only_candidates_total {}\n",
+        searcher_metrics.executable_only_candidates_total
+    ));
+    out.push_str("# TYPE mempulse_searcher_legacy_only_candidates_total counter\n");
+    out.push_str(&format!(
+        "mempulse_searcher_legacy_only_candidates_total {}\n",
+        searcher_metrics.legacy_only_candidates_total
+    ));
     out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
     out.push_str(&format!(
         "mempulse_dashboard_cache_refresh_total {}\n",
@@ -1763,19 +2695,128 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         dashboard_cache_metrics.estimated_bytes
     ));
 
-    // Stub values until replay runtime exports these counters directly.
+    let replay_metrics = (state.replay_runtime_metrics_provider)();
     out.push_str("# TYPE mempulse_replay_lag_events gauge\n");
-    out.push_str("mempulse_replay_lag_events 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_lag_events {}\n",
+        replay_metrics.lag_events
+    ));
     out.push_str("# TYPE mempulse_replay_checkpoint_duration_ms gauge\n");
-    out.push_str("mempulse_replay_checkpoint_duration_ms 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_checkpoint_duration_ms {}\n",
+        replay_metrics.checkpoint_duration_ms
+    ));
+    out.push_str("# TYPE mempulse_replay_tail_reorged_tx_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_replay_tail_reorged_tx_total {}\n",
+        replay_metrics.reorg_depth
+    ));
+    // Deprecated alias kept for compatibility; this counts replay-tail TxReorged events, not
+    // reorganized block depth.
     out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
-    out.push_str("mempulse_replay_reorg_depth 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_reorg_depth {}\n",
+        replay_metrics.reorg_depth
+    ));
 
-    // Stub values until simulator exports categorized metrics directly.
+    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
+    out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_enqueued_total {}\n",
+        sim_metrics.enqueued_total
+    ));
+    out.push_str("# TYPE mempulse_sim_queue_depth gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_queue_depth {}\n",
+        sim_metrics.queue_depth
+    ));
+    out.push_str("# TYPE mempulse_sim_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_queue_capacity {}\n",
+        sim_metrics.queue_capacity
+    ));
+    out.push_str("# TYPE mempulse_sim_inflight_current gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_inflight_current {}\n",
+        sim_metrics.inflight_current
+    ));
+    out.push_str("# TYPE mempulse_sim_worker_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_sim_worker_total {}\n",
+        sim_metrics.worker_total
+    ));
     out.push_str("# TYPE mempulse_sim_latency_ms gauge\n");
-    out.push_str("mempulse_sim_latency_ms 0\n");
+    out.push_str(&format!(
+        "mempulse_sim_latency_ms {}\n",
+        sim_metrics.last_latency_ms
+    ));
+    out.push_str("# TYPE mempulse_sim_completed_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"ok\"}} {}\n",
+        sim_metrics.ok_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"failed\"}} {}\n",
+        sim_metrics.failed_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"state_error\"}} {}\n",
+        sim_metrics.state_error_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_completed_total{{status=\"timeout\"}} {}\n",
+        sim_metrics.timeout_total
+    ));
+    out.push_str("# TYPE mempulse_sim_cache_hits_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_cache_hits_total {}\n",
+        sim_metrics.cache_hit_total
+    ));
+    out.push_str("# TYPE mempulse_sim_cache_misses_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_cache_misses_total {}\n",
+        sim_metrics.cache_miss_total
+    ));
+    out.push_str("# TYPE mempulse_sim_tx_total counter\n");
+    out.push_str(&format!("mempulse_sim_tx_total {}\n", sim_metrics.tx_total));
     out.push_str("# TYPE mempulse_sim_fail_total counter\n");
-    out.push_str("mempulse_sim_fail_total{category=\"unknown\"} 0\n");
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"revert\"}} {}\n",
+        sim_metrics.revert_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"out_of_gas\"}} {}\n",
+        sim_metrics.out_of_gas_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {}\n",
+        sim_metrics.nonce_mismatch_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_mismatch\"}} {}\n",
+        sim_metrics.state_mismatch_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_rpc\"}} {}\n",
+        sim_metrics.state_rpc_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"state_timeout\"}} {}\n",
+        sim_metrics.state_timeout_fail_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_fail_total{{category=\"unknown\"}} {}\n",
+        sim_metrics.unknown_fail_total
+    ));
+    out.push_str("# TYPE mempulse_sim_drop_total counter\n");
+    out.push_str(&format!(
+        "mempulse_sim_drop_total{{reason=\"queue_full\"}} {}\n",
+        sim_metrics.queue_full_drop_total
+    ));
+    out.push_str(&format!(
+        "mempulse_sim_drop_total{{reason=\"stale\"}} {}\n",
+        sim_metrics.stale_drop_total
+    ));
 
     out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
     out.push_str(&format!(
@@ -1872,41 +2913,19 @@ const DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY: usize = 256;
 const DASHBOARD_STREAM_BROADCAST_PAGE_LIMIT: usize = 20;
 const DASHBOARD_STREAM_BROADCAST_INTERVAL_MS: u64 = 1_000;
 
-fn dashboard_stream_broadcaster_registry()
--> &'static Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<DashboardStreamBroadcaster>>>> =
-        OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn dashboard_stream_provider_key(provider: &Arc<dyn VizDataProvider>) -> usize {
-    Arc::as_ptr(provider) as *const () as usize
-}
-
-fn resolve_dashboard_stream_broadcaster(
+fn dashboard_stream_broadcaster(
     provider: Arc<dyn VizDataProvider>,
 ) -> Arc<DashboardStreamBroadcaster> {
-    let key = dashboard_stream_provider_key(&provider);
-    let registry = dashboard_stream_broadcaster_registry();
-    if let Ok(guard) = registry.lock()
-        && let Some(existing) = guard.get(&key)
-    {
-        return existing.clone();
-    }
+    let broadcaster = empty_dashboard_stream_broadcaster();
+    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
+    broadcaster
+}
 
-    let broadcaster = Arc::new(DashboardStreamBroadcaster::new(
+fn empty_dashboard_stream_broadcaster() -> Arc<DashboardStreamBroadcaster> {
+    Arc::new(DashboardStreamBroadcaster::new(
         DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY,
         DASHBOARD_STREAM_BROADCAST_CHANNEL_CAPACITY,
-    ));
-    spawn_dashboard_stream_broadcaster_producer(provider, broadcaster.clone());
-
-    if let Ok(mut guard) = registry.lock() {
-        guard.entry(key).or_insert_with(|| broadcaster.clone());
-        if let Some(existing) = guard.get(&key) {
-            return existing.clone();
-        }
-    }
-    broadcaster
+    ))
 }
 
 fn spawn_dashboard_stream_broadcaster_producer(
@@ -1981,7 +3000,7 @@ async fn events_v1(
         query.after,
     );
     let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
-    let broadcaster = resolve_dashboard_stream_broadcaster(state.provider.clone());
+    let broadcaster = state.dashboard_stream_broadcaster.clone();
     let (initial_events, receiver) = broadcaster.subscribe_from(after_seq_id);
 
     struct EventsV1LoopState {
@@ -2802,8 +3821,25 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider =
+            Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -2811,6 +3847,14 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
         }
     }
 
@@ -2820,8 +3864,25 @@ mod tests {
             as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
         let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider =
+            Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
             downsample_limit: limit,
             relay_dry_run_status: Arc::new(RwLock::new(relay_status)),
             alert_thresholds: AlertThresholdConfig::default(),
@@ -2829,6 +3890,120 @@ mod tests {
             api_auth,
             live_rpc_chain_status_provider,
             live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        }
+    }
+
+    fn sample_scheduler_tx(hash_seed: u8, nonce: u64) -> ValidatedTransaction {
+        ValidatedTransaction {
+            source_id: SourceId::new("rpc-mainnet"),
+            observed_at_unix_ms: 1_700_000_123_456,
+            observed_at_mono_ns: 999,
+            calldata: vec![hash_seed; 4],
+            decoded: TxDecoded {
+                hash: [hash_seed; 32],
+                tx_type: 2,
+                sender: [hash_seed; 20],
+                nonce,
+                chain_id: Some(1),
+                to: Some([hash_seed.saturating_add(1); 20]),
+                value_wei: Some(42),
+                gas_limit: Some(21_000),
+                gas_price_wei: None,
+                max_fee_per_gas_wei: Some(101),
+                max_priority_fee_per_gas_wei: Some(3),
+                max_fee_per_blob_gas_wei: None,
+                calldata_len: Some(4),
+            },
+        }
+    }
+
+    fn test_state_with_scheduler(
+        limit: usize,
+        scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
+        scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
+    ) -> AppState {
+        let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+        AppState {
+            provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
+            downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        }
+    }
+
+    fn test_state_with_builder(
+        limit: usize,
+        builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
+        builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+    ) -> AppState {
+        let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_metrics_provider =
+            Arc::new(LiveRpcSimulationMetricsSnapshot::default)
+                as Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+        let live_rpc_simulation_status_provider =
+            Arc::new(|_: &str| None::<LiveRpcSimulationStatusSnapshot>)
+                as Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+        AppState {
+            provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
+            downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+            scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+            builder_snapshot_provider,
+            builder_metrics_provider,
         }
     }
 
@@ -2851,6 +4026,25 @@ mod tests {
         let mut status = RelayDryRunStatus::default();
         status.record(result);
         status
+    }
+
+    fn seeded_builder_engine() -> AssemblyEngine {
+        let mut engine = AssemblyEngine::new(AssemblyConfig {
+            block_gas_limit: 30_000_000,
+        });
+        let _ = engine.insert(AssemblyCandidate {
+            candidate_id: "cand-a".to_owned(),
+            tx_hashes: vec![[0x71; 32]],
+            priority_score: 320,
+            gas_used: 42_000,
+            kind: AssemblyCandidateKind::Transaction,
+            simulation: SimulationApproval {
+                sim_id: "sim-a".to_owned(),
+                block_number: 22_222_222,
+                approved: true,
+            },
+        });
+        engine
     }
 
     #[tokio::test]
@@ -2907,8 +4101,174 @@ mod tests {
         assert!(payload.contains("mempulse_dashboard_cache_last_build_ms"));
         assert!(payload.contains("mempulse_dashboard_cache_estimated_bytes"));
         assert!(payload.contains("mempulse_replay_lag_events"));
+        assert!(payload.contains("mempulse_replay_tail_reorged_tx_total"));
+        assert!(payload.contains("mempulse_sim_queue_depth"));
+        assert!(payload.contains("mempulse_sim_drop_total{reason=\"stale\"}"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
         assert!(payload.contains("mempulse_relay_success_rate"));
+        assert!(payload.contains(
+            "mempulse_builder_rejected_reason_total{reason=\"simulation_not_approved\"}"
+        ));
+        assert!(payload.contains("mempulse_builder_last_decision_latency_ns"));
+        assert!(payload.contains("mempulse_searcher_comparison_batches_total"));
+        assert!(payload.contains("mempulse_searcher_executable_bundle_candidates_total"));
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_includes_scheduler_series() {
+        let scheduler_snapshot_provider = Arc::new(SchedulerSnapshot::default)
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(|| SchedulerMetrics {
+            admitted_total: 7,
+            duplicate_total: 2,
+            replacement_total: 1,
+            underpriced_replacement_total: 3,
+            sender_limit_drop_total: 4,
+            queue_full_drop_total: 5,
+            pending_total: 6,
+            ready_total: 4,
+            blocked_total: 2,
+            sender_total: 3,
+            stale_simulation_drop_total: 8,
+            queue_depth: 9,
+            queue_depth_peak: 12,
+            handoff_queue_capacity: 128,
+        })
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_scheduler_admitted_total 7"));
+        assert!(payload.contains("mempulse_scheduler_duplicate_total 2"));
+        assert!(payload.contains("mempulse_scheduler_queue_depth 9"));
+        assert!(payload.contains("mempulse_scheduler_queue_depth_peak 12"));
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_includes_builder_series() {
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider = Arc::new(|| AssemblyMetrics {
+            inserted_total: 5,
+            replaced_total: 2,
+            rejected_total: 3,
+            rejected_simulation_not_approved_total: 1,
+            rejected_objective_not_improved_total: 1,
+            rejected_gas_limit_total: 1,
+            rollback_total: 4,
+            active_candidate_total: 2,
+            total_priority_score: 500,
+            total_gas_used: 63_000,
+            last_decision_latency_ns: 7,
+            max_decision_latency_ns: 11,
+            total_decision_latency_ns: 29,
+        }) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_builder_inserted_total 5"));
+        assert!(payload.contains(
+            "mempulse_builder_rejected_reason_total{reason=\"objective_not_improved\"} 1"
+        ));
+        assert!(payload.contains("mempulse_builder_rollback_total 4"));
+        assert!(payload.contains("mempulse_builder_last_decision_latency_ns 7"));
+        assert!(payload.contains("mempulse_builder_total_decision_latency_ns 29"));
+    }
+
+    #[tokio::test]
+    async fn metrics_prometheus_route_includes_searcher_series() {
+        let api_auth = ApiAuthConfig::default();
+        let state = AppState {
+            provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
+            downsample_limit: 100,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
+            live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+            live_rpc_searcher_metrics_provider: Arc::new(|| LiveRpcSearcherMetricsSnapshot {
+                executable_batches_total: 11,
+                executable_candidates_total: 22,
+                executable_bundle_candidates_total: 3,
+                max_executable_candidates_in_batch: 6,
+                legacy_shadow_batches_total: 10,
+                legacy_shadow_candidates_total: 20,
+                max_legacy_shadow_candidates_in_batch: 5,
+                comparison_batches_total: 9,
+                executable_top_score_total: 90_000,
+                legacy_top_score_total: 80_000,
+                executable_top_score_wins_total: 7,
+                legacy_top_score_wins_total: 1,
+                top_score_ties_total: 1,
+                overlapping_candidates_total: 12,
+                executable_only_candidates_total: 8,
+                legacy_only_candidates_total: 4,
+            }),
+            live_rpc_simulation_metrics_provider: Arc::new(
+                LiveRpcSimulationMetricsSnapshot::default,
+            ),
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider: Arc::new(|_| None),
+            scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+            scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+            builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+            builder_metrics_provider: Arc::new(AssemblyMetrics::default),
+        };
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_searcher_executable_batches_total 11"));
+        assert!(payload.contains("mempulse_searcher_executable_bundle_candidates_total 3"));
+        assert!(payload.contains("mempulse_searcher_max_executable_candidates_in_batch 6"));
+        assert!(payload.contains("mempulse_searcher_comparison_batches_total 9"));
+        assert!(payload.contains("mempulse_searcher_executable_top_score_wins_total 7"));
+        assert!(payload.contains("mempulse_searcher_legacy_only_candidates_total 4"));
     }
 
     #[tokio::test]
@@ -3422,6 +4782,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_snapshot_route_returns_scheduler_state() {
+        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+        scheduler
+            .admit(sample_scheduler_tx(0x51, 7))
+            .await
+            .expect("scheduler admit");
+        let scheduler_for_snapshot = scheduler.clone();
+        let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(move || scheduler.metrics())
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/scheduler/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SchedulerSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.pending.len(), 1);
+        assert_eq!(payload.ready.len(), 1);
+        assert_eq!(payload.blocked.len(), 0);
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduler_metrics_route_returns_scheduler_metrics() {
+        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let runtime_task = tokio::spawn(runtime.run());
+        scheduler
+            .admit(sample_scheduler_tx(0x61, 9))
+            .await
+            .expect("first scheduler admit");
+        scheduler
+            .admit(sample_scheduler_tx(0x61, 9))
+            .await
+            .expect("duplicate scheduler admit");
+
+        let scheduler_for_snapshot = scheduler.clone();
+        let scheduler_snapshot_provider = Arc::new(move || scheduler_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+        let scheduler_metrics_provider = Arc::new(move || scheduler.metrics())
+            as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_scheduler(
+            100,
+            scheduler_snapshot_provider,
+            scheduler_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/scheduler/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SchedulerMetrics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.admitted_total, 1);
+        assert_eq!(payload.duplicate_total, 1);
+        assert_eq!(payload.pending_total, 1);
+        assert_eq!(payload.ready_total, 1);
+
+        runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn builder_snapshot_route_returns_builder_state() {
+        let engine = seeded_builder_engine();
+        let builder_snapshot_provider =
+            Arc::new(move || engine.snapshot()) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblySnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.candidates.len(), 1);
+        assert_eq!(payload.objective.total_priority_score, 320);
+        assert_eq!(payload.objective.total_gas_used, 42_000);
+    }
+
+    #[tokio::test]
+    async fn builder_metrics_route_returns_builder_metrics() {
+        let engine = seeded_builder_engine();
+        let engine_for_snapshot = engine.clone();
+        let builder_snapshot_provider = Arc::new(move || engine_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(move || engine.metrics()) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblyMetrics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.inserted_total, 1);
+        assert_eq!(payload.active_candidate_total, 1);
+        assert_eq!(payload.total_priority_score, 320);
+        assert_eq!(payload.total_gas_used, 42_000);
+        assert_eq!(payload.rollback_total, 0);
+        assert_eq!(payload.rejected_total, 0);
+        assert!(payload.last_decision_latency_ns > 0);
+    }
+
+    #[tokio::test]
     async fn bundle_route_returns_latest_bundle_detail() {
         let app = build_router(test_state_with_relay(100, seeded_relay_status()));
 
@@ -3465,6 +4980,161 @@ mod tests {
         assert_eq!(payload.relay_url, "https://relay.example");
         assert_eq!(payload.status, "fail");
         assert_eq!(payload.fail_category.as_deref(), Some("relay_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn sim_route_prefers_live_rpc_simulation_status_when_present() {
+        let seeded_status = LiveRpcSimulationStatusSnapshot {
+            id: "sim-local-1".to_owned(),
+            bundle_id: "bundle-local-1".to_owned(),
+            status: "ok".to_owned(),
+            relay_url: "not_submitted".to_owned(),
+            attempt_count: 0,
+            accepted: true,
+            fail_category: None,
+            started_unix_ms: 1_700_000_123_000,
+            finished_unix_ms: 1_700_000_123_111,
+        };
+        let mut state = test_state_with_relay(100, seeded_relay_status());
+        state.live_rpc_simulation_status_provider = Arc::new(move |id: &str| {
+            if id == "latest" || id == "sim-local-1" {
+                Some(seeded_status.clone())
+            } else {
+                None
+            }
+        });
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sim/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SimDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.id, "sim-local-1");
+        assert_eq!(payload.bundle_id, "bundle-local-1");
+        assert_eq!(payload.status, "ok");
+        assert_eq!(payload.relay_url, "not_submitted");
+        assert!(payload.accepted);
+    }
+
+    #[tokio::test]
+    async fn sim_route_reads_runtime_core_status_provider_when_injected() {
+        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
+        let handle = RuntimeCore::start(RuntimeCoreStartArgs {
+            deps: RuntimeCoreDeps {
+                storage: Arc::new(RwLock::new(InMemoryStorage::default())),
+                writer: StorageWriteHandle::from_sender(storage_tx),
+                scheduler,
+            },
+            config: RuntimeCoreConfig {
+                ingest_mode: RuntimeIngestMode::Rpc,
+                rebuild_scheduler_from_rpc: false,
+            },
+        })
+        .expect("runtime core should start");
+        handle.record_simulation_status(LiveRpcSimulationStatusSnapshot {
+            id: "sim-core-1".to_owned(),
+            bundle_id: "bundle-core-1".to_owned(),
+            status: "ok".to_owned(),
+            relay_url: "runtime-core".to_owned(),
+            attempt_count: 0,
+            accepted: true,
+            fail_category: None,
+            started_unix_ms: 1_700_000_111_000,
+            finished_unix_ms: 1_700_000_111_050,
+        });
+        let providers = RuntimeCoreViewProviders::from_runtime_core(handle);
+        let api_auth = ApiAuthConfig::default();
+        let app = build_router(AppState {
+            provider: Arc::new(MockProvider),
+            dashboard_stream_broadcaster: empty_dashboard_stream_broadcaster(),
+            downsample_limit: 100,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider: providers.live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider: providers.live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider: providers.live_rpc_searcher_metrics_provider,
+            live_rpc_simulation_metrics_provider: providers.live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
+            live_rpc_simulation_status_provider: providers.live_rpc_simulation_status_provider,
+            scheduler_snapshot_provider: providers.scheduler_snapshot_provider,
+            scheduler_metrics_provider: providers.scheduler_metrics_provider,
+            builder_snapshot_provider: providers.builder_snapshot_provider,
+            builder_metrics_provider: providers.builder_metrics_provider,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sim/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: SimDetail = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.id, "sim-core-1");
+        assert_eq!(payload.bundle_id, "bundle-core-1");
+        assert_eq!(payload.relay_url, "runtime-core");
+        assert!(payload.accepted);
+    }
+
+    #[tokio::test]
+    async fn app_state_from_runtime_bootstrap_reads_runtime_core_builder_views() {
+        let (_legacy_state, bootstrap) = default_state_with_runtime();
+        let handle = RuntimeCore::start(bootstrap.runtime_core_start_args(RuntimeIngestMode::Rpc))
+            .expect("runtime core should start");
+        handle.with_builder_engine_mut(|engine| {
+            let _ = engine.insert(AssemblyCandidate {
+                candidate_id: "cand-runtime-1".to_owned(),
+                tx_hashes: vec![[0x31; 32]],
+                priority_score: 123,
+                gas_used: 21_000,
+                kind: AssemblyCandidateKind::Transaction,
+                simulation: SimulationApproval {
+                    sim_id: "sim-runtime-1".to_owned(),
+                    block_number: 17,
+                    approved: true,
+                },
+            });
+        });
+
+        let app = build_router(app_state_from_runtime_bootstrap(
+            &bootstrap,
+            RuntimeCoreViewProviders::from_runtime_core(handle),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblySnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.candidates.len(), 1);
+        assert_eq!(payload.candidates[0].candidate_id, "cand-runtime-1");
+
+        bootstrap.abort_background_tasks();
     }
 
     #[test]

@@ -21,11 +21,13 @@ fn parquet_export_writes_replay_frames_that_can_be_read_back() {
             seq_hi: 1,
             timestamp_unix_ms: 1_700_000_000_001,
             pending: vec![hash(1)],
+            sender_queues: Vec::new(),
         },
         ReplayFrame {
             seq_hi: 2,
             timestamp_unix_ms: 1_700_000_000_002,
             pending: vec![hash(2), hash(3)],
+            sender_queues: Vec::new(),
         },
     ];
     let path = temp_path();

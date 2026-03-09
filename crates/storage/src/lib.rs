@@ -6,9 +6,13 @@ use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use common::{Address, PeerId, SourceId, TxHash};
-use event_log::{EventEnvelope, EventPayload, GlobalSequencer, cmp_deterministic};
+use event_log::{
+    AssemblyDecisionApplied, CandidateQueued, EventEnvelope, EventPayload, GlobalSequencer,
+    cmp_deterministic,
+};
 use hashbrown::{HashMap, HashSet};
 use replay::ReplayFrame;
+use scheduler::PersistedSchedulerSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
@@ -104,6 +108,17 @@ pub struct OpportunityRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuilderLifecycleRecord {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    pub decision: String,
+    pub replaced_candidate_ids: Vec<String>,
+    pub reason: Option<String>,
+    pub block_number: u64,
+    pub updated_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxLifecycleRecord {
     pub hash: TxHash,
     pub status: String,
@@ -160,6 +175,13 @@ pub fn scan_events_cursor_start(events: &[EventEnvelope], from_seq_id: u64) -> u
     events.partition_point(|event| event.seq_id <= from_seq_id)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SchedulerRehydrationPlan {
+    pub snapshot: Option<PersistedSchedulerSnapshot>,
+    pub replay_events: Vec<EventEnvelope>,
+    pub requires_rpc_rebuild: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct InMemoryStorage {
     config: StorageConfig,
@@ -176,10 +198,13 @@ pub struct InMemoryStorage {
     tx_features_lookup: FastMap<TxHash, TxFeaturesRecord>,
     feature_summary_counts: FastMap<(String, String), u64>,
     opportunities: VecDeque<OpportunityRecord>,
+    builder_lifecycle: VecDeque<BuilderLifecycleRecord>,
     tx_lifecycle: VecDeque<TxLifecycleRecord>,
     tx_lifecycle_counts: FastMap<TxHash, usize>,
     tx_lifecycle_lookup: FastMap<TxHash, TxLifecycleRecord>,
     peer_stats: VecDeque<PeerStatsRecord>,
+    scheduler_snapshot: Option<PersistedSchedulerSnapshot>,
+    latest_finalized_block_unix_ms: Option<i64>,
     write_latency_ns: VecDeque<u64>,
     recent_tx_order: VecDeque<TxHash>,
     recent_tx_counts: FastMap<TxHash, usize>,
@@ -218,10 +243,13 @@ impl InMemoryStorage {
             tx_features_lookup: FastMap::default(),
             feature_summary_counts: FastMap::default(),
             opportunities: VecDeque::new(),
+            builder_lifecycle: VecDeque::new(),
             tx_lifecycle: VecDeque::new(),
             tx_lifecycle_counts: FastMap::default(),
             tx_lifecycle_lookup: FastMap::default(),
             peer_stats: VecDeque::new(),
+            scheduler_snapshot: None,
+            latest_finalized_block_unix_ms: None,
             write_latency_ns: VecDeque::new(),
             recent_tx_order: VecDeque::new(),
             recent_tx_counts: FastMap::default(),
@@ -311,6 +339,17 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    pub fn upsert_builder_lifecycle(&mut self, record: BuilderLifecycleRecord) {
+        let start = Instant::now();
+        push_bounded(
+            &mut self.builder_lifecycle,
+            record,
+            self.config.table_capacity,
+        );
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
+    }
+
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
         push_bounded_hash_indexed(
@@ -328,6 +367,13 @@ impl InMemoryStorage {
     pub fn upsert_peer_stats(&mut self, record: PeerStatsRecord) {
         let start = Instant::now();
         push_bounded(&mut self.peer_stats, record, self.config.table_capacity);
+        self.record_write_latency(start.elapsed().as_nanos() as u64);
+        self.bump_read_model_revision();
+    }
+
+    pub fn write_scheduler_snapshot(&mut self, snapshot: PersistedSchedulerSnapshot) {
+        let start = Instant::now();
+        self.scheduler_snapshot = Some(snapshot);
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }
@@ -365,6 +411,10 @@ impl InMemoryStorage {
                 .then_with(|| a.strategy.cmp(&b.strategy))
         });
         out
+    }
+
+    pub fn builder_lifecycle(&self) -> &VecDeque<BuilderLifecycleRecord> {
+        &self.builder_lifecycle
     }
 
     pub fn dashboard_feature_summary(&self, limit: usize) -> Vec<FeatureSummaryBucket> {
@@ -435,6 +485,36 @@ impl InMemoryStorage {
 
     pub fn peer_stats(&self) -> &VecDeque<PeerStatsRecord> {
         &self.peer_stats
+    }
+
+    pub fn scheduler_snapshot(&self) -> Option<&PersistedSchedulerSnapshot> {
+        self.scheduler_snapshot.as_ref()
+    }
+
+    pub fn scheduler_rehydration_plan(&self, max_finality_gap_ms: u64) -> SchedulerRehydrationPlan {
+        let Some(snapshot) = self.scheduler_snapshot.clone() else {
+            return SchedulerRehydrationPlan::default();
+        };
+
+        if self
+            .latest_finalized_block_unix_ms
+            .is_some_and(|finalized_unix_ms| {
+                finalized_unix_ms.saturating_sub(snapshot.captured_at_unix_ms)
+                    > max_finality_gap_ms.min(i64::MAX as u64) as i64
+            })
+        {
+            return SchedulerRehydrationPlan {
+                snapshot: None,
+                replay_events: Vec::new(),
+                requires_rpc_rebuild: true,
+            };
+        }
+
+        SchedulerRehydrationPlan {
+            replay_events: self.scan_events(snapshot.event_seq_hi, self.event_index.len().max(1)),
+            snapshot: Some(snapshot),
+            requires_rpc_rebuild: false,
+        }
     }
 
     pub fn recent_transactions(&self, limit: usize) -> Vec<RecentTransactionRecord> {
@@ -543,6 +623,25 @@ impl EventStore for InMemoryStorage {
                 source_id: event.source_id.0.clone(),
             });
         }
+        if let EventPayload::TxConfirmedFinal(confirmed) = &event.payload {
+            let _ = confirmed;
+            self.latest_finalized_block_unix_ms = Some(
+                self.latest_finalized_block_unix_ms
+                    .unwrap_or_default()
+                    .max(event.ingest_ts_unix_ms),
+            );
+        }
+
+        // Event append is the authority boundary; flat tables are derived here.
+        if let EventPayload::CandidateQueued(queued) = &event.payload {
+            self.upsert_opportunity(project_opportunity_from_candidate(queued));
+        }
+        if let EventPayload::AssemblyDecisionApplied(applied) = &event.payload {
+            self.upsert_builder_lifecycle(project_builder_lifecycle(
+                applied,
+                event.ingest_ts_unix_ms,
+            ));
+        }
 
         let lifecycle_update = match &event.payload {
             EventPayload::TxDecoded(decoded) => Some(TxLifecycleRecord {
@@ -591,9 +690,14 @@ impl EventStore for InMemoryStorage {
             }),
             EventPayload::TxSeen(_)
             | EventPayload::TxFetched(_)
+            | EventPayload::CandidateQueued(_)
+            | EventPayload::SimDispatched(_)
             | EventPayload::OppDetected(_)
             | EventPayload::SimCompleted(_)
-            | EventPayload::BundleSubmitted(_) => None,
+            | EventPayload::AssemblyDecisionApplied(_)
+            | EventPayload::BundleSubmitted(_)
+            | EventPayload::TxReady(_)
+            | EventPayload::TxBlocked(_) => None,
         };
         if let Some(record) = lifecycle_update {
             self.upsert_tx_lifecycle(record);
@@ -656,6 +760,7 @@ pub enum StorageWriteOp {
     UpsertOpportunity(OpportunityRecord),
     UpsertTxLifecycle(TxLifecycleRecord),
     UpsertPeerStats(PeerStatsRecord),
+    WriteSchedulerSnapshot(PersistedSchedulerSnapshot),
 }
 
 #[derive(Clone, Debug)]
@@ -716,6 +821,15 @@ impl StorageWriteHandle {
         op: StorageWriteOp,
     ) -> std::result::Result<(), StorageTryEnqueueError> {
         self.tx.try_send(op).map_err(|err| match err {
+            TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
+            TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,
+        })
+    }
+
+    pub fn try_reserve(
+        &self,
+    ) -> std::result::Result<mpsc::Permit<'_, StorageWriteOp>, StorageTryEnqueueError> {
+        self.tx.try_reserve().map_err(|err| match err {
             TrySendError::Full(_) => StorageTryEnqueueError::QueueFull,
             TrySendError::Closed(_) => StorageTryEnqueueError::QueueClosed,
         })
@@ -927,6 +1041,9 @@ fn apply_write_op(
         StorageWriteOp::UpsertOpportunity(record) => storage.upsert_opportunity(record),
         StorageWriteOp::UpsertTxLifecycle(record) => storage.upsert_tx_lifecycle(record),
         StorageWriteOp::UpsertPeerStats(record) => storage.upsert_peer_stats(record),
+        StorageWriteOp::WriteSchedulerSnapshot(snapshot) => {
+            storage.write_scheduler_snapshot(snapshot);
+        }
     }
 }
 
@@ -1056,6 +1173,37 @@ fn format_hash(hash: &TxHash) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn project_opportunity_from_candidate(payload: &CandidateQueued) -> OpportunityRecord {
+    OpportunityRecord {
+        tx_hash: payload.tx_hash,
+        chain_id: payload.chain_id,
+        strategy: payload.strategy.clone(),
+        score: payload.score,
+        protocol: payload.protocol.clone(),
+        category: payload.category.clone(),
+        feature_engine_version: payload.feature_engine_version.clone(),
+        scorer_version: payload.scorer_version.clone(),
+        strategy_version: payload.strategy_version.clone(),
+        reasons: payload.reasons.clone(),
+        detected_unix_ms: payload.detected_unix_ms,
+    }
+}
+
+fn project_builder_lifecycle(
+    payload: &AssemblyDecisionApplied,
+    updated_unix_ms: i64,
+) -> BuilderLifecycleRecord {
+    BuilderLifecycleRecord {
+        candidate_id: payload.candidate_id.clone(),
+        tx_hash: payload.tx_hash,
+        decision: payload.decision.clone(),
+        replaced_candidate_ids: payload.replaced_candidate_ids.clone(),
+        reason: payload.reason.clone(),
+        block_number: payload.block_number,
+        updated_unix_ms,
+    }
 }
 
 #[cfg(test)]
@@ -1474,11 +1622,13 @@ mod tests {
                 seq_hi: 1,
                 timestamp_unix_ms: 1_700_000_000_000,
                 pending: vec![hash(3)],
+                sender_queues: Vec::new(),
             },
             ReplayFrame {
                 seq_hi: 2,
                 timestamp_unix_ms: 1_700_000_000_100,
                 pending: vec![hash(3), hash(4)],
+                sender_queues: Vec::new(),
             },
         ];
         let json_a = export_replay_frames_json(&frames).expect("json");
@@ -1497,6 +1647,7 @@ mod tests {
             seq_hi: 1,
             timestamp_unix_ms: 1_700_000_000_000,
             pending: vec![hash(9)],
+            sender_queues: Vec::new(),
         }];
         let err = exporter
             .export_replay_frames_parquet(&frames, "/tmp/replay.parquet")

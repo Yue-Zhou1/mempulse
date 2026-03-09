@@ -2,8 +2,8 @@
   "seeded_transactions": 2000,
   "seeded_events": 6000,
   "latest_seq_id": 6000,
-  "snapshot_latency_ms": 2830.975176,
-  "stream_catch_up_ms": 2.099331,
+  "snapshot_latency_ms": 24.842479,
+  "stream_catch_up_ms": 1.904115,
   "stream_events_seen": 6000,
-  "stream_events_per_sec": 2858053.351281909
+  "stream_events_per_sec": 3151070.182210633
 }

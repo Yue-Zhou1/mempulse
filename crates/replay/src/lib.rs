@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use mempool_state::{MempoolState, StateTransition, TxLifecycleStatus};
+pub use mempool_state::{
+    CandidateLifecycleEntry, CandidateLifecycleSnapshot, CandidateLifecycleState, MempoolState,
+    ReplayQueueState, ReplaySenderQueue, ReplaySenderQueueEntry, StateTransition,
+    TxLifecycleStatus,
+};
 pub use sim_engine::{
     ChainContext as SimulationChainContext, SimulationBatchResult, TxSimulationResult,
 };
@@ -22,12 +26,16 @@ pub struct ReplayFrame {
     pub seq_hi: u64,
     pub timestamp_unix_ms: i64,
     pub pending: Vec<TxHash>,
+    #[serde(default)]
+    pub sender_queues: Vec<ReplaySenderQueue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleCheckpoint {
     pub seq_id: u64,
     pub pending_hashes: Vec<TxHash>,
+    #[serde(default)]
+    pub sender_queues: Vec<ReplaySenderQueue>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +87,7 @@ pub fn lifecycle_checkpoints(
             out.push(LifecycleCheckpoint {
                 seq_id: event.seq_id,
                 pending_hashes: pending,
+                sender_queues: state.sender_queues(),
             });
         }
     }
@@ -95,6 +104,24 @@ pub fn lifecycle_snapshot(
         .next()
 }
 
+pub fn candidate_lifecycle_snapshot(
+    events: &[EventEnvelope],
+    checkpoint_seq_id: u64,
+) -> Option<CandidateLifecycleSnapshot> {
+    let mut sorted = events.to_vec();
+    sort_deterministic(&mut sorted);
+
+    let mut state = CandidateLifecycleState::default();
+    for event in sorted {
+        state.apply_event(&event);
+        if event.seq_id == checkpoint_seq_id {
+            return Some(state.snapshot(event.seq_id));
+        }
+    }
+
+    None
+}
+
 pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     let mut pending_hashes = checkpoint.pending_hashes.clone();
     pending_hashes.sort_unstable();
@@ -105,6 +132,7 @@ pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     for hash in pending_hashes {
         hasher.update(hash);
     }
+    hash_sender_queues(&mut hasher, &checkpoint.sender_queues);
     let digest = hasher.finalize();
     let mut out = [0_u8; 32];
     out.copy_from_slice(&digest);
@@ -167,6 +195,7 @@ fn replay_deterministic(events: &[EventEnvelope], stride: usize) -> Vec<ReplayFr
                 seq_hi: event.seq_id,
                 timestamp_unix_ms: event.ingest_ts_unix_ms,
                 pending,
+                sender_queues: state.sender_queues(),
             });
         }
     }
@@ -190,7 +219,11 @@ fn replay_deterministic_from_checkpoint(
         return Vec::new();
     }
 
-    let mut state = MempoolState::from_pending_hashes(&checkpoint.pending_hashes);
+    let mut state = if checkpoint.sender_queues.is_empty() {
+        MempoolState::from_pending_hashes(&checkpoint.pending_hashes)
+    } else {
+        MempoolState::from_checkpoint(&checkpoint.pending_hashes, &checkpoint.sender_queues)
+    };
     let mut frames = Vec::new();
     for (idx, event) in sorted_tail.iter().enumerate() {
         state.apply_event(event);
@@ -202,6 +235,7 @@ fn replay_deterministic_from_checkpoint(
                 seq_hi: event.seq_id,
                 timestamp_unix_ms: event.ingest_ts_unix_ms,
                 pending,
+                sender_queues: state.sender_queues(),
             });
         }
     }
@@ -213,34 +247,22 @@ fn replay_snapshot(events: &[EventEnvelope], stride: usize) -> Vec<ReplayFrame> 
     let mut sorted = events.to_vec();
     sort_deterministic(&mut sorted);
 
-    let mut pending = BTreeSet::new();
+    let mut state = MempoolState::default();
     let mut frames = Vec::new();
     let mut count = 0usize;
 
     for event in &sorted {
         count += 1;
-        match &event.payload {
-            EventPayload::TxDecoded(decoded) => {
-                pending.insert(decoded.hash);
-            }
-            EventPayload::TxDropped(dropped) => {
-                pending.remove(&dropped.hash);
-            }
-            EventPayload::TxConfirmedFinal(confirmed) => {
-                pending.remove(&confirmed.hash);
-            }
-            EventPayload::TxReplaced(replaced) => {
-                pending.remove(&replaced.hash);
-                pending.insert(replaced.replaced_by);
-            }
-            _ => {}
-        }
+        state.apply_event(event);
 
         if count.is_multiple_of(stride) || count == sorted.len() {
+            let mut pending = state.pending_hashes();
+            pending.sort_unstable();
             frames.push(ReplayFrame {
                 seq_hi: event.seq_id,
                 timestamp_unix_ms: event.ingest_ts_unix_ms,
-                pending: pending.iter().copied().collect(),
+                pending,
+                sender_queues: state.sender_queues(),
             });
         }
     }
@@ -321,10 +343,30 @@ fn frame_checkpoint_hash(frame: &ReplayFrame) -> [u8; 32] {
     for hash in &frame.pending {
         hasher.update(hash);
     }
+    hash_sender_queues(&mut hasher, &frame.sender_queues);
     let digest = hasher.finalize();
     let mut out = [0_u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+fn hash_sender_queues(hasher: &mut Sha256, sender_queues: &[ReplaySenderQueue]) {
+    hasher.update((sender_queues.len() as u64).to_le_bytes());
+    for queue in sender_queues {
+        hasher.update(queue.sender);
+        hasher.update((queue.queued.len() as u64).to_le_bytes());
+        for entry in &queue.queued {
+            hasher.update(entry.hash);
+            hasher.update(entry.nonce.to_le_bytes());
+            match entry.state {
+                ReplayQueueState::Ready => hasher.update([0]),
+                ReplayQueueState::Blocked { expected_nonce } => {
+                    hasher.update([1]);
+                    hasher.update(expected_nonce.to_le_bytes());
+                }
+            }
+        }
+    }
 }
 
 pub fn simulate_deterministic_window(
@@ -359,7 +401,7 @@ pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLif
 mod tests {
     use super::*;
     use common::{Address, BlockHash, SourceId};
-    use event_log::{TxConfirmed, TxDecoded, TxDropped};
+    use event_log::{TxBlocked, TxConfirmed, TxDecoded, TxDropped, TxReady};
 
     fn hash(v: u8) -> TxHash {
         [v; 32]
@@ -398,6 +440,35 @@ mod tests {
                 max_priority_fee_per_gas_wei: None,
                 max_fee_per_blob_gas_wei: None,
                 calldata_len: None,
+            }),
+        )
+    }
+
+    fn ready(seq: u64, hash_v: u8, sender_v: u8, nonce: u64) -> EventEnvelope {
+        envelope(
+            seq,
+            EventPayload::TxReady(TxReady {
+                hash: hash(hash_v),
+                sender: address(sender_v),
+                nonce,
+            }),
+        )
+    }
+
+    fn blocked(
+        seq: u64,
+        hash_v: u8,
+        sender_v: u8,
+        nonce: u64,
+        expected_nonce: u64,
+    ) -> EventEnvelope {
+        envelope(
+            seq,
+            EventPayload::TxBlocked(TxBlocked {
+                hash: hash(hash_v),
+                sender: address(sender_v),
+                nonce,
+                expected_nonce: Some(expected_nonce),
             }),
         )
     }
@@ -480,10 +551,12 @@ mod tests {
         let checkpoint = LifecycleCheckpoint {
             seq_id: 10,
             pending_hashes: vec![hash(3), hash(1), hash(2)],
+            sender_queues: Vec::new(),
         };
         let same_set_different_order = LifecycleCheckpoint {
             seq_id: 10,
             pending_hashes: vec![hash(2), hash(3), hash(1)],
+            sender_queues: Vec::new(),
         };
 
         let hash_a = lifecycle_checkpoint_hash(&checkpoint);
@@ -548,5 +621,73 @@ mod tests {
         assert_eq!(summary.added_pending, vec![hash(3)]);
         assert_eq!(summary.removed_pending, vec![hash(1)]);
         assert_ne!(summary.from_checkpoint_hash, summary.to_checkpoint_hash);
+    }
+
+    #[test]
+    fn replay_reconstructs_sender_queue_state_from_queue_transition_events() {
+        let events = vec![
+            decoded(1, 7, 9, 7),
+            ready(2, 7, 9, 7),
+            decoded(3, 9, 9, 9),
+            blocked(4, 9, 9, 9, 8),
+            decoded(5, 8, 9, 8),
+            ready(6, 8, 9, 8),
+            ready(7, 9, 9, 9),
+        ];
+
+        let frames = replay_frames(&events, ReplayMode::DeterministicEventReplay, 1);
+        assert_eq!(frames.len(), 7);
+
+        assert_eq!(
+            frames[3].sender_queues,
+            vec![ReplaySenderQueue {
+                sender: address(9),
+                queued: vec![
+                    ReplaySenderQueueEntry {
+                        hash: hash(7),
+                        nonce: 7,
+                        state: ReplayQueueState::Ready,
+                    },
+                    ReplaySenderQueueEntry {
+                        hash: hash(9),
+                        nonce: 9,
+                        state: ReplayQueueState::Blocked { expected_nonce: 8 },
+                    },
+                ],
+            }]
+        );
+        assert_eq!(
+            frames[6].sender_queues,
+            vec![ReplaySenderQueue {
+                sender: address(9),
+                queued: vec![
+                    ReplaySenderQueueEntry {
+                        hash: hash(7),
+                        nonce: 7,
+                        state: ReplayQueueState::Ready,
+                    },
+                    ReplaySenderQueueEntry {
+                        hash: hash(8),
+                        nonce: 8,
+                        state: ReplayQueueState::Ready,
+                    },
+                    ReplaySenderQueueEntry {
+                        hash: hash(9),
+                        nonce: 9,
+                        state: ReplayQueueState::Ready,
+                    },
+                ],
+            }]
+        );
+
+        let checkpoint = lifecycle_snapshot(&events, 4).expect("checkpoint at seq=4");
+        let expected_tail = frames
+            .iter()
+            .filter(|frame| frame.seq_hi > checkpoint.seq_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let from_checkpoint = replay_from_checkpoint(&events, &checkpoint, 1);
+
+        assert_eq!(from_checkpoint, expected_tail);
     }
 }

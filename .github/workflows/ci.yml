@@ -65,8 +65,18 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Compile bench targets
+        run: cargo bench -p bench --no-run
+
       - name: Run perf regression checks
         run: bash scripts/perf_regression_check.sh
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-artifacts
+          path: artifacts/perf/*.json
 
   web-ui:
     name: Web UI Check

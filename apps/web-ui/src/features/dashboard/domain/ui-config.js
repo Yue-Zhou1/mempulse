@@ -9,7 +9,7 @@ const DEFAULT_CONFIG = Object.freeze({
   samplingLagThresholdMs: 30,
   samplingStride: 5,
   samplingFlushIdleMs: 500,
-  heapEmergencyPurgeMb: 400,
+  heapEmergencyPurgeMb: 250,
   devPerformanceEntryCleanupIntervalMs: 15_000,
   transactionRetentionMs: 5 * 60 * 1000,
   streamTransport: 'sse',

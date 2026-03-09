@@ -6,13 +6,28 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 event-log = { path = "../event-log" }
+scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+storage = { path = "../storage" }
+tokio = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "pipeline_latency"
+harness = false
+
+[[bench]]
+name = "scheduler_pipeline"
+harness = false
+
+[[bench]]
+name = "simulation_roundtrip"
+harness = false
+
+[[bench]]
+name = "storage_snapshot"
 harness = false

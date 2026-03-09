@@ -15,7 +15,10 @@ futures = { workspace = true }
 hashbrown = { workspace = true }
 node-runtime = { path = "../node-runtime" }
 replay = { path = "../replay" }
+runtime-core = { path = "../runtime-core" }
+scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }
+sim-engine = { path = "../sim-engine" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 storage = { path = "../storage" }

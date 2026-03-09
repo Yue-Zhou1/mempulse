@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+runtime-core = { path = "../runtime-core" }
 
 [dev-dependencies]
+scheduler = { path = "../scheduler" }
+storage = { path = "../storage" }
 tokio = { workspace = true }

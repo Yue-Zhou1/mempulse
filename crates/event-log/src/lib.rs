@@ -63,8 +63,13 @@ pub enum EventPayload {
     TxSeen(TxSeen),
     TxFetched(TxFetched),
     TxDecoded(TxDecoded),
+    TxReady(TxReady),
+    TxBlocked(TxBlocked),
+    CandidateQueued(CandidateQueued),
+    SimDispatched(SimDispatched),
     OppDetected(OppDetected),
     SimCompleted(SimCompleted),
+    AssemblyDecisionApplied(AssemblyDecisionApplied),
     BundleSubmitted(BundleSubmitted),
     TxReplaced(TxReplaced),
     TxDropped(TxDropped),
@@ -79,8 +84,13 @@ impl EventPayload {
             EventPayload::TxSeen(e) => e.hash,
             EventPayload::TxFetched(e) => e.hash,
             EventPayload::TxDecoded(e) => e.hash,
+            EventPayload::TxReady(e) => e.hash,
+            EventPayload::TxBlocked(e) => e.hash,
+            EventPayload::CandidateQueued(e) => e.tx_hash,
+            EventPayload::SimDispatched(e) => e.tx_hash,
             EventPayload::OppDetected(e) => e.hash,
             EventPayload::SimCompleted(e) => e.hash,
+            EventPayload::AssemblyDecisionApplied(e) => e.tx_hash,
             EventPayload::BundleSubmitted(e) => e.hash,
             EventPayload::TxReplaced(e) => e.hash,
             EventPayload::TxDropped(e) => e.hash,
@@ -132,6 +142,56 @@ pub struct TxDecoded {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxReady {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxBlocked {
+    pub hash: TxHash,
+    pub sender: Address,
+    pub nonce: u64,
+    #[serde(default)]
+    pub expected_nonce: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateQueued {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+    pub strategy: String,
+    pub score: u32,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub feature_engine_version: String,
+    #[serde(default)]
+    pub scorer_version: String,
+    #[serde(default)]
+    pub strategy_version: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub detected_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SimDispatched {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    #[serde(default)]
+    pub member_tx_hashes: Vec<TxHash>,
+    pub block_number: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OppDetected {
     pub hash: TxHash,
     pub strategy: String,
@@ -153,6 +213,24 @@ pub struct SimCompleted {
     pub feature_engine_version: String,
     pub scorer_version: String,
     pub strategy_version: String,
+    #[serde(default)]
+    pub fail_category: Option<String>,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub tx_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssemblyDecisionApplied {
+    pub candidate_id: String,
+    pub tx_hash: TxHash,
+    pub decision: String,
+    #[serde(default)]
+    pub replaced_candidate_ids: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub block_number: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -2,8 +2,13 @@
 set -euo pipefail
 
 MODE="${1:-}"
+UI_PROD="${2:-}"
 if [[ "$MODE" != "--verify" && "$MODE" != "--run" ]]; then
-  echo "usage: $0 --verify | --run"
+  echo "usage: $0 --verify | --run [--prod]"
+  exit 2
+fi
+if [[ -n "$UI_PROD" && "$UI_PROD" != "--prod" ]]; then
+  echo "usage: $0 --verify | --run [--prod]"
   exit 2
 fi
 
@@ -19,7 +24,7 @@ UI_PUBLIC_HOST="${DEMO_V2_UI_PUBLIC_HOST:-127.0.0.1}"
 UI_PORT="${DEMO_V2_UI_PORT:-5174}"
 API_HEALTH_TIMEOUT_SECONDS="${DEMO_V2_API_HEALTH_TIMEOUT_SECONDS:-180}"
 API_HEALTH_POLL_INTERVAL_SECONDS=0.5
-UI_START_TIMEOUT_SECONDS="${DEMO_V2_UI_START_TIMEOUT_SECONDS:-60}"
+UI_START_TIMEOUT_SECONDS="${DEMO_V2_UI_START_TIMEOUT_SECONDS:-$(if [[ "${2:-}" == "--prod" ]]; then echo 300; else echo 60; fi)}"
 LOG_DIR="target/demo"
 mkdir -p "$LOG_DIR"
 
@@ -97,8 +102,14 @@ verify_endpoint_shapes() {
 start_ui() {
   (
     cd apps/web-ui
-    WEB_UI_API_PROXY_TARGET="${API_LOCAL_BASE}" \
-      npm run dev -- --host "${UI_BIND_HOST}" --port "${UI_PORT}"
+    if [[ "${UI_PROD}" == "--prod" ]]; then
+      WEB_UI_API_PROXY_TARGET="${API_LOCAL_BASE}" npm run build &&
+      WEB_UI_API_PROXY_TARGET="${API_LOCAL_BASE}" \
+        npm run preview -- --host "${UI_BIND_HOST}" --port "${UI_PORT}"
+    else
+      WEB_UI_API_PROXY_TARGET="${API_LOCAL_BASE}" \
+        npm run dev -- --host "${UI_BIND_HOST}" --port "${UI_PORT}"
+    fi
   ) >"$UI_LOG" 2>&1 &
   ui_pid="$!"
 }
@@ -152,7 +163,7 @@ if ! wait_for_ui; then
 fi
 
 cat <<EOF2
-demo-v2 run: PASS
+demo-v2 run: PASS (mode: $(if [[ "${UI_PROD}" == "--prod" ]]; then echo "production"; else echo "dev"; fi))
 API: ${API_BASE}
 UI : http://${UI_PUBLIC_HOST}:${UI_PORT}/?apiBase=%2Fapi
 $(if [[ -n "${WSL_EXTERNAL_HOST}" ]]; then echo "UI (WSL): http://${WSL_EXTERNAL_HOST}:${UI_PORT}/?apiBase=%2Fapi"; fi)

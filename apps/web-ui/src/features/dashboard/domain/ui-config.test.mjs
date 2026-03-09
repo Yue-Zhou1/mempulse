@@ -19,7 +19,7 @@ test('resolveUiRuntimeConfig returns defaults when env is empty', () => {
   assert.equal(config.samplingLagThresholdMs, 30);
   assert.equal(config.samplingStride, 5);
   assert.equal(config.samplingFlushIdleMs, 500);
-  assert.equal(config.heapEmergencyPurgeMb, 400);
+  assert.equal(config.heapEmergencyPurgeMb, 250);
   assert.equal(config.devPerformanceEntryCleanupEnabled, true);
   assert.equal(config.devPerformanceEntryCleanupIntervalMs, 15000);
   assert.equal(config.streamTransport, 'sse');

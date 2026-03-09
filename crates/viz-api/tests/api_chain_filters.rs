@@ -1,14 +1,18 @@
 use axum::{body::Body, http::Request, http::StatusCode};
-use builder::RelayDryRunStatus;
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
+use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::sync::{Arc, RwLock};
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
 use tower::util::ServiceExt;
 use viz_api::auth::{ApiAuthConfig, ApiRateLimiter};
-use viz_api::live_rpc::{LiveRpcChainStatus, LiveRpcDropMetricsSnapshot};
+use viz_api::live_rpc::{
+    LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
+    LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
+};
 use viz_api::{
     AppState, DashboardSnapshotV2, FeatureDetail, InMemoryVizProvider, OpportunityDetail,
     TransactionDetail, TransactionSummary, VizDataProvider, build_router,
@@ -120,6 +124,9 @@ fn build_test_app() -> axum::Router {
         Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
     let state = AppState {
         provider,
+        dashboard_stream_broadcaster: Arc::new(
+            viz_api::stream_broadcast::DashboardStreamBroadcaster::new(256, 256),
+        ),
         downsample_limit: 100,
         relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
         alert_thresholds: AlertThresholdConfig::default(),
@@ -127,6 +134,16 @@ fn build_test_app() -> axum::Router {
         api_rate_limiter: ApiRateLimiter::new(600),
         live_rpc_chain_status_provider: Arc::new(Vec::<LiveRpcChainStatus>::new),
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
+        live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
+        live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        replay_runtime_metrics_provider: Arc::new(viz_api::ReplayRuntimeMetricsSnapshot::default),
+        live_rpc_simulation_status_provider: Arc::new(|_: &str| {
+            Option::<LiveRpcSimulationStatusSnapshot>::None
+        }),
+        scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+        scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+        builder_metrics_provider: Arc::new(AssemblyMetrics::default),
     };
     build_router(state)
 }
