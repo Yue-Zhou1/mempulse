@@ -1,93 +1,80 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
-import TextTransition from 'react-text-transition';
-import {
-  buildRollingDigitSlots,
-  resolveRollingTransitionDirection,
-  resolveRollingTransitionSpringConfig,
-} from '../lib/rolling-number-transition.js';
+import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
+import { createRollingNumberAnimator } from '../lib/rolling-number-animator.js';
 
 const INT_NUMBER_FORMATTER = new Intl.NumberFormat();
 
-function useRollingNumberTransition(value, formatValue, options = {}) {
-  const durationMs = Number.isFinite(options.durationMs) ? options.durationMs : 520;
-  const sanitizedTarget = Number.isFinite(value) ? value : 0;
-  const text = useMemo(
-    () => formatValue(sanitizedTarget),
-    [formatValue, sanitizedTarget],
-  );
-  const previousTextRef = useRef(text);
-  const previousValueRef = useRef(sanitizedTarget);
-  const previousValue = previousValueRef.current;
-  const direction = resolveRollingTransitionDirection(previousValue, sanitizedTarget);
-  const springConfig = useMemo(
-    () => resolveRollingTransitionSpringConfig(durationMs),
-    [durationMs],
-  );
-  const slots = useMemo(
-    () => buildRollingDigitSlots(previousTextRef.current, text),
-    [text],
-  );
+function useAnimatedSpan(targetValue, durationMs, format) {
+  const spanRef = useRef(null);
+  const animatorRef = useRef(null);
+  const formatRef = useRef(format);
+  formatRef.current = format;
+
+  if (!animatorRef.current) {
+    animatorRef.current = createRollingNumberAnimator();
+  }
+
+  // Initialize span content and animator state synchronously before first paint
+  useLayoutEffect(() => {
+    if (spanRef.current) {
+      spanRef.current.textContent = formatRef.current(targetValue);
+    }
+    animatorRef.current.start({
+      fromValue: targetValue,
+      toValue: targetValue,
+      durationMs: 0,
+    });
+    return () => animatorRef.current?.stop();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Animate to new target on value change
   useEffect(() => {
-    previousValueRef.current = sanitizedTarget;
-    previousTextRef.current = text;
-  }, [sanitizedTarget, text]);
+    const span = spanRef.current;
+    if (!span) return;
+    animatorRef.current.retarget({
+      toValue: targetValue,
+      durationMs,
+      onUpdate: (v) => { span.textContent = formatRef.current(v); },
+      onComplete: (v) => { span.textContent = formatRef.current(v); },
+    });
+  }, [targetValue, durationMs]);
 
-  return {
-    text,
-    slots,
-    direction,
-    springConfig,
-  };
-}
-
-function RollingDigitSlots({ slots, direction, springConfig }) {
-  return (
-    <span className="inline-flex items-baseline tabular-nums" aria-hidden="true">
-      {slots.map((slot) => (
-        slot.isDigit
-          ? (
-              <span key={slot.key} className="inline-flex w-[1ch] justify-center overflow-hidden">
-                <TextTransition inline direction={direction} springConfig={springConfig}>
-                  {slot.char}
-                </TextTransition>
-              </span>
-            )
-          : (
-              <span key={slot.key} className="inline-flex min-w-[0.35ch] justify-center">
-                {slot.char}
-              </span>
-            )
-      ))}
-    </span>
-  );
+  return spanRef;
 }
 
 export function RollingInt({ value, durationMs = 520, className }) {
-  const formatValue = useCallback(
-    (nextValue) => INT_NUMBER_FORMATTER.format(Math.round(Number(nextValue) || 0)),
-    [],
-  );
-  const { text, slots, direction, springConfig } = useRollingNumberTransition(value, formatValue, {
-    durationMs,
-  });
+  const sanitized = Number.isFinite(value) ? value : 0;
+  const format = useCallback((v) => INT_NUMBER_FORMATTER.format(Math.round(v)), []);
+  const spanRef = useAnimatedSpan(sanitized, durationMs, format);
+  // High-water-mark: reserve width for the widest value seen so far.
+  // Updated during render (safe — Math.max is idempotent, ref mutation doesn't trigger re-render).
+  const maxCharsRef = useRef(0);
+  const targetText = format(sanitized);
+  maxCharsRef.current = Math.max(maxCharsRef.current, targetText.length);
   return (
-    <span className={className} aria-label={text}>
-      <RollingDigitSlots slots={slots} direction={direction} springConfig={springConfig} />
+    <span
+      className={className}
+      aria-label={targetText}
+      style={{ minWidth: `${maxCharsRef.current}ch`, fontFamily: 'var(--news-mono-font)' }}
+    >
+      <span ref={spanRef} aria-hidden="true" className="tabular-nums" />
     </span>
   );
 }
 
 export function RollingPercent({ value, durationMs = 520, className, suffix = '%' }) {
-  const formatValue = useCallback(
-    (nextValue) => `${(Number(nextValue) || 0).toFixed(1)}${suffix}`,
-    [suffix],
-  );
-  const { text, slots, direction, springConfig } = useRollingNumberTransition(value, formatValue, {
-    durationMs,
-  });
+  const sanitized = Number.isFinite(value) ? value : 0;
+  const format = useCallback((v) => `${(v || 0).toFixed(1)}${suffix}`, [suffix]);
+  const spanRef = useAnimatedSpan(sanitized, durationMs, format);
+  const maxCharsRef = useRef(0);
+  const targetText = format(sanitized);
+  maxCharsRef.current = Math.max(maxCharsRef.current, targetText.length);
   return (
-    <span className={className} aria-label={text}>
-      <RollingDigitSlots slots={slots} direction={direction} springConfig={springConfig} />
+    <span
+      className={className}
+      aria-label={targetText}
+      style={{ minWidth: `${maxCharsRef.current}ch`, fontFamily: 'var(--news-mono-font)' }}
+    >
+      <span ref={spanRef} aria-hidden="true" className="tabular-nums" />
     </span>
   );
 }

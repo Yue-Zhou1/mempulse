@@ -742,9 +742,6 @@ export function useDashboardLifecycleEffects({
       };
 
       recordMemoryDiagnostics(heapBytes, nowUnixMs);
-      if (!import.meta.env.DEV) {
-        return;
-      }
       if (totalMemorySampleInFlight || nowUnixMs < nextTotalMemorySampleAtUnixMs) {
         return;
       }
@@ -757,8 +754,15 @@ export function useDashboardLifecycleEffects({
           }
           if (Number.isFinite(measuredBytes)) {
             totalMemoryBytesEstimate = measuredBytes;
+            const pageEmergencyBytes = heapEmergencyPurgeMb * 1.5 * 1024 * 1024;
+            if (measuredBytes > pageEmergencyBytes) {
+              emergencyPurge(measuredBytes);
+              scheduleSnapshot('page-memory-emergency-purge', true);
+            }
           }
-          recordMemoryDiagnostics(resolveUsedHeapSize(), Date.now());
+          if (import.meta.env.DEV) {
+            recordMemoryDiagnostics(resolveUsedHeapSize(), Date.now());
+          }
         })
         .finally(() => {
           totalMemorySampleInFlight = false;
