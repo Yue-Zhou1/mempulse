@@ -341,7 +341,11 @@ impl InMemoryStorage {
 
     pub fn upsert_builder_lifecycle(&mut self, record: BuilderLifecycleRecord) {
         let start = Instant::now();
-        push_bounded(&mut self.builder_lifecycle, record, self.config.table_capacity);
+        push_bounded(
+            &mut self.builder_lifecycle,
+            record,
+            self.config.table_capacity,
+        );
         self.record_write_latency(start.elapsed().as_nanos() as u64);
         self.bump_read_model_revision();
     }

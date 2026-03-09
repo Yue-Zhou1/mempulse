@@ -28,7 +28,10 @@ fn storage_snapshot_perf_emits_metrics_artifact() {
     let persisted: serde_json::Value =
         serde_json::from_str(&artifact_contents).expect("decode storage snapshot artifact");
 
-    assert_eq!(persisted["pending_count"].as_u64(), Some(pending_count as u64));
+    assert_eq!(
+        persisted["pending_count"].as_u64(),
+        Some(pending_count as u64)
+    );
     assert_eq!(
         persisted["tail_event_count"].as_u64(),
         Some(tail_event_count as u64)

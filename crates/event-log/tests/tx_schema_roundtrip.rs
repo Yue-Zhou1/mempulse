@@ -1,7 +1,6 @@
 use common::{Address, SourceId, TxHash};
 use event_log::{
-    AssemblyDecisionApplied, CandidateQueued, EventEnvelope, EventPayload, SimDispatched,
-    TxDecoded,
+    AssemblyDecisionApplied, CandidateQueued, EventEnvelope, EventPayload, SimDispatched, TxDecoded,
 };
 
 fn hash(value: u8) -> TxHash {

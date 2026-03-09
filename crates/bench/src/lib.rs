@@ -175,7 +175,8 @@ pub fn measure_scheduler_pipeline_latency(
 
     for _ in 0..iterations {
         let start = Instant::now();
-        last_outcome = runtime.block_on(async { scheduler_pipeline_iteration(&transactions).await });
+        last_outcome =
+            runtime.block_on(async { scheduler_pipeline_iteration(&transactions).await });
         samples.push(start.elapsed().as_micros() as u64);
     }
 

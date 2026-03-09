@@ -580,7 +580,10 @@ impl CandidateLifecycleState {
         match &event.payload {
             EventPayload::CandidateQueued(queued) => {
                 self.index_candidate(&queued.candidate_id, queued.tx_hash);
-                let entry = self.candidates.entry(queued.candidate_id.clone()).or_default();
+                let entry = self
+                    .candidates
+                    .entry(queued.candidate_id.clone())
+                    .or_default();
                 entry.tx_hash = queued.tx_hash;
                 entry.member_tx_hashes = queued.member_tx_hashes.clone();
                 entry.chain_id = queued.chain_id;
@@ -620,7 +623,10 @@ impl CandidateLifecycleState {
             }
             EventPayload::AssemblyDecisionApplied(applied) => {
                 self.index_candidate(&applied.candidate_id, applied.tx_hash);
-                let entry = self.candidates.entry(applied.candidate_id.clone()).or_default();
+                let entry = self
+                    .candidates
+                    .entry(applied.candidate_id.clone())
+                    .or_default();
                 entry.tx_hash = applied.tx_hash;
                 entry.assembly_status = Some(applied.decision.clone());
                 entry.assembly_block_number = Some(applied.block_number);

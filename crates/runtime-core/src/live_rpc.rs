@@ -20,8 +20,8 @@ use futures::{SinkExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
 use scheduler::{
     SchedulerAdmission, SchedulerCandidate, SchedulerEnqueueError, SchedulerHandle,
-    SchedulerQueueState, SchedulerQueueTransition, SchedulerSimulationResult,
-    SimulationTaskSpec, ValidatedTransaction,
+    SchedulerQueueState, SchedulerQueueTransition, SchedulerSimulationResult, SimulationTaskSpec,
+    ValidatedTransaction,
 };
 use searcher::{OpportunityCandidate, SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, de::IgnoredAny};
@@ -2075,14 +2075,15 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
         let prepared_simulation_tasks = executable_opportunities
             .iter()
             .filter_map(|opportunity| {
-                build_remote_simulation_request(opportunity, &simulation_context_transactions)
-                    .map(|request| {
+                build_remote_simulation_request(opportunity, &simulation_context_transactions).map(
+                    |request| {
                         (
                             scheduler_candidate_from_executable_opportunity(opportunity),
                             request,
                             opportunity.clone(),
                         )
-                    })
+                    },
+                )
             })
             .collect::<Vec<_>>();
         if !prepared_simulation_tasks.is_empty() {
@@ -2095,8 +2096,10 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
                 )
                 .await
                 .map_err(|error| anyhow!("scheduler candidate registration failed: {error:?}"))?;
-            let mut grouped_tasks =
-                BTreeMap::<String, (RemoteSimulationRequest, Vec<RegisteredSimulationCandidate>)>::new();
+            let mut grouped_tasks = BTreeMap::<
+                String,
+                (RemoteSimulationRequest, Vec<RegisteredSimulationCandidate>),
+            >::new();
             for (task_spec, (candidate, request, opportunity)) in dispatch
                 .simulation_tasks
                 .into_iter()

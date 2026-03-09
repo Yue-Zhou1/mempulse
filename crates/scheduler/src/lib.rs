@@ -550,7 +550,10 @@ impl SharedState {
         state.admit(tx, self.config)
     }
 
-    fn register_candidates(&self, candidates: Vec<SchedulerCandidate>) -> SchedulerCandidateDispatch {
+    fn register_candidates(
+        &self,
+        candidates: Vec<SchedulerCandidate>,
+    ) -> SchedulerCandidateDispatch {
         let mut state = self
             .state
             .write()
