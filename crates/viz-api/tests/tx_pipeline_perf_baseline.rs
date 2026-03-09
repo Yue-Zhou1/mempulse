@@ -1,6 +1,6 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use builder::RelayDryRunStatus;
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::{AlertThresholdConfig, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
@@ -142,6 +142,8 @@ fn build_seeded_state(seeded_transactions: usize) -> (AppState, SeedSummary) {
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+        builder_metrics_provider: Arc::new(AssemblyMetrics::default),
     };
 
     (state, seed_summary)

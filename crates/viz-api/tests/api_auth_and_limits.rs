@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::Request;
-use builder::RelayDryRunStatus;
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::{AlertThresholdConfig, MetricSnapshot};
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::collections::HashSet;
@@ -114,6 +114,8 @@ fn auth_state() -> AppState {
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+        builder_metrics_provider: Arc::new(AssemblyMetrics::default),
     }
 }
 

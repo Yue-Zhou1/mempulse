@@ -13,15 +13,15 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum::{middleware, response::Response};
-use builder::{RelayDryRunResult, RelayDryRunStatus};
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunResult, RelayDryRunStatus};
 use common::{AlertDecisions, AlertThresholdConfig, MetricSnapshot, evaluate_alerts};
 use event_log::{EventEnvelope, EventPayload};
 use futures::stream;
 use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
-    live_rpc_chain_status_snapshot, live_rpc_drop_metrics_snapshot,
-    live_rpc_searcher_metrics_snapshot, live_rpc_simulation_metrics_snapshot,
-    live_rpc_simulation_status_snapshot,
+    live_rpc_builder_metrics_snapshot, live_rpc_builder_snapshot, live_rpc_chain_status_snapshot,
+    live_rpc_drop_metrics_snapshot, live_rpc_searcher_metrics_snapshot,
+    live_rpc_simulation_metrics_snapshot, live_rpc_simulation_status_snapshot,
 };
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
@@ -54,7 +54,10 @@ const DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: u64 = 300_000;
 static SCHEDULER_SNAPSHOT_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 #[cfg(test)]
-use builder::RelayAttemptTrace;
+use builder::{
+    AssemblyCandidate, AssemblyCandidateKind, AssemblyConfig, AssemblyEngine, RelayAttemptTrace,
+    SimulationApproval,
+};
 #[cfg(test)]
 use common::SourceId;
 #[cfg(test)]
@@ -91,6 +94,8 @@ pub struct AppState {
         Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
     pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
     pub scheduler_metrics_provider: Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>,
+    pub builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
+    pub builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
 }
 
 pub struct RuntimeBootstrap {
@@ -1036,6 +1041,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/transactions/{hash}", get(transaction_by_hash))
         .route("/scheduler/snapshot", get(scheduler_snapshot))
         .route("/scheduler/metrics", get(scheduler_metrics))
+        .route("/builder/snapshot", get(builder_snapshot))
+        .route("/builder/metrics", get(builder_metrics))
         .route("/relay/dry-run/status", get(relay_dry_run_status))
         .route("/dashboard/events-v1", get(events_v1))
         .route_layer(middleware::from_fn_with_state(
@@ -1168,6 +1175,10 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
         as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
     let scheduler_metrics_provider = Arc::new(move || scheduler_for_metrics.metrics())
         as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+    let builder_snapshot_provider =
+        Arc::new(live_rpc_builder_snapshot) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+    let builder_metrics_provider = Arc::new(live_rpc_builder_metrics_snapshot)
+        as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
 
     let state = AppState {
         provider: Arc::new(InMemoryVizProvider::new(
@@ -1185,6 +1196,8 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
         live_rpc_searcher_metrics_provider,
         scheduler_snapshot_provider,
         scheduler_metrics_provider,
+        builder_snapshot_provider,
+        builder_metrics_provider,
     };
 
     (
@@ -1491,6 +1504,14 @@ async fn scheduler_snapshot(State(state): State<AppState>) -> Json<SchedulerSnap
 
 async fn scheduler_metrics(State(state): State<AppState>) -> Json<SchedulerMetrics> {
     Json((state.scheduler_metrics_provider)())
+}
+
+async fn builder_snapshot(State(state): State<AppState>) -> Json<AssemblySnapshot> {
+    Json((state.builder_snapshot_provider)())
+}
+
+async fn builder_metrics(State(state): State<AppState>) -> Json<AssemblyMetrics> {
+    Json((state.builder_metrics_provider)())
 }
 
 async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
@@ -2041,6 +2062,70 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "mempulse_scheduler_handoff_queue_capacity {}\n",
         scheduler_metrics.handoff_queue_capacity
+    ));
+    let builder_metrics = (state.builder_metrics_provider)();
+    out.push_str("# TYPE mempulse_builder_inserted_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_inserted_total {}\n",
+        builder_metrics.inserted_total
+    ));
+    out.push_str("# TYPE mempulse_builder_replaced_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_replaced_total {}\n",
+        builder_metrics.replaced_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rejected_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rejected_total {}\n",
+        builder_metrics.rejected_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rejected_reason_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {}\n",
+        builder_metrics.rejected_simulation_not_approved_total
+    ));
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {}\n",
+        builder_metrics.rejected_objective_not_improved_total
+    ));
+    out.push_str(&format!(
+        "mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {}\n",
+        builder_metrics.rejected_gas_limit_total
+    ));
+    out.push_str("# TYPE mempulse_builder_rollback_total counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_rollback_total {}\n",
+        builder_metrics.rollback_total
+    ));
+    out.push_str("# TYPE mempulse_builder_active_candidate_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_active_candidate_total {}\n",
+        builder_metrics.active_candidate_total
+    ));
+    out.push_str("# TYPE mempulse_builder_total_priority_score gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_priority_score {}\n",
+        builder_metrics.total_priority_score
+    ));
+    out.push_str("# TYPE mempulse_builder_total_gas_used gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_gas_used {}\n",
+        builder_metrics.total_gas_used
+    ));
+    out.push_str("# TYPE mempulse_builder_last_decision_latency_ns gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_last_decision_latency_ns {}\n",
+        builder_metrics.last_decision_latency_ns
+    ));
+    out.push_str("# TYPE mempulse_builder_max_decision_latency_ns gauge\n");
+    out.push_str(&format!(
+        "mempulse_builder_max_decision_latency_ns {}\n",
+        builder_metrics.max_decision_latency_ns
+    ));
+    out.push_str("# TYPE mempulse_builder_total_decision_latency_ns counter\n");
+    out.push_str(&format!(
+        "mempulse_builder_total_decision_latency_ns {}\n",
+        builder_metrics.total_decision_latency_ns
     ));
     let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
     out.push_str("# TYPE mempulse_searcher_executable_batches_total counter\n");
@@ -3298,6 +3383,10 @@ mod tests {
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
             Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -3310,6 +3399,8 @@ mod tests {
             live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
         }
     }
 
@@ -3325,6 +3416,10 @@ mod tests {
             as Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
         let scheduler_metrics_provider =
             Arc::new(SchedulerMetrics::default) as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -3337,6 +3432,8 @@ mod tests {
             live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
         }
     }
 
@@ -3376,6 +3473,10 @@ mod tests {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
         let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
             as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
         AppState {
             provider: Arc::new(MockProvider),
             downsample_limit: limit,
@@ -3388,6 +3489,37 @@ mod tests {
             live_rpc_searcher_metrics_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        }
+    }
+
+    fn test_state_with_builder(
+        limit: usize,
+        builder_snapshot_provider: Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>,
+        builder_metrics_provider: Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>,
+    ) -> AppState {
+        let api_auth = ApiAuthConfig::default();
+        let live_rpc_chain_status_provider = Arc::new(Vec::<LiveRpcChainStatus>::new)
+            as Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+        let live_rpc_drop_metrics_provider = Arc::new(LiveRpcDropMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+        let live_rpc_searcher_metrics_provider = Arc::new(LiveRpcSearcherMetricsSnapshot::default)
+            as Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+        AppState {
+            provider: Arc::new(MockProvider),
+            downsample_limit: limit,
+            relay_dry_run_status: Arc::new(RwLock::new(RelayDryRunStatus::default())),
+            alert_thresholds: AlertThresholdConfig::default(),
+            api_rate_limiter: ApiRateLimiter::new(api_auth.requests_per_minute),
+            api_auth,
+            live_rpc_chain_status_provider,
+            live_rpc_drop_metrics_provider,
+            live_rpc_searcher_metrics_provider,
+            scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
+            scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+            builder_snapshot_provider,
+            builder_metrics_provider,
         }
     }
 
@@ -3410,6 +3542,25 @@ mod tests {
         let mut status = RelayDryRunStatus::default();
         status.record(result);
         status
+    }
+
+    fn seeded_builder_engine() -> AssemblyEngine {
+        let mut engine = AssemblyEngine::new(AssemblyConfig {
+            block_gas_limit: 30_000_000,
+        });
+        let _ = engine.insert(AssemblyCandidate {
+            candidate_id: "cand-a".to_owned(),
+            tx_hashes: vec![[0x71; 32]],
+            priority_score: 320,
+            gas_used: 42_000,
+            kind: AssemblyCandidateKind::Transaction,
+            simulation: SimulationApproval {
+                sim_id: "sim-a".to_owned(),
+                block_number: 22_222_222,
+                approved: true,
+            },
+        });
+        engine
     }
 
     #[tokio::test]
@@ -3472,6 +3623,10 @@ mod tests {
         assert!(payload.contains("mempulse_sim_drop_total{reason=\"stale\"}"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
         assert!(payload.contains("mempulse_relay_success_rate"));
+        assert!(payload.contains(
+            "mempulse_builder_rejected_reason_total{reason=\"simulation_not_approved\"}"
+        ));
+        assert!(payload.contains("mempulse_builder_last_decision_latency_ns"));
         assert!(payload.contains("mempulse_searcher_comparison_batches_total"));
         assert!(payload.contains("mempulse_searcher_executable_bundle_candidates_total"));
     }
@@ -3520,6 +3675,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_prometheus_route_includes_builder_series() {
+        let builder_snapshot_provider =
+            Arc::new(AssemblySnapshot::default) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider = Arc::new(|| AssemblyMetrics {
+            inserted_total: 5,
+            replaced_total: 2,
+            rejected_total: 3,
+            rejected_simulation_not_approved_total: 1,
+            rejected_objective_not_improved_total: 1,
+            rejected_gas_limit_total: 1,
+            rollback_total: 4,
+            active_candidate_total: 2,
+            total_priority_score: 500,
+            total_gas_used: 63_000,
+            last_decision_latency_ns: 7,
+            max_decision_latency_ns: 11,
+            total_decision_latency_ns: 29,
+        }) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = String::from_utf8(body.to_vec()).unwrap();
+        assert!(payload.contains("mempulse_builder_inserted_total 5"));
+        assert!(payload.contains(
+            "mempulse_builder_rejected_reason_total{reason=\"objective_not_improved\"} 1"
+        ));
+        assert!(payload.contains("mempulse_builder_rollback_total 4"));
+        assert!(payload.contains("mempulse_builder_last_decision_latency_ns 7"));
+        assert!(payload.contains("mempulse_builder_total_decision_latency_ns 29"));
+    }
+
+    #[tokio::test]
     async fn metrics_prometheus_route_includes_searcher_series() {
         let api_auth = ApiAuthConfig::default();
         let state = AppState {
@@ -3551,6 +3753,8 @@ mod tests {
             }),
             scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
             scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+            builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+            builder_metrics_provider: Arc::new(AssemblyMetrics::default),
         };
         let app = build_router(state);
 
@@ -4169,6 +4373,75 @@ mod tests {
         assert_eq!(payload.ready_total, 1);
 
         runtime_task.abort();
+    }
+
+    #[tokio::test]
+    async fn builder_snapshot_route_returns_builder_state() {
+        let engine = seeded_builder_engine();
+        let builder_snapshot_provider =
+            Arc::new(move || engine.snapshot()) as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(AssemblyMetrics::default) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblySnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.candidates.len(), 1);
+        assert_eq!(payload.objective.total_priority_score, 320);
+        assert_eq!(payload.objective.total_gas_used, 42_000);
+    }
+
+    #[tokio::test]
+    async fn builder_metrics_route_returns_builder_metrics() {
+        let engine = seeded_builder_engine();
+        let engine_for_snapshot = engine.clone();
+        let builder_snapshot_provider = Arc::new(move || engine_for_snapshot.snapshot())
+            as Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+        let builder_metrics_provider =
+            Arc::new(move || engine.metrics()) as Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
+
+        let app = build_router(test_state_with_builder(
+            100,
+            builder_snapshot_provider,
+            builder_metrics_provider,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/builder/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload: AssemblyMetrics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.inserted_total, 1);
+        assert_eq!(payload.active_candidate_total, 1);
+        assert_eq!(payload.total_priority_score, 320);
+        assert_eq!(payload.total_gas_used, 42_000);
+        assert_eq!(payload.rollback_total, 0);
+        assert_eq!(payload.rejected_total, 0);
+        assert!(payload.last_decision_latency_ns > 0);
     }
 
     #[tokio::test]

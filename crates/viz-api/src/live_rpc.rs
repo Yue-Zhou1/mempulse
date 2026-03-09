@@ -1,5 +1,9 @@
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
+use builder::{
+    AssemblyCandidate, AssemblyConfig, AssemblyDecision, AssemblyEngine, AssemblyMetrics,
+    AssemblySnapshot,
+};
 use common::{Address, SourceId, TxHash};
 use event_log::{
     BundleSubmitted, EventPayload, OppDetected, SimCompleted, TxBlocked, TxDecoded, TxDropped,
@@ -14,7 +18,7 @@ use scheduler::{
     SchedulerAdmission, SchedulerEnqueueError, SchedulerHandle, SchedulerQueueState,
     SchedulerQueueTransition, ValidatedTransaction,
 };
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
+use searcher::{OpportunityCandidate, SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json::json;
 use sim_engine::{
@@ -212,7 +216,7 @@ struct LiveRpcSimulationMetrics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutableOpportunity {
     record: OpportunityRecord,
-    member_tx_hashes: Vec<TxHash>,
+    candidate: OpportunityCandidate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +234,7 @@ struct RemoteSimulationOutcome {
     fail_category: Option<String>,
     latency_ms: u64,
     tx_count: u32,
+    simulation_batch: Option<sim_engine::SimulationBatchResult>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,7 +258,7 @@ struct SimulationTask {
     generation: u64,
     chain: ChainRpcConfig,
     request: RemoteSimulationRequest,
-    opportunities: Vec<OpportunityRecord>,
+    opportunities: Vec<ExecutableOpportunity>,
     writer: StorageWriteHandle,
     next_seq_id: Arc<AtomicU64>,
     enqueued_unix_ms: i64,
@@ -740,6 +745,7 @@ static LIVE_RPC_SIMULATION_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::ne
 static LIVE_RPC_SIMULATION_SERVICE: OnceLock<LiveRpcSimulationService> = OnceLock::new();
 static LIVE_RPC_SIMULATION_STATUS: OnceLock<Arc<RwLock<LiveRpcSimulationStatusStore>>> =
     OnceLock::new();
+static LIVE_RPC_BUILDER_ENGINE: OnceLock<Arc<RwLock<AssemblyEngine>>> = OnceLock::new();
 static LIVE_RPC_FEED_START_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_RPC_MONO_EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -766,6 +772,11 @@ fn simulation_http_client() -> &'static reqwest::Client {
 fn live_rpc_simulation_status_store() -> &'static Arc<RwLock<LiveRpcSimulationStatusStore>> {
     LIVE_RPC_SIMULATION_STATUS
         .get_or_init(|| Arc::new(RwLock::new(LiveRpcSimulationStatusStore::default())))
+}
+
+fn live_rpc_builder_engine() -> &'static Arc<RwLock<AssemblyEngine>> {
+    LIVE_RPC_BUILDER_ENGINE
+        .get_or_init(|| Arc::new(RwLock::new(AssemblyEngine::new(AssemblyConfig::default()))))
 }
 
 fn spawn_live_rpc_simulation_runtime(
@@ -965,6 +976,7 @@ fn apply_simulation_task_outcome(
     started_unix_ms: i64,
     finished_unix_ms: i64,
 ) -> Result<()> {
+    apply_builder_assembly_state(task, outcome);
     record_live_rpc_simulation_status(build_live_rpc_simulation_status_snapshot(
         task,
         outcome,
@@ -973,7 +985,7 @@ fn apply_simulation_task_outcome(
     ));
 
     for opportunity in &task.opportunities {
-        let sim_event = build_sim_completed_payload(opportunity, outcome);
+        let sim_event = build_sim_completed_payload(&opportunity.record, outcome);
         if !append_event(
             &task.writer,
             &task.chain,
@@ -990,14 +1002,14 @@ fn apply_simulation_task_outcome(
                 &task.chain,
                 &task.next_seq_id,
                 finished_unix_ms,
-                build_bundle_submitted_payload(opportunity, &sim_event),
+                build_bundle_submitted_payload(&opportunity.record, &sim_event),
             )? {
                 return Ok(());
             }
             if !try_enqueue_storage_write(
                 &task.writer,
                 &task.chain,
-                StorageWriteOp::UpsertOpportunity(opportunity.clone()),
+                StorageWriteOp::UpsertOpportunity(opportunity.record.clone()),
             )? {
                 return Ok(());
             }
@@ -1016,7 +1028,7 @@ fn build_live_rpc_simulation_status_snapshot(
     let bundle_id = task
         .opportunities
         .first()
-        .map(bundle_id_for_opportunity)
+        .map(|opportunity| bundle_id_for_opportunity(&opportunity.record))
         .unwrap_or_else(|| build_bundle_id(task.request.tx_hash, task.request.detected_unix_ms));
     LiveRpcSimulationStatusSnapshot {
         id: outcome.sim_id.clone(),
@@ -1028,6 +1040,56 @@ fn build_live_rpc_simulation_status_snapshot(
         fail_category: outcome.fail_category.clone(),
         started_unix_ms: task.enqueued_unix_ms,
         finished_unix_ms,
+    }
+}
+
+fn apply_builder_assembly_state(task: &SimulationTask, outcome: &RemoteSimulationOutcome) {
+    let Some(batch) = outcome.simulation_batch.as_ref() else {
+        return;
+    };
+
+    let mut engine = live_rpc_builder_engine()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    for opportunity in &task.opportunities {
+        match AssemblyCandidate::from_simulated_opportunity(&opportunity.candidate, batch) {
+            Ok(candidate) => {
+                let simulation_block_number = candidate.simulation.block_number;
+                match engine.insert(candidate) {
+                    AssemblyDecision::Inserted {
+                        candidate_id,
+                        replaced_candidate_ids,
+                    } => {
+                        tracing::debug!(
+                            candidate_id,
+                            tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                            simulation_block_number,
+                            replaced_candidate_ids = ?replaced_candidate_ids,
+                            "builder candidate inserted into live assembly state"
+                        );
+                    }
+                    AssemblyDecision::Rejected {
+                        candidate_id,
+                        reason,
+                    } => {
+                        tracing::debug!(
+                            candidate_id,
+                            tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                            simulation_block_number,
+                            reason,
+                            "builder candidate rejected from live assembly state"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    tx_hash = %format_fixed_hex(&opportunity.record.tx_hash),
+                    "failed to materialize builder candidate from simulation result"
+                );
+            }
+        }
     }
 }
 
@@ -1070,6 +1132,20 @@ pub fn live_rpc_simulation_status_snapshot(id: &str) -> Option<LiveRpcSimulation
     store.by_id.get(id).cloned()
 }
 
+pub fn live_rpc_builder_snapshot() -> AssemblySnapshot {
+    live_rpc_builder_engine()
+        .read()
+        .map(|guard| guard.snapshot())
+        .unwrap_or_default()
+}
+
+pub fn live_rpc_builder_metrics_snapshot() -> AssemblyMetrics {
+    live_rpc_builder_engine()
+        .read()
+        .map(|guard| guard.metrics())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 fn reset_live_rpc_searcher_metrics() {
     live_rpc_searcher_metrics().reset();
@@ -1099,6 +1175,16 @@ pub(crate) fn reset_live_rpc_simulation_runtime_state() {
     if let Ok(mut store) = live_rpc_simulation_status_store().write() {
         store.latest = None;
         store.by_id.clear();
+    }
+    if let Ok(mut engine) = live_rpc_builder_engine().write() {
+        *engine = AssemblyEngine::new(AssemblyConfig::default());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_live_rpc_builder_runtime_state() {
+    if let Ok(mut engine) = live_rpc_builder_engine().write() {
+        *engine = AssemblyEngine::new(AssemblyConfig::default());
     }
 }
 
@@ -2981,21 +3067,21 @@ fn build_executable_opportunities(
     )
     .candidates
     .into_iter()
-    .map(|candidate| ExecutableOpportunity {
-        record: OpportunityRecord {
+    .map(|candidate| {
+        let record = OpportunityRecord {
             tx_hash: candidate.tx_hash,
             strategy: format!("{:?}", candidate.strategy),
             score: candidate.score,
-            protocol: candidate.protocol,
-            category: candidate.category,
-            feature_engine_version: candidate.feature_engine_version,
-            scorer_version: candidate.scorer_version,
-            strategy_version: candidate.strategy_version,
-            reasons: candidate.reasons,
+            protocol: candidate.protocol.clone(),
+            category: candidate.category.clone(),
+            feature_engine_version: candidate.feature_engine_version.clone(),
+            scorer_version: candidate.scorer_version.clone(),
+            strategy_version: candidate.strategy_version.clone(),
+            reasons: candidate.reasons.clone(),
             detected_unix_ms,
             chain_id,
-        },
-        member_tx_hashes: candidate.member_tx_hashes,
+        };
+        ExecutableOpportunity { record, candidate }
     })
     .collect()
 }
@@ -3066,8 +3152,9 @@ fn build_opportunity_detected_payload(opportunity: &OpportunityRecord) -> EventP
 fn build_simulation_batches(
     opportunities: &[ExecutableOpportunity],
     executable: &[ValidatedTransaction],
-) -> Vec<(String, RemoteSimulationRequest, Vec<OpportunityRecord>)> {
-    let mut batches = BTreeMap::<String, (RemoteSimulationRequest, Vec<OpportunityRecord>)>::new();
+) -> Vec<(String, RemoteSimulationRequest, Vec<ExecutableOpportunity>)> {
+    let mut batches =
+        BTreeMap::<String, (RemoteSimulationRequest, Vec<ExecutableOpportunity>)>::new();
 
     for opportunity in opportunities {
         let Some(request) = build_remote_simulation_request(opportunity, executable) else {
@@ -3076,8 +3163,8 @@ fn build_simulation_batches(
         let task_key = simulation_task_key(&request);
         batches
             .entry(task_key)
-            .and_modify(|(_, grouped)| grouped.push(opportunity.record.clone()))
-            .or_insert_with(|| (request, vec![opportunity.record.clone()]));
+            .and_modify(|(_, grouped)| grouped.push(opportunity.clone()))
+            .or_insert_with(|| (request, vec![opportunity.clone()]));
     }
 
     batches
@@ -3092,10 +3179,10 @@ fn build_remote_simulation_request(
     opportunity: &ExecutableOpportunity,
     executable: &[ValidatedTransaction],
 ) -> Option<RemoteSimulationRequest> {
-    let requested_hashes = if opportunity.member_tx_hashes.is_empty() {
+    let requested_hashes = if opportunity.candidate.member_tx_hashes.is_empty() {
         vec![opportunity.record.tx_hash]
     } else {
-        opportunity.member_tx_hashes.clone()
+        opportunity.candidate.member_tx_hashes.clone()
     };
     let mut selected_hashes = requested_hashes
         .iter()
@@ -3179,15 +3266,20 @@ async fn simulate_remote_request(
     .await;
     let latency_ms = started.elapsed().as_millis() as u64;
 
-    let (status, fail_category) = match simulated {
-        Ok(Ok(batch)) => summarize_simulation_batch(&batch),
+    let (status, fail_category, simulation_batch) = match simulated {
+        Ok(Ok(batch)) => {
+            let (status, fail_category) = summarize_simulation_batch(&batch);
+            (status, fail_category, Some(batch))
+        }
         Ok(Err(_)) => (
             RemoteSimulationStatus::StateError,
             Some("state_rpc".to_owned()),
+            None,
         ),
         Err(_) => (
             RemoteSimulationStatus::Timeout,
             Some("state_timeout".to_owned()),
+            None,
         ),
     };
     live_rpc_simulation_metrics().observe_result(
@@ -3203,6 +3295,7 @@ async fn simulate_remote_request(
         fail_category,
         latency_ms,
         tx_count: tx_count as u32,
+        simulation_batch,
     })
 }
 
@@ -4228,7 +4321,24 @@ mod tests {
                 reasons: vec!["test".to_owned()],
                 detected_unix_ms,
             },
-            member_tx_hashes: Vec::new(),
+            candidate: OpportunityCandidate {
+                tx_hash: tx.hash(),
+                member_tx_hashes: vec![tx.hash()],
+                strategy: searcher::StrategyKind::SandwichCandidate,
+                feature_engine_version: "feature-engine.test".to_owned(),
+                scorer_version: "scorer.test".to_owned(),
+                strategy_version: "strategy.test".to_owned(),
+                score: 10_000,
+                protocol: "uniswap-v2".to_owned(),
+                category: "swap".to_owned(),
+                breakdown: searcher::OpportunityScoreBreakdown {
+                    mev_component: 10_000,
+                    urgency_component: 0,
+                    structural_component: 0,
+                    strategy_bonus: 0,
+                },
+                reasons: vec!["test".to_owned()],
+            },
         }
     }
 
@@ -4506,6 +4616,7 @@ mod tests {
         reset_live_rpc_simulation_metrics();
         reset_live_rpc_simulation_cache();
         reset_live_rpc_simulation_runtime_state();
+        reset_live_rpc_builder_runtime_state();
 
         let (rpc_state, rpc_addr, server) =
             start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
@@ -4566,6 +4677,8 @@ mod tests {
         assert_eq!(metrics.ok_total, 1);
         assert_eq!(rpc_state.balance_requests.load(Ordering::SeqCst), 1);
         assert_eq!(rpc_state.nonce_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(live_rpc_builder_snapshot().candidates.len(), 1);
+        assert_eq!(live_rpc_builder_metrics_snapshot().inserted_total, 1);
 
         runtime_task.abort();
         server.abort();

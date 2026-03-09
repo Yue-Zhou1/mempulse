@@ -1,5 +1,5 @@
 use axum::{body::Body, http::Request};
-use builder::RelayDryRunStatus;
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::sync::{Arc, RwLock};
@@ -78,6 +78,8 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+        builder_metrics_provider: Arc::new(AssemblyMetrics::default),
     };
     let app = build_router(state);
 

@@ -1,5 +1,5 @@
 use axum::{body::Body, http::Request, http::StatusCode};
-use builder::RelayDryRunStatus;
+use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
@@ -133,6 +133,8 @@ fn build_test_app() -> axum::Router {
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
         scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
+        builder_snapshot_provider: Arc::new(AssemblySnapshot::default),
+        builder_metrics_provider: Arc::new(AssemblyMetrics::default),
     };
     build_router(state)
 }
