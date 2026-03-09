@@ -26,6 +26,9 @@ const ENV_SEED_TX_COUNT: &str = "VIZ_API_TX_PERF_TX_COUNT";
 const DEFAULT_ARTIFACT_PATH: &str = "artifacts/perf/tx_pipeline_perf_baseline.json";
 const DEFAULT_SEED_TX_COUNT: usize = 2_000;
 const STREAM_BATCH_LIMIT: usize = 512;
+const STREAM_SAMPLE_COUNT: usize = 3;
+const STREAM_EVENTS_PER_SEC_FLOOR: f64 = 2_000_000.0;
+const PREVIOUS_STREAM_EVENTS_PER_SEC_FLOOR_RATIO: f64 = 0.75;
 
 #[derive(Clone, Copy, Debug)]
 struct SeedSummary {
@@ -53,6 +56,7 @@ async fn tx_pipeline_perf_baseline_emits_metrics_artifact() {
         .unwrap_or(DEFAULT_SEED_TX_COUNT)
         .max(1);
     let artifact_path = artifact_path_from_env();
+    let previous_baseline = read_artifact_if_present(&artifact_path);
     let (state, seed_summary) = build_seeded_state(seeded_transactions);
 
     let (snapshot_latency_ms, snapshot) = measure_snapshot_latency_ms(&state).await;
@@ -60,7 +64,7 @@ async fn tx_pipeline_perf_baseline_emits_metrics_artifact() {
     assert!(!snapshot.transactions.is_empty());
 
     let (stream_catch_up_ms, stream_events_seen) =
-        measure_stream_catch_up(state.provider.as_ref(), seed_summary.latest_seq_id);
+        best_stream_catch_up_sample(state.provider.as_ref(), seed_summary.latest_seq_id);
     assert!(stream_events_seen >= seed_summary.seeded_events);
 
     let stream_events_per_sec = if stream_catch_up_ms <= f64::EPSILON {
@@ -68,6 +72,15 @@ async fn tx_pipeline_perf_baseline_emits_metrics_artifact() {
     } else {
         (stream_events_seen as f64 * 1_000.0) / stream_catch_up_ms
     };
+    let throughput_floor = previous_baseline
+        .as_ref()
+        .map(|baseline| baseline.stream_events_per_sec * PREVIOUS_STREAM_EVENTS_PER_SEC_FLOOR_RATIO)
+        .unwrap_or(0.0)
+        .max(STREAM_EVENTS_PER_SEC_FLOOR);
+    assert!(
+        stream_events_per_sec >= throughput_floor,
+        "stream throughput regression: current={stream_events_per_sec:.0} floor={throughput_floor:.0}"
+    );
 
     let baseline = TxPipelinePerfBaseline {
         seeded_transactions: seed_summary.seeded_transactions,
@@ -145,6 +158,7 @@ fn build_seeded_state(seeded_transactions: usize) -> (AppState, SeedSummary) {
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        replay_runtime_metrics_provider: Arc::new(viz_api::ReplayRuntimeMetricsSnapshot::default),
         live_rpc_simulation_status_provider: Arc::new(|_: &str| {
             Option::<LiveRpcSimulationStatusSnapshot>::None
         }),
@@ -331,6 +345,24 @@ fn measure_stream_catch_up(provider: &dyn VizDataProvider, latest_seq_id: u64) -
     (start.elapsed().as_secs_f64() * 1_000.0, streamed_events)
 }
 
+fn best_stream_catch_up_sample(provider: &dyn VizDataProvider, latest_seq_id: u64) -> (f64, usize) {
+    let mut best = None;
+    for _ in 0..STREAM_SAMPLE_COUNT {
+        let sample = measure_stream_catch_up(provider, latest_seq_id);
+        best = match best {
+            Some((best_ms, best_events))
+                if sample.0 > f64::EPSILON
+                    && best_ms > f64::EPSILON
+                    && (sample.1 as f64 / sample.0) <= (best_events as f64 / best_ms) =>
+            {
+                Some((best_ms, best_events))
+            }
+            _ => Some(sample),
+        };
+    }
+    best.expect("at least one stream catch-up sample")
+}
+
 fn artifact_path_from_env() -> PathBuf {
     let candidate = std::env::var(ENV_ARTIFACT_PATH)
         .ok()
@@ -359,4 +391,9 @@ fn write_artifact(path: &Path, baseline: &TxPipelinePerfBaseline) {
     let payload =
         serde_json::to_string_pretty(baseline).expect("serialize tx pipeline perf baseline");
     fs::write(path, payload).expect("write tx pipeline perf baseline artifact");
+}
+
+fn read_artifact_if_present(path: &Path) -> Option<TxPipelinePerfBaseline> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
 }

@@ -1,5 +1,5 @@
 use common::{Address, SourceId};
-use event_log::{EventEnvelope, EventPayload, TxConfirmed, TxDecoded, TxReplaced};
+use event_log::{EventEnvelope, EventPayload, TxConfirmed, TxDecoded, TxReorged, TxReplaced};
 use scheduler::{
     PersistedSchedulerSnapshot, PersistedSenderQueueEntry, PersistedSenderQueueSnapshot,
     ValidatedTransaction,
@@ -96,6 +96,20 @@ fn replaced_event(
         payload: EventPayload::TxReplaced(TxReplaced {
             hash: replaced.hash(),
             replaced_by: replacement.hash(),
+        }),
+    }
+}
+
+fn reorg_event(seq_id: u64, tx: &ValidatedTransaction, old_block_hash: [u8; 32]) -> EventEnvelope {
+    EventEnvelope {
+        seq_id,
+        ingest_ts_unix_ms: tx.observed_at_unix_ms + 2_000,
+        ingest_ts_mono_ns: tx.observed_at_mono_ns + 2_000,
+        source_id: tx.source_id.clone(),
+        payload: EventPayload::TxReorged(TxReorged {
+            hash: tx.hash(),
+            old_block_hash,
+            new_block_hash: [seq_id as u8; 32],
         }),
     }
 }
@@ -216,6 +230,52 @@ async fn binary_bootstrap_prunes_snapshot_transactions_confirmed_in_wal_tail() {
 
     assert!(snapshot.pending.is_empty());
     assert!(snapshot.ready.is_empty());
+    assert!(snapshot.blocked.is_empty());
+}
+
+#[tokio::test]
+async fn binary_bootstrap_recovers_reorged_transaction_without_tail_decode_event() {
+    let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+    let reopened = sample_validated_tx(1, sender(0xa1), 7);
+    let confirmed = confirmed_final_event(2, &reopened);
+    let old_block_hash = match &confirmed.payload {
+        EventPayload::TxConfirmedFinal(payload) => payload.block_hash,
+        _ => unreachable!("confirmed_final_event should emit a final confirmation"),
+    };
+
+    {
+        let mut guard = storage.write().expect("storage writable");
+        guard.upsert_tx_full(tx_full_record(&reopened));
+        guard.append_event(decoded_event(1, &reopened));
+        guard.append_event(confirmed);
+        guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
+            captured_at_unix_ms: 1_700_000_000_321,
+            captured_at_mono_ns: 321,
+            event_seq_hi: 0,
+            pending: Vec::new(),
+            executable_frontier: Vec::new(),
+            sender_queues: Vec::new(),
+        });
+        guard.append_event(reorg_event(3, &reopened, old_block_hash));
+    }
+
+    let (_state, bootstrap) = default_state_with_runtime_from_storage(storage);
+    let snapshot = bootstrap.scheduler.snapshot();
+
+    assert_eq!(snapshot.pending.len(), 1);
+    let recovered = &snapshot.pending[0];
+    assert_eq!(recovered.hash(), reopened.hash());
+    assert_eq!(recovered.calldata, reopened.calldata);
+    assert_eq!(recovered.decoded, reopened.decoded);
+    assert_eq!(
+        recovered.observed_at_unix_ms,
+        reopened.observed_at_unix_ms + 2_000
+    );
+    assert_eq!(
+        recovered.observed_at_mono_ns,
+        reopened.observed_at_mono_ns + 2_000
+    );
+    assert_eq!(snapshot.ready, snapshot.pending);
     assert!(snapshot.blocked.is_empty());
 }
 

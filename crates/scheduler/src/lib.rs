@@ -4,7 +4,7 @@ use common::{Address, SourceId, TxHash};
 use event_log::TxDecoded;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
@@ -94,6 +94,7 @@ pub struct SchedulerMetrics {
     pub blocked_total: usize,
     pub sender_total: usize,
     pub queue_depth: usize,
+    pub queue_depth_peak: usize,
     pub handoff_queue_capacity: usize,
 }
 
@@ -176,11 +177,23 @@ impl SchedulerHandle {
 
     fn try_send_command(&self, command: SchedulerCommand) -> Result<(), SchedulerEnqueueError> {
         match self.ingress_tx.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let current_depth = self
+                    .ingress_tx
+                    .max_capacity()
+                    .saturating_sub(self.ingress_tx.capacity());
+                self.shared
+                    .queue_depth_peak
+                    .fetch_max(current_depth, Ordering::Relaxed);
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.shared
                     .queue_full_drop_total
                     .fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .queue_depth_peak
+                    .fetch_max(self.ingress_tx.max_capacity(), Ordering::Relaxed);
                 Err(SchedulerEnqueueError::QueueFull)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SchedulerEnqueueError::QueueClosed),
@@ -241,6 +254,7 @@ impl SchedulerHandle {
             blocked_total: state.blocked_total,
             sender_total: state.sender_queues.len(),
             queue_depth,
+            queue_depth_peak: self.shared.queue_depth_peak.load(Ordering::Relaxed),
             handoff_queue_capacity,
         }
     }
@@ -320,6 +334,7 @@ fn scheduler_channel_with_state(
         config,
         state: RwLock::new(state),
         queue_full_drop_total: AtomicU64::new(0),
+        queue_depth_peak: AtomicUsize::new(0),
     });
 
     (
@@ -378,6 +393,7 @@ struct SharedState {
     config: SchedulerConfig,
     state: RwLock<SchedulerState>,
     queue_full_drop_total: AtomicU64,
+    queue_depth_peak: AtomicUsize,
 }
 
 impl SharedState {

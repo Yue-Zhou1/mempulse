@@ -42,7 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
     NoopClickHouseSink, StorageTryEnqueueError, StorageWriteHandle, StorageWriteOp,
-    StorageWriterConfig, spawn_single_writer,
+    StorageWriterConfig, TxFullRecord, spawn_single_writer,
 };
 use stream_broadcast::{DashboardStreamBroadcastEvent, DashboardStreamBroadcaster};
 use tokio::time::MissedTickBehavior;
@@ -53,6 +53,9 @@ const DEFAULT_SCHEDULER_SNAPSHOT_INTERVAL_MS: u64 = 5_000;
 const ENV_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: &str =
     "VIZ_API_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS";
 const DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS: u64 = 300_000;
+const ENV_SCHEDULER_HANDOFF_QUEUE_CAPACITY: &str = "VIZ_API_SCHEDULER_HANDOFF_QUEUE_CAPACITY";
+const ENV_SCHEDULER_MAX_PENDING_PER_SENDER: &str = "VIZ_API_SCHEDULER_MAX_PENDING_PER_SENDER";
+const ENV_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS: &str = "VIZ_API_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS";
 
 #[cfg(test)]
 use builder::{
@@ -96,6 +99,8 @@ pub struct AppState {
         Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>,
     pub live_rpc_simulation_metrics_provider:
         Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>,
+    pub replay_runtime_metrics_provider:
+        Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>,
     pub live_rpc_simulation_status_provider:
         Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>,
     pub scheduler_snapshot_provider: Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>,
@@ -163,6 +168,7 @@ impl RuntimeCoreViewProviders {
     }
 }
 
+#[derive(Clone)]
 pub struct RuntimeBootstrap {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
@@ -173,6 +179,8 @@ pub struct RuntimeBootstrap {
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
     scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
+    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     pub ingest_mode: IngestSourceMode,
 }
 
@@ -182,18 +190,26 @@ pub struct RuntimeBootstrapStartup {
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
     scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
+    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl RuntimeBootstrap {
     pub fn abort_background_tasks(&self) {
         abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+        abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
     }
 
     pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
         start_scheduler_snapshot_writer_once(
             &self.scheduler_snapshot_writer_abort,
             self.scheduler_snapshot_interval_ms,
-            runtime_core,
+            runtime_core.clone(),
+        );
+        start_replay_runtime_metrics_refresher_once(
+            &self.replay_runtime_metrics_abort,
+            self.scheduler_snapshot_interval_ms,
+            self.replay_runtime_metrics_cache.clone(),
         );
     }
 
@@ -231,6 +247,8 @@ impl RuntimeBootstrap {
             rebuild_scheduler_from_rpc: self.rebuild_scheduler_from_rpc,
             scheduler_snapshot_interval_ms: self.scheduler_snapshot_interval_ms,
             scheduler_snapshot_writer_abort: self.scheduler_snapshot_writer_abort,
+            replay_runtime_metrics_cache: self.replay_runtime_metrics_cache,
+            replay_runtime_metrics_abort: self.replay_runtime_metrics_abort,
         };
         (start_args, startup)
     }
@@ -239,13 +257,19 @@ impl RuntimeBootstrap {
 impl RuntimeBootstrapStartup {
     pub fn abort_background_tasks(&self) {
         abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
+        abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
     }
 
     pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
         start_scheduler_snapshot_writer_once(
             &self.scheduler_snapshot_writer_abort,
             self.scheduler_snapshot_interval_ms,
-            runtime_core,
+            runtime_core.clone(),
+        );
+        start_replay_runtime_metrics_refresher_once(
+            &self.replay_runtime_metrics_abort,
+            self.scheduler_snapshot_interval_ms,
+            self.replay_runtime_metrics_cache.clone(),
         );
     }
 }
@@ -428,6 +452,42 @@ pub struct DashboardCacheMetrics {
     pub last_build_duration_ns: u64,
     pub total_build_duration_ns: u64,
     pub estimated_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplayRuntimeMetricsSnapshot {
+    pub lag_events: u64,
+    pub checkpoint_duration_ms: u64,
+    // Counts reorged transactions in the replay tail, not block depth.
+    pub reorg_depth: u64,
+}
+
+#[derive(Clone)]
+struct ReplayRuntimeMetricsCache {
+    storage: Arc<RwLock<InMemoryStorage>>,
+    snapshot: Arc<RwLock<ReplayRuntimeMetricsSnapshot>>,
+}
+
+impl ReplayRuntimeMetricsCache {
+    fn new(storage: Arc<RwLock<InMemoryStorage>>) -> Self {
+        let cache = Self {
+            storage,
+            snapshot: Arc::new(RwLock::new(ReplayRuntimeMetricsSnapshot::default())),
+        };
+        cache.refresh();
+        cache
+    }
+
+    fn snapshot(&self) -> ReplayRuntimeMetricsSnapshot {
+        self.snapshot.read().map(|guard| *guard).unwrap_or_default()
+    }
+
+    fn refresh(&self) {
+        let next = build_replay_runtime_metrics(&self.storage);
+        if let Ok(mut guard) = self.snapshot.write() {
+            *guard = next;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1208,8 +1268,8 @@ pub fn default_state_with_runtime_from_storage(
     let bootstrap = runtime_bootstrap_from_storage(storage);
     let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
     bootstrap.start_background_tasks(runtime_core.clone());
-    let state = app_state_from_runtime_core(
-        &runtime_core,
+    let state = app_state_from_runtime_bootstrap(
+        &bootstrap,
         RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
     );
     (state, bootstrap)
@@ -1238,8 +1298,8 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
     let bootstrap = runtime_bootstrap_from_storage_and_rehydration(storage, rehydration);
     let runtime_core = start_runtime_core_for_bootstrap(&bootstrap);
     bootstrap.start_background_tasks(runtime_core.clone());
-    let state = app_state_from_runtime_core(
-        &runtime_core,
+    let state = app_state_from_runtime_bootstrap(
+        &bootstrap,
         RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
     );
     (state, bootstrap)
@@ -1256,19 +1316,29 @@ pub fn app_state_from_runtime_bootstrap(
     bootstrap: &RuntimeBootstrap,
     runtime_views: RuntimeCoreViewProviders,
 ) -> AppState {
-    build_app_state(bootstrap.storage.clone(), runtime_views)
+    build_app_state(
+        bootstrap.storage.clone(),
+        runtime_views,
+        replay_runtime_metrics_provider(bootstrap.replay_runtime_metrics_cache.clone()),
+    )
 }
 
 pub fn app_state_from_runtime_core(
     runtime_core: &RuntimeCoreHandle,
     runtime_views: RuntimeCoreViewProviders,
 ) -> AppState {
-    build_app_state(runtime_core.storage().clone(), runtime_views)
+    let cache = ReplayRuntimeMetricsCache::new(runtime_core.storage().clone());
+    build_app_state(
+        runtime_core.storage().clone(),
+        runtime_views,
+        replay_runtime_metrics_provider(cache),
+    )
 }
 
 fn build_app_state(
     storage: Arc<RwLock<InMemoryStorage>>,
     runtime_views: RuntimeCoreViewProviders,
+    replay_runtime_metrics_provider: Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>,
 ) -> AppState {
     let propagation = vec![
         PropagationEdge {
@@ -1306,6 +1376,7 @@ fn build_app_state(
         live_rpc_drop_metrics_provider: runtime_views.live_rpc_drop_metrics_provider,
         live_rpc_searcher_metrics_provider: runtime_views.live_rpc_searcher_metrics_provider,
         live_rpc_simulation_metrics_provider: runtime_views.live_rpc_simulation_metrics_provider,
+        replay_runtime_metrics_provider,
         live_rpc_simulation_status_provider: runtime_views.live_rpc_simulation_status_provider,
         scheduler_snapshot_provider: runtime_views.scheduler_snapshot_provider,
         scheduler_metrics_provider: runtime_views.scheduler_metrics_provider,
@@ -1314,12 +1385,56 @@ fn build_app_state(
     }
 }
 
+fn replay_runtime_metrics_provider(
+    cache: ReplayRuntimeMetricsCache,
+) -> Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync> {
+    Arc::new(move || cache.snapshot())
+}
+
 fn start_runtime_core_for_bootstrap(bootstrap: &RuntimeBootstrap) -> RuntimeCoreHandle {
     RuntimeCore::start(
         bootstrap
             .runtime_core_start_args(runtime_ingest_mode_from_source_mode(bootstrap.ingest_mode)),
     )
     .expect("runtime core should start for viz-api state")
+}
+
+fn build_replay_runtime_metrics(
+    storage: &Arc<RwLock<InMemoryStorage>>,
+) -> ReplayRuntimeMetricsSnapshot {
+    let Ok(storage) = storage.read() else {
+        return ReplayRuntimeMetricsSnapshot::default();
+    };
+
+    let latest_seq_id = storage.latest_seq_id().unwrap_or(0);
+    let checkpoint_seq_id = storage
+        .scheduler_snapshot()
+        .map(|snapshot| snapshot.event_seq_hi)
+        .unwrap_or(latest_seq_id);
+    let replay_tail = storage.scan_events(checkpoint_seq_id, usize::MAX);
+    let replay_tail_reorgs = replay_tail
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::TxReorged(_)))
+        .count() as u64;
+
+    let checkpoint_duration_ms = if latest_seq_id == 0 {
+        0
+    } else {
+        let started_at = Instant::now();
+        let _ = replay::lifecycle_snapshot(&storage.list_events(), latest_seq_id);
+        started_at
+            .elapsed()
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u64::MAX as u128) as u64
+    };
+
+    ReplayRuntimeMetricsSnapshot {
+        lag_events: latest_seq_id.saturating_sub(checkpoint_seq_id),
+        checkpoint_duration_ms,
+        // Approximation from the replay tail until the event schema carries explicit block-depth data.
+        reorg_depth: replay_tail_reorgs,
+    }
 }
 
 fn runtime_ingest_mode_from_source_mode(mode: IngestSourceMode) -> RuntimeIngestMode {
@@ -1363,8 +1478,9 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let scheduler_config = resolve_scheduler_config();
     let scheduler = match spawn_scheduler_with_rehydration(
-        SchedulerConfig::default(),
+        scheduler_config,
         sanitized_snapshot,
         replay_transactions,
     ) {
@@ -1372,7 +1488,7 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
         Err(error) => {
             tracing::warn!(?error, "failed to rehydrate scheduler from storage plan");
             rebuild_scheduler_from_rpc = true;
-            spawn_scheduler_with_rehydration(SchedulerConfig::default(), None, Vec::new())
+            spawn_scheduler_with_rehydration(scheduler_config, None, Vec::new())
                 .expect("empty scheduler rehydration should succeed")
         }
     };
@@ -1384,6 +1500,7 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
         }
     };
     let ingest_mode = resolve_ingest_source_mode(env::var("VIZ_API_INGEST_MODE").ok().as_deref());
+    let replay_runtime_metrics_cache = ReplayRuntimeMetricsCache::new(storage.clone());
 
     RuntimeBootstrap {
         storage: storage.clone(),
@@ -1393,6 +1510,8 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
         rebuild_scheduler_from_rpc,
         scheduler_snapshot_interval_ms: rehydration.snapshot_interval_ms,
         scheduler_snapshot_writer_abort: Arc::new(Mutex::new(None)),
+        replay_runtime_metrics_cache,
+        replay_runtime_metrics_abort: Arc::new(Mutex::new(None)),
         ingest_mode,
     }
 }
@@ -1452,6 +1571,49 @@ fn start_scheduler_snapshot_writer_once(
 }
 
 fn abort_scheduler_snapshot_writer(abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>) {
+    let handle = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
+fn spawn_replay_runtime_metrics_refresher(
+    cache: ReplayRuntimeMetricsCache,
+    interval_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            cache.refresh();
+        }
+    })
+}
+
+fn start_replay_runtime_metrics_refresher_once(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    interval_ms: u64,
+    cache: ReplayRuntimeMetricsCache,
+) {
+    let mut guard = abort_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_some() {
+        return;
+    }
+
+    let task = spawn_replay_runtime_metrics_refresher(cache, interval_ms);
+    *guard = Some(task.abort_handle());
+}
+
+fn abort_replay_runtime_metrics_refresher(
+    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+) {
     let handle = abort_slot
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -1527,6 +1689,34 @@ fn resolve_scheduler_snapshot_max_finality_age_ms(raw: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_SCHEDULER_SNAPSHOT_MAX_FINALITY_AGE_MS)
 }
 
+fn resolve_scheduler_config() -> SchedulerConfig {
+    let defaults = SchedulerConfig::default();
+    SchedulerConfig {
+        handoff_queue_capacity: resolve_positive_usize(
+            env::var(ENV_SCHEDULER_HANDOFF_QUEUE_CAPACITY)
+                .ok()
+                .as_deref(),
+            defaults.handoff_queue_capacity,
+        ),
+        max_pending_per_sender: resolve_positive_usize(
+            env::var(ENV_SCHEDULER_MAX_PENDING_PER_SENDER)
+                .ok()
+                .as_deref(),
+            defaults.max_pending_per_sender,
+        ),
+        replacement_fee_bump_bps: env::var(ENV_SCHEDULER_REPLACEMENT_FEE_BUMP_BPS)
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .unwrap_or(defaults.replacement_fee_bump_bps),
+    }
+}
+
+fn resolve_positive_usize(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 fn validated_transaction_from_event(
     event: &EventEnvelope,
     storage: &InMemoryStorage,
@@ -1542,7 +1732,48 @@ fn validated_transaction_from_event(
                 .unwrap_or_default(),
             decoded: decoded.clone(),
         }),
+        EventPayload::TxReorged(reorged) => storage.tx_full_by_hash(&reorged.hash).map(|row| {
+            // Reorg recovery re-admits the transaction at the reorg observation time, not the
+            // original decode time, because the tx became pending again at this event.
+            validated_transaction_from_storage_row(
+                &event.source_id,
+                event.ingest_ts_unix_ms,
+                event.ingest_ts_mono_ns,
+                row,
+            )
+        }),
         _ => None,
+    }
+}
+
+fn validated_transaction_from_storage_row(
+    source_id: &common::SourceId,
+    observed_at_unix_ms: i64,
+    observed_at_mono_ns: u64,
+    row: &TxFullRecord,
+) -> ValidatedTransaction {
+    ValidatedTransaction {
+        source_id: source_id.clone(),
+        observed_at_unix_ms,
+        observed_at_mono_ns,
+        calldata: row.raw_tx.clone(),
+        decoded: event_log::TxDecoded {
+            hash: row.hash,
+            tx_type: row.tx_type,
+            sender: row.sender,
+            nonce: row.nonce,
+            chain_id: row.chain_id,
+            to: row.to,
+            value_wei: row.value_wei,
+            gas_limit: row.gas_limit,
+            gas_price_wei: row.gas_price_wei,
+            max_fee_per_gas_wei: row.max_fee_per_gas_wei,
+            max_priority_fee_per_gas_wei: row.max_priority_fee_per_gas_wei,
+            max_fee_per_blob_gas_wei: row.max_fee_per_blob_gas_wei,
+            calldata_len: row
+                .calldata_len
+                .or(Some(row.raw_tx.len().min(u32::MAX as usize) as u32)),
+        },
     }
 }
 
@@ -2260,6 +2491,11 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_scheduler_queue_depth {}\n",
         scheduler_metrics.queue_depth
     ));
+    out.push_str("# TYPE mempulse_scheduler_queue_depth_peak gauge\n");
+    out.push_str(&format!(
+        "mempulse_scheduler_queue_depth_peak {}\n",
+        scheduler_metrics.queue_depth_peak
+    ));
     out.push_str("# TYPE mempulse_scheduler_handoff_queue_capacity gauge\n");
     out.push_str(&format!(
         "mempulse_scheduler_handoff_queue_capacity {}\n",
@@ -2350,6 +2586,8 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_searcher_max_executable_candidates_in_batch {}\n",
         searcher_metrics.max_executable_candidates_in_batch
     ));
+    // Compatibility-only legacy series retained for existing dashboards after the legacy shadow
+    // path was retired. They stay at zero in the current runtime path.
     out.push_str("# TYPE mempulse_searcher_legacy_shadow_batches_total counter\n");
     out.push_str(&format!(
         "mempulse_searcher_legacy_shadow_batches_total {}\n",
@@ -2437,13 +2675,29 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         dashboard_cache_metrics.estimated_bytes
     ));
 
-    // Stub values until replay runtime exports these counters directly.
+    let replay_metrics = (state.replay_runtime_metrics_provider)();
     out.push_str("# TYPE mempulse_replay_lag_events gauge\n");
-    out.push_str("mempulse_replay_lag_events 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_lag_events {}\n",
+        replay_metrics.lag_events
+    ));
     out.push_str("# TYPE mempulse_replay_checkpoint_duration_ms gauge\n");
-    out.push_str("mempulse_replay_checkpoint_duration_ms 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_checkpoint_duration_ms {}\n",
+        replay_metrics.checkpoint_duration_ms
+    ));
+    out.push_str("# TYPE mempulse_replay_tail_reorged_tx_total gauge\n");
+    out.push_str(&format!(
+        "mempulse_replay_tail_reorged_tx_total {}\n",
+        replay_metrics.reorg_depth
+    ));
+    // Deprecated alias kept for compatibility; this counts replay-tail TxReorged events, not
+    // reorganized block depth.
     out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
-    out.push_str("mempulse_replay_reorg_depth 0\n");
+    out.push_str(&format!(
+        "mempulse_replay_reorg_depth {}\n",
+        replay_metrics.reorg_depth
+    ));
 
     let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
     out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
@@ -3575,6 +3829,7 @@ mod tests {
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
             live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
@@ -3617,6 +3872,7 @@ mod tests {
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
             live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
@@ -3683,6 +3939,7 @@ mod tests {
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
             live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider,
             scheduler_snapshot_provider,
             scheduler_metrics_provider,
@@ -3721,6 +3978,7 @@ mod tests {
             live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider,
             live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider,
             scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
             scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
@@ -3823,6 +4081,7 @@ mod tests {
         assert!(payload.contains("mempulse_dashboard_cache_last_build_ms"));
         assert!(payload.contains("mempulse_dashboard_cache_estimated_bytes"));
         assert!(payload.contains("mempulse_replay_lag_events"));
+        assert!(payload.contains("mempulse_replay_tail_reorged_tx_total"));
         assert!(payload.contains("mempulse_sim_queue_depth"));
         assert!(payload.contains("mempulse_sim_drop_total{reason=\"stale\"}"));
         assert!(payload.contains("mempulse_sim_fail_total{category=\"unknown\"}"));
@@ -3851,6 +4110,7 @@ mod tests {
             blocked_total: 2,
             sender_total: 3,
             queue_depth: 9,
+            queue_depth_peak: 12,
             handoff_queue_capacity: 128,
         })
             as Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
@@ -3876,6 +4136,7 @@ mod tests {
         assert!(payload.contains("mempulse_scheduler_admitted_total 7"));
         assert!(payload.contains("mempulse_scheduler_duplicate_total 2"));
         assert!(payload.contains("mempulse_scheduler_queue_depth 9"));
+        assert!(payload.contains("mempulse_scheduler_queue_depth_peak 12"));
     }
 
     #[tokio::test]
@@ -3959,6 +4220,7 @@ mod tests {
             live_rpc_simulation_metrics_provider: Arc::new(
                 LiveRpcSimulationMetricsSnapshot::default,
             ),
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider: Arc::new(|_| None),
             scheduler_snapshot_provider: Arc::new(SchedulerSnapshot::default),
             scheduler_metrics_provider: Arc::new(SchedulerMetrics::default),
@@ -4783,6 +5045,7 @@ mod tests {
             live_rpc_drop_metrics_provider: providers.live_rpc_drop_metrics_provider,
             live_rpc_searcher_metrics_provider: providers.live_rpc_searcher_metrics_provider,
             live_rpc_simulation_metrics_provider: providers.live_rpc_simulation_metrics_provider,
+            replay_runtime_metrics_provider: Arc::new(ReplayRuntimeMetricsSnapshot::default),
             live_rpc_simulation_status_provider: providers.live_rpc_simulation_status_provider,
             scheduler_snapshot_provider: providers.scheduler_snapshot_provider,
             scheduler_metrics_provider: providers.scheduler_metrics_provider,

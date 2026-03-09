@@ -189,13 +189,8 @@ impl LiveRpcStateOwner {
         self.handle().observe_drop_reason(reason);
     }
 
-    fn observe_searcher_batch(
-        &self,
-        executable: &[OpportunityRecord],
-        legacy_shadow: &[OpportunityRecord],
-    ) {
-        self.handle()
-            .observe_searcher_batch(executable, legacy_shadow);
+    fn observe_searcher_batch(&self, executable: &[OpportunityRecord]) {
+        self.handle().observe_searcher_batch(executable);
     }
 
     fn configure_simulation_queue(&self, queue_capacity: usize, worker_total: usize) {
@@ -2023,14 +2018,8 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
                 .iter()
                 .map(|opportunity| opportunity.record.clone())
                 .collect::<Vec<_>>();
-            let legacy_shadow_opportunities = build_legacy_comparison_opportunity_records(
-                &executable_transactions,
-                processed_at_unix_ms,
-                resolved_chain_id,
-            );
-            if !executable_records.is_empty() || !legacy_shadow_opportunities.is_empty() {
-                state_owner
-                    .observe_searcher_batch(&executable_records, &legacy_shadow_opportunities);
+            if !executable_records.is_empty() {
+                state_owner.observe_searcher_batch(&executable_records);
             }
         }
         for opportunity in &executable_opportunities {
@@ -2342,6 +2331,7 @@ fn default_feature_analysis() -> FeatureAnalysis {
     }
 }
 
+#[cfg(test)]
 fn build_opportunity_records(
     decoded: &TxDecoded,
     calldata: &[u8],
@@ -2374,26 +2364,6 @@ fn build_opportunity_records(
         chain_id,
     })
     .collect()
-}
-
-fn build_legacy_comparison_opportunity_records(
-    executable: &[ValidatedTransaction],
-    detected_unix_ms: i64,
-    chain_id: Option<u64>,
-) -> Vec<OpportunityRecord> {
-    let mut candidates = executable
-        .iter()
-        .flat_map(|tx| {
-            build_opportunity_records(
-                &tx.decoded,
-                tx.calldata.as_slice(),
-                detected_unix_ms,
-                chain_id,
-            )
-        })
-        .collect::<Vec<_>>();
-    sort_and_limit_opportunity_records(&mut candidates);
-    candidates
 }
 
 fn build_executable_opportunities(
@@ -2436,17 +2406,6 @@ fn build_executable_opportunities(
         ExecutableOpportunity { record, candidate }
     })
     .collect()
-}
-
-fn sort_and_limit_opportunity_records(candidates: &mut Vec<OpportunityRecord>) {
-    candidates.sort_unstable_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.strategy.cmp(&right.strategy))
-            .then_with(|| left.tx_hash.cmp(&right.tx_hash))
-    });
-    candidates.truncate(SEARCHER_MAX_CANDIDATES);
 }
 
 fn ready_transactions_for_queue_transitions(
@@ -4645,7 +4604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_pending_hash_with_fetched_tx_records_internal_candidate_comparison_metrics() {
+    async fn process_pending_hash_with_fetched_tx_records_executable_searcher_metrics_only() {
         let (_mock_state, rpc_addr, server) =
             start_mock_simulation_rpc(MockSimulationRpcState::new(100)).await;
 
@@ -4705,13 +4664,17 @@ mod tests {
 
         let metrics = runtime_core.searcher_metrics();
         assert_eq!(metrics.executable_batches_total, 1);
-        assert_eq!(metrics.legacy_shadow_batches_total, 1);
-        assert_eq!(metrics.comparison_batches_total, 1);
-        assert!(metrics.executable_candidates_total > metrics.legacy_shadow_candidates_total);
+        assert_eq!(metrics.legacy_shadow_batches_total, 0);
+        assert_eq!(metrics.comparison_batches_total, 0);
+        assert_eq!(metrics.legacy_shadow_candidates_total, 0);
         assert!(metrics.executable_bundle_candidates_total >= 1);
-        assert!(metrics.executable_only_candidates_total >= 1);
-        assert_eq!(metrics.executable_top_score_wins_total, 1);
+        assert_eq!(
+            metrics.executable_only_candidates_total,
+            metrics.executable_candidates_total
+        );
+        assert_eq!(metrics.executable_top_score_wins_total, 0);
         assert_eq!(metrics.legacy_top_score_wins_total, 0);
+        assert_eq!(metrics.top_score_ties_total, 0);
 
         runtime_task.abort();
         server.abort();

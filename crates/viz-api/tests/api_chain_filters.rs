@@ -136,6 +136,7 @@ fn build_test_app() -> axum::Router {
         live_rpc_drop_metrics_provider: Arc::new(LiveRpcDropMetricsSnapshot::default),
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        replay_runtime_metrics_provider: Arc::new(viz_api::ReplayRuntimeMetricsSnapshot::default),
         live_rpc_simulation_status_provider: Arc::new(|_: &str| {
             Option::<LiveRpcSimulationStatusSnapshot>::None
         }),

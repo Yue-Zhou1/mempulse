@@ -4,6 +4,7 @@ use scheduler::{
     SchedulerAdmission, SchedulerConfig, SchedulerEnqueueError, ValidatedTransaction,
     scheduler_channel,
 };
+use tokio::sync::Barrier;
 use tokio::time::{Duration, Instant, sleep};
 
 fn sample_validated_tx(
@@ -91,6 +92,118 @@ fn scheduler_handoff_queue_drops_new_transactions_when_full() {
     assert_eq!(metrics.handoff_queue_capacity, 1);
     assert_eq!(metrics.queue_depth, 1);
     assert_eq!(metrics.queue_full_drop_total, 1);
+    assert_eq!(metrics.pending_total, 0);
+}
+
+#[tokio::test]
+async fn scheduler_metrics_preserve_peak_queue_depth_after_runtime_drains_burst() {
+    let (handle, runtime) = scheduler_channel(SchedulerConfig {
+        handoff_queue_capacity: 4,
+        max_pending_per_sender: 64,
+        replacement_fee_bump_bps: 1_000,
+    });
+
+    handle
+        .try_admit(sample_validated_tx(
+            1,
+            sender(1),
+            1,
+            101,
+            "rpc-a",
+            1_700_000_000_000,
+            10,
+        ))
+        .expect("first transaction fits in queue");
+    handle
+        .try_admit(sample_validated_tx(
+            2,
+            sender(2),
+            1,
+            101,
+            "rpc-a",
+            1_700_000_000_001,
+            11,
+        ))
+        .expect("second transaction fits in queue");
+    handle
+        .try_admit(sample_validated_tx(
+            3,
+            sender(3),
+            1,
+            101,
+            "rpc-a",
+            1_700_000_000_002,
+            12,
+        ))
+        .expect("third transaction fits in queue");
+
+    let queued_metrics = handle.metrics();
+    assert_eq!(queued_metrics.queue_depth, 3);
+    assert_eq!(queued_metrics.queue_depth_peak, 3);
+
+    let runtime_task = tokio::spawn(runtime.run());
+    wait_for(|| {
+        let metrics = handle.metrics();
+        metrics.queue_depth == 0 && metrics.pending_total == 3
+    })
+    .await;
+
+    let drained_metrics = handle.metrics();
+    assert_eq!(drained_metrics.queue_depth, 0);
+    assert_eq!(drained_metrics.queue_depth_peak, 3);
+
+    runtime_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_handoff_queue_saturation_tracks_peak_and_drop_metrics() {
+    let capacity = 4;
+    let producer_total = 12;
+    let (handle, _runtime) = scheduler_channel(SchedulerConfig {
+        handoff_queue_capacity: capacity,
+        max_pending_per_sender: 64,
+        replacement_fee_bump_bps: 1_000,
+    });
+    let barrier = std::sync::Arc::new(Barrier::new(producer_total));
+    let mut tasks = Vec::new();
+
+    for seed in 0..producer_total {
+        let handle = handle.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            handle.try_admit(sample_validated_tx(
+                seed as u8 + 1,
+                sender(seed as u8 + 1),
+                1,
+                101,
+                "rpc-burst",
+                1_700_000_100_000 + seed as i64,
+                10 + seed as u64,
+            ))
+        }));
+    }
+
+    let mut admitted = 0;
+    let mut dropped = 0;
+    for task in tasks {
+        match task.await.expect("producer task joins") {
+            Ok(()) => admitted += 1,
+            Err(SchedulerEnqueueError::QueueFull) => dropped += 1,
+            Err(error) => panic!("unexpected enqueue error: {error:?}"),
+        }
+    }
+
+    assert_eq!(admitted, capacity);
+    assert_eq!(dropped, producer_total - capacity);
+
+    let metrics = handle.metrics();
+    assert_eq!(metrics.queue_depth, capacity);
+    assert_eq!(metrics.queue_depth_peak, capacity);
+    assert_eq!(
+        metrics.queue_full_drop_total,
+        (producer_total - capacity) as u64
+    );
     assert_eq!(metrics.pending_total, 0);
 }
 

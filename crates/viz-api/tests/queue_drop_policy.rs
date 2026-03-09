@@ -99,6 +99,7 @@ async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
             as Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>,
         live_rpc_searcher_metrics_provider: Arc::new(LiveRpcSearcherMetricsSnapshot::default),
         live_rpc_simulation_metrics_provider: Arc::new(LiveRpcSimulationMetricsSnapshot::default),
+        replay_runtime_metrics_provider: Arc::new(viz_api::ReplayRuntimeMetricsSnapshot::default),
         live_rpc_simulation_status_provider: Arc::new(|_: &str| {
             Option::<LiveRpcSimulationStatusSnapshot>::None
         }),

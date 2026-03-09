@@ -8,13 +8,15 @@ use std::env;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use viz_api::{
-    RuntimeCoreViewProviders, app_state_from_runtime_core, build_router, default_runtime_bootstrap,
+    RuntimeCoreViewProviders, app_state_from_runtime_bootstrap, build_router,
+    default_runtime_bootstrap,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing(env::var("RUST_LOG").ok().as_deref());
     let bootstrap = default_runtime_bootstrap();
+    let state_bootstrap = bootstrap.clone();
     let runtime_builder = NodeRuntimeBuilder::from_env()?;
     let ingest_mode = runtime_builder.ingest_mode();
     let (runtime_core_start_args, startup) =
@@ -47,8 +49,8 @@ async fn main() -> Result<()> {
         .build()?;
     let runtime_core = runtime.runtime_core().expect("runtime core handle");
     startup.start_background_tasks(runtime_core.clone());
-    let state = app_state_from_runtime_core(
-        &runtime_core,
+    let state = app_state_from_runtime_bootstrap(
+        &state_bootstrap,
         RuntimeCoreViewProviders::from_runtime_core(runtime_core.clone()),
     );
     let app = build_router(state);

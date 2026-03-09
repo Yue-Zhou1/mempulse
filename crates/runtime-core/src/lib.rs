@@ -8,7 +8,7 @@ use common::{Address, TxHash};
 use scheduler::{SchedulerHandle, SchedulerMetrics, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use sim_engine::AccountSeed;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -61,6 +61,7 @@ pub struct LiveRpcSearcherMetricsSnapshot {
     pub executable_candidates_total: u64,
     pub executable_bundle_candidates_total: u64,
     pub max_executable_candidates_in_batch: u64,
+    // Compatibility fields retained for existing dashboards after the legacy shadow path removal.
     pub legacy_shadow_batches_total: u64,
     pub legacy_shadow_candidates_total: u64,
     pub max_legacy_shadow_candidates_in_batch: u64,
@@ -364,14 +365,9 @@ impl RuntimeCoreHandle {
         }
     }
 
-    pub fn observe_searcher_batch(
-        &self,
-        executable: &[OpportunityRecord],
-        legacy_shadow: &[OpportunityRecord],
-    ) {
+    pub fn observe_searcher_batch(&self, executable: &[OpportunityRecord]) {
         if let Ok(mut guard) = self.inner.searcher_metrics.write() {
             let executable_count = executable.len() as u64;
-            let legacy_count = legacy_shadow.len() as u64;
 
             guard.executable_batches_total = guard.executable_batches_total.saturating_add(1);
             guard.executable_candidates_total = guard
@@ -388,63 +384,15 @@ impl RuntimeCoreHandle {
                 .max_executable_candidates_in_batch
                 .max(executable_count);
 
-            guard.legacy_shadow_batches_total = guard.legacy_shadow_batches_total.saturating_add(1);
-            guard.legacy_shadow_candidates_total = guard
-                .legacy_shadow_candidates_total
-                .saturating_add(legacy_count);
-            guard.max_legacy_shadow_candidates_in_batch = guard
-                .max_legacy_shadow_candidates_in_batch
-                .max(legacy_count);
-            guard.comparison_batches_total = guard.comparison_batches_total.saturating_add(1);
-
             let executable_top_score = executable
-                .first()
-                .map_or(0, |candidate| candidate.score as u64);
-            let legacy_top_score = legacy_shadow
                 .first()
                 .map_or(0, |candidate| candidate.score as u64);
             guard.executable_top_score_total = guard
                 .executable_top_score_total
                 .saturating_add(executable_top_score);
-            guard.legacy_top_score_total = guard
-                .legacy_top_score_total
-                .saturating_add(legacy_top_score);
-
-            match executable_top_score.cmp(&legacy_top_score) {
-                std::cmp::Ordering::Greater => {
-                    guard.executable_top_score_wins_total =
-                        guard.executable_top_score_wins_total.saturating_add(1);
-                }
-                std::cmp::Ordering::Less => {
-                    guard.legacy_top_score_wins_total =
-                        guard.legacy_top_score_wins_total.saturating_add(1);
-                }
-                std::cmp::Ordering::Equal => {
-                    guard.top_score_ties_total = guard.top_score_ties_total.saturating_add(1);
-                }
-            }
-
-            let executable_keys = executable
-                .iter()
-                .map(opportunity_identity)
-                .collect::<BTreeSet<_>>();
-            let legacy_keys = legacy_shadow
-                .iter()
-                .map(opportunity_identity)
-                .collect::<BTreeSet<_>>();
-            let overlapping = executable_keys.intersection(&legacy_keys).count() as u64;
-            let executable_only = executable_keys.difference(&legacy_keys).count() as u64;
-            let legacy_only = legacy_keys.difference(&executable_keys).count() as u64;
-
-            guard.overlapping_candidates_total = guard
-                .overlapping_candidates_total
-                .saturating_add(overlapping);
             guard.executable_only_candidates_total = guard
                 .executable_only_candidates_total
-                .saturating_add(executable_only);
-            guard.legacy_only_candidates_total = guard
-                .legacy_only_candidates_total
-                .saturating_add(legacy_only);
+                .saturating_add(executable_count);
         }
     }
 
@@ -810,10 +758,6 @@ impl SimulationTaskStore {
         self.task_members.clear();
         self.tasks_by_member.clear();
     }
-}
-
-fn opportunity_identity(candidate: &OpportunityRecord) -> ([u8; 32], String) {
-    (candidate.tx_hash, candidate.strategy.clone())
 }
 
 fn current_unix_ms() -> i64 {
