@@ -15,7 +15,6 @@ import {
 } from '../lib/dashboard-helpers.js';
 import {
   buildVirtualizedTickerRows,
-  resolveVirtualizedSelectionIndex,
 } from '../lib/radar-virtualized-model.js';
 
 const EMPTY_ROWS = [];
@@ -41,7 +40,6 @@ export function useDashboardDerivedState({
   chainStatusRows,
   marketStats,
   featureSummaryRows,
-  setTransactionPage,
   setSelectedOpportunityKey,
 }) {
   const previousVirtualizedTickerRowsRef = useRef(null);
@@ -150,13 +148,6 @@ export function useDashboardDerivedState({
     [selectedHash, shouldComputeRadarDerived, transactionByHash],
   );
 
-  const selectedDetail = useMemo(() => {
-    if (!selectedTransaction) {
-      return null;
-    }
-    return resolveTransactionDetail(selectedTransaction.hash);
-  }, [resolveTransactionDetail, selectedTransaction, transactionDetailVersion]);
-
   const selectedFeature = useMemo(() => {
     if (!selectedTransaction) {
       return null;
@@ -244,22 +235,17 @@ export function useDashboardDerivedState({
       : EMPTY_ROWS),
     [pagedTransactions, shouldComputeRadarDerived, tickerPageSize, transactionPageStart],
   );
-  const deferredTickerRows = latestTickerRows;
   const virtualizedTickerRows = useMemo(
     () => {
       const next = buildVirtualizedTickerRows(
-        deferredTickerRows,
+        latestTickerRows,
         tickerPageSize,
         previousVirtualizedTickerRowsRef.current,
       );
       previousVirtualizedTickerRowsRef.current = next;
       return next;
     },
-    [deferredTickerRows, tickerPageSize],
-  );
-  const virtualizedSelectedTickerIndex = useMemo(
-    () => resolveVirtualizedSelectionIndex(virtualizedTickerRows, selectedHash),
-    [selectedHash, virtualizedTickerRows],
+    [latestTickerRows, tickerPageSize],
   );
   const transactionPageEnd = Math.min(
     pagedTransactions.length,
@@ -269,10 +255,6 @@ export function useDashboardDerivedState({
     () => paginationWindow(normalizedTransactionPage, transactionPageCount),
     [normalizedTransactionPage, transactionPageCount],
   );
-
-  useEffect(() => {
-    setTransactionPage((current) => Math.min(current, transactionPageCount));
-  }, [setTransactionPage, transactionPageCount]);
 
   useEffect(() => {
     setSelectedOpportunityKey((current) => {
@@ -341,7 +323,6 @@ export function useDashboardDerivedState({
     filteredTransactions,
     filteredOpportunityRows,
     selectedTransaction,
-    selectedDetail,
     selectedFeature,
     selectedRecent,
     selectedOpportunity,
@@ -358,9 +339,7 @@ export function useDashboardDerivedState({
     transactionPageCount,
     normalizedTransactionPage,
     transactionPageStart,
-    deferredTickerRows,
     virtualizedTickerRows,
-    virtualizedSelectedTickerIndex,
     transactionPageEnd,
     paginationPages,
     totalSignalVolume,

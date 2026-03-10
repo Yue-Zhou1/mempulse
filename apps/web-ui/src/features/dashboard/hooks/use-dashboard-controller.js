@@ -127,7 +127,6 @@ export function useDashboardController() {
     chainStatusRows,
     marketStats,
     featureSummaryRows,
-    setTransactionPage,
     setSelectedOpportunityKey,
   });
 
@@ -217,9 +216,7 @@ export function useDashboardController() {
     showTickerFilters,
     liveMainnetFilter,
     query,
-    deferredTickerRows: derived.deferredTickerRows,
     virtualizedTickerRows: derived.virtualizedTickerRows,
-    virtualizedSelectedTickerIndex: derived.virtualizedSelectedTickerIndex,
     featureByHash: derived.featureByHash,
     selectedHash,
     filteredTransactions: derived.filteredTransactions,

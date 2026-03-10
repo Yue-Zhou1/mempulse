@@ -89,14 +89,6 @@ export function useDashboardActions({
     setSelectedOpportunityKey(key);
   }, [setSelectedOpportunityKey]);
 
-  const onShowRadar = useCallback(() => {
-    setActiveScreen('radar');
-  }, [setActiveScreen]);
-
-  const onShowOpps = useCallback(() => {
-    setActiveScreen('opps');
-  }, [setActiveScreen]);
-
   const onMastheadNavClick = useCallback((event) => {
     const node = event.target;
     const container = event.currentTarget;
@@ -207,8 +199,6 @@ export function useDashboardActions({
     onTickerListKeyDown,
     onOpportunityListClick,
     onMastheadNavClick,
-    onShowRadar,
-    onShowOpps,
     onSearchChange,
     onTickerFilterToggle,
     onLiveMainnetFilterChange,
