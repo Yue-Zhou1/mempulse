@@ -6,7 +6,7 @@ use scheduler::{
     PersistedSchedulerSnapshot, SchedulerCandidate, SchedulerConfig, SchedulerSimulationResult,
     ValidatedTransaction, scheduler_channel,
 };
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
+use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use storage::{EventStore, InMemoryStorage};
@@ -132,7 +132,7 @@ pub fn run_pipeline_once(batch: &[SearcherInputTx<'_>]) -> usize {
         min_score: 7_500,
         max_candidates: 128,
     };
-    rank_opportunities(batch, config).len()
+    rank_opportunity_batch(batch, config).candidates.len()
 }
 
 pub fn measure_pipeline_latency(batch_size: usize, iterations: usize) -> PipelineLatencyReport {

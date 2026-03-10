@@ -440,14 +440,6 @@ pub fn scheduler_channel(config: SchedulerConfig) -> (SchedulerHandle, Scheduler
     scheduler_channel_with_state(config, SchedulerState::default())
 }
 
-pub fn scheduler_channel_with_snapshot(
-    config: SchedulerConfig,
-    snapshot: PersistedSchedulerSnapshot,
-) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerSnapshotError> {
-    let state = SchedulerState::from_persisted_snapshot(snapshot)?;
-    Ok(scheduler_channel_with_state(config, state))
-}
-
 pub fn scheduler_channel_with_rehydration(
     config: SchedulerConfig,
     snapshot: Option<PersistedSchedulerSnapshot>,
@@ -484,19 +476,6 @@ fn scheduler_channel_with_state(
         },
         SchedulerRuntime { ingress_rx, shared },
     )
-}
-
-pub fn spawn_scheduler(config: SchedulerConfig) -> SchedulerHandle {
-    let (handle, runtime) = scheduler_channel(config);
-    spawn_runtime(handle, runtime)
-}
-
-pub fn spawn_scheduler_with_snapshot(
-    config: SchedulerConfig,
-    snapshot: PersistedSchedulerSnapshot,
-) -> Result<SchedulerHandle, SchedulerSnapshotError> {
-    let (handle, runtime) = scheduler_channel_with_snapshot(config, snapshot)?;
-    Ok(spawn_runtime(handle, runtime))
 }
 
 pub fn spawn_scheduler_with_rehydration(

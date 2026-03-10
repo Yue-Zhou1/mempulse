@@ -439,42 +439,6 @@ impl InMemoryStorage {
         out
     }
 
-    pub fn dashboard_feature_details_recent(&self, limit: usize) -> Vec<TxFeaturesRecord> {
-        let target = limit.max(1);
-        let mut out = Vec::with_capacity(target);
-        let mut emitted_hashes: FastSet<TxHash> = FastSet::default();
-
-        for row in self.tx_features.iter().rev() {
-            if !emitted_hashes.insert(row.hash) {
-                continue;
-            }
-            out.push(row.clone());
-            if out.len() >= target {
-                break;
-            }
-        }
-        out
-    }
-
-    pub fn dashboard_opportunities_recent(
-        &self,
-        limit: usize,
-        min_score: u32,
-    ) -> Vec<OpportunityRecord> {
-        let target = limit.max(1);
-        let mut out = Vec::with_capacity(target);
-        for row in self.opportunities.iter().rev() {
-            if row.score < min_score {
-                continue;
-            }
-            out.push(row.clone());
-            if out.len() >= target {
-                break;
-            }
-        }
-        out
-    }
-
     pub fn tx_lifecycle(&self) -> &VecDeque<TxLifecycleRecord> {
         &self.tx_lifecycle
     }
@@ -777,17 +741,6 @@ impl Default for StorageWriterConfig {
             queue_capacity: 8_192,
             flush_batch_size: 512,
             flush_interval_ms: 500,
-            wal_path: None,
-        }
-    }
-}
-
-impl StorageWriterConfig {
-    pub fn high_throughput_defaults() -> Self {
-        Self {
-            queue_capacity: 32_768,
-            flush_batch_size: 2_048,
-            flush_interval_ms: 100,
             wal_path: None,
         }
     }

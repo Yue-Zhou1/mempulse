@@ -9,7 +9,6 @@ use feature_engine::{analyze_decoded_transaction, version as feature_engine_vers
 use scoring::ScoreBreakdown;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use strategies::default_strategies;
 
 pub use scoring::ScoreBreakdown as OpportunityScoreBreakdown;
 pub use scoring::scorer_version;
@@ -88,20 +87,12 @@ pub fn rank_opportunity_batch(
     batch: &[SearcherInputTx<'_>],
     config: SearcherConfig,
 ) -> SearcherBatchResult {
-    let strategies = default_strategies();
     let mut candidates = Vec::new();
     let mut bundle_inputs = Vec::new();
 
     for input in batch {
         let featured = analyze_decoded_transaction(&input.decoded, input.calldata.as_ref());
-        let mut per_tx_candidates = Vec::new();
-        for strategy in &strategies {
-            if let Some(candidate) = strategy.evaluate(&featured)
-                && candidate.score >= config.min_score
-            {
-                per_tx_candidates.push(candidate);
-            }
-        }
+        let mut per_tx_candidates = strategies::rank_transaction(&featured, config.min_score);
         per_tx_candidates.sort_by(candidate_sort_key);
         if let Some(top_candidate) = per_tx_candidates.first().cloned() {
             bundle_inputs.push(BundleInput {
@@ -130,13 +121,6 @@ pub fn rank_opportunity_batch(
         },
         candidates,
     }
-}
-
-pub fn rank_opportunities(
-    batch: &[SearcherInputTx<'_>],
-    config: SearcherConfig,
-) -> Vec<OpportunityCandidate> {
-    rank_opportunity_batch(batch, config).candidates
 }
 
 #[derive(Clone, Debug)]

@@ -1,7 +1,9 @@
 mod mempool_state;
 
 use common::TxHash;
-use event_log::{EventEnvelope, EventPayload, sort_deterministic};
+#[cfg(test)]
+use event_log::EventPayload;
+use event_log::{EventEnvelope, sort_deterministic};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,24 +104,6 @@ pub fn lifecycle_snapshot(
     lifecycle_checkpoints(events, &[checkpoint_seq_id])
         .into_iter()
         .next()
-}
-
-pub fn candidate_lifecycle_snapshot(
-    events: &[EventEnvelope],
-    checkpoint_seq_id: u64,
-) -> Option<CandidateLifecycleSnapshot> {
-    let mut sorted = events.to_vec();
-    sort_deterministic(&mut sorted);
-
-    let mut state = CandidateLifecycleState::default();
-    for event in sorted {
-        state.apply_event(&event);
-        if event.seq_id == checkpoint_seq_id {
-            return Some(state.snapshot(event.seq_id));
-        }
-    }
-
-    None
 }
 
 pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
@@ -367,24 +351,6 @@ fn hash_sender_queues(hasher: &mut Sha256, sender_queues: &[ReplaySenderQueue]) 
             }
         }
     }
-}
-
-pub fn simulate_deterministic_window(
-    events: &[EventEnvelope],
-    chain_context: &SimulationChainContext,
-) -> anyhow::Result<SimulationBatchResult> {
-    let mut sorted = events.to_vec();
-    sort_deterministic(&mut sorted);
-
-    let decoded_txs = sorted
-        .into_iter()
-        .filter_map(|event| match event.payload {
-            EventPayload::TxDecoded(decoded) => Some(decoded),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    sim_engine::simulate_deterministic(chain_context, &decoded_txs)
 }
 
 pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLifecycleStatus> {

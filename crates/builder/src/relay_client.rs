@@ -69,13 +69,6 @@ impl RelayDryRunStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
-pub struct RelayHealthStatus {
-    pub consecutive_failures: u32,
-    pub downweighted: bool,
-    pub circuit_open: bool,
-}
-
 #[derive(Clone, Debug, Default)]
 struct RelayHealthState {
     consecutive_failures: u32,
@@ -200,19 +193,6 @@ impl RelayClient {
             started_unix_ms: started,
             finished_unix_ms: unix_ms_now(),
         })
-    }
-
-    pub fn health_status(&self) -> RelayHealthStatus {
-        let now = unix_ms_now();
-        let state = self
-            .health
-            .lock()
-            .expect("relay health lock should not be poisoned");
-        RelayHealthStatus {
-            consecutive_failures: state.consecutive_failures,
-            downweighted: now < state.downweighted_until_unix_ms,
-            circuit_open: now < state.circuit_open_until_unix_ms,
-        }
     }
 
     fn is_circuit_open(&self, now_unix_ms: i64) -> bool {

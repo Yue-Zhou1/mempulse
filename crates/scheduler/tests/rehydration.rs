@@ -2,7 +2,7 @@ use common::{Address, SourceId, TxHash};
 use event_log::TxDecoded;
 use scheduler::{
     PersistedSchedulerSnapshot, PersistedSenderQueueEntry, PersistedSenderQueueSnapshot,
-    SchedulerConfig, ValidatedTransaction, scheduler_channel, scheduler_channel_with_snapshot,
+    SchedulerConfig, ValidatedTransaction, scheduler_channel, scheduler_channel_with_rehydration,
 };
 use tokio::time::{Duration, Instant, sleep};
 
@@ -122,7 +122,7 @@ async fn scheduler_persisted_snapshot_captures_frontier_and_rehydrates_state() {
     runtime_task.abort();
 
     let (restored_handle, restored_runtime) =
-        scheduler_channel_with_snapshot(SchedulerConfig::default(), persisted)
+        scheduler_channel_with_rehydration(SchedulerConfig::default(), Some(persisted), Vec::new())
             .expect("rehydrate scheduler from persisted snapshot");
     let restored_runtime_task = tokio::spawn(restored_runtime.run());
 

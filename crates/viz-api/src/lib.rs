@@ -1330,18 +1330,6 @@ pub fn app_state_from_runtime_bootstrap(
     )
 }
 
-pub fn app_state_from_runtime_core(
-    runtime_core: &RuntimeCoreHandle,
-    runtime_views: RuntimeCoreViewProviders,
-) -> AppState {
-    let cache = ReplayRuntimeMetricsCache::new(runtime_core.storage().clone());
-    build_app_state(
-        runtime_core.storage().clone(),
-        runtime_views,
-        replay_runtime_metrics_provider(cache),
-    )
-}
-
 fn build_app_state(
     storage: Arc<RwLock<InMemoryStorage>>,
     runtime_views: RuntimeCoreViewProviders,
@@ -2606,23 +2594,6 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_searcher_max_executable_candidates_in_batch {}\n",
         searcher_metrics.max_executable_candidates_in_batch
     ));
-    // Compatibility-only legacy series retained for existing dashboards after the legacy shadow
-    // path was retired. They stay at zero in the current runtime path.
-    out.push_str("# TYPE mempulse_searcher_legacy_shadow_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_shadow_batches_total {}\n",
-        searcher_metrics.legacy_shadow_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_shadow_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_shadow_candidates_total {}\n",
-        searcher_metrics.legacy_shadow_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_max_legacy_shadow_candidates_in_batch gauge\n");
-    out.push_str(&format!(
-        "mempulse_searcher_max_legacy_shadow_candidates_in_batch {}\n",
-        searcher_metrics.max_legacy_shadow_candidates_in_batch
-    ));
     out.push_str("# TYPE mempulse_searcher_comparison_batches_total counter\n");
     out.push_str(&format!(
         "mempulse_searcher_comparison_batches_total {}\n",
@@ -2633,20 +2604,10 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_searcher_executable_top_score_total {}\n",
         searcher_metrics.executable_top_score_total
     ));
-    out.push_str("# TYPE mempulse_searcher_legacy_top_score_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_top_score_total {}\n",
-        searcher_metrics.legacy_top_score_total
-    ));
     out.push_str("# TYPE mempulse_searcher_executable_top_score_wins_total counter\n");
     out.push_str(&format!(
         "mempulse_searcher_executable_top_score_wins_total {}\n",
         searcher_metrics.executable_top_score_wins_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_top_score_wins_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_top_score_wins_total {}\n",
-        searcher_metrics.legacy_top_score_wins_total
     ));
     out.push_str("# TYPE mempulse_searcher_top_score_ties_total counter\n");
     out.push_str(&format!(
@@ -2662,11 +2623,6 @@ fn render_prometheus_metrics(state: &AppState) -> String {
     out.push_str(&format!(
         "mempulse_searcher_executable_only_candidates_total {}\n",
         searcher_metrics.executable_only_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_only_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_only_candidates_total {}\n",
-        searcher_metrics.legacy_only_candidates_total
     ));
     out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
     out.push_str(&format!(
@@ -2711,14 +2667,6 @@ fn render_prometheus_metrics(state: &AppState) -> String {
         "mempulse_replay_tail_reorged_tx_total {}\n",
         replay_metrics.reorg_depth
     ));
-    // Deprecated alias kept for compatibility; this counts replay-tail TxReorged events, not
-    // reorganized block depth.
-    out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_reorg_depth {}\n",
-        replay_metrics.reorg_depth
-    ));
-
     let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
     out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
     out.push_str(&format!(
@@ -4225,18 +4173,12 @@ mod tests {
                 executable_candidates_total: 22,
                 executable_bundle_candidates_total: 3,
                 max_executable_candidates_in_batch: 6,
-                legacy_shadow_batches_total: 10,
-                legacy_shadow_candidates_total: 20,
-                max_legacy_shadow_candidates_in_batch: 5,
                 comparison_batches_total: 9,
                 executable_top_score_total: 90_000,
-                legacy_top_score_total: 80_000,
                 executable_top_score_wins_total: 7,
-                legacy_top_score_wins_total: 1,
                 top_score_ties_total: 1,
                 overlapping_candidates_total: 12,
                 executable_only_candidates_total: 8,
-                legacy_only_candidates_total: 4,
             }),
             live_rpc_simulation_metrics_provider: Arc::new(
                 LiveRpcSimulationMetricsSnapshot::default,
@@ -4268,7 +4210,6 @@ mod tests {
         assert!(payload.contains("mempulse_searcher_max_executable_candidates_in_batch 6"));
         assert!(payload.contains("mempulse_searcher_comparison_batches_total 9"));
         assert!(payload.contains("mempulse_searcher_executable_top_score_wins_total 7"));
-        assert!(payload.contains("mempulse_searcher_legacy_only_candidates_total 4"));
     }
 
     #[tokio::test]

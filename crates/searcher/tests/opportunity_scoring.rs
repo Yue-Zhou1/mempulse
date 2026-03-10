@@ -1,6 +1,6 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
-use searcher::{SearcherConfig, SearcherInputTx, StrategyKind, rank_opportunities};
+use searcher::{SearcherConfig, SearcherInputTx, StrategyKind, rank_opportunity_batch};
 
 fn hash(v: u8) -> TxHash {
     [v; 32]
@@ -66,8 +66,8 @@ fn opportunity_scoring_is_deterministic_and_prunes() {
         min_score: 8_000,
         max_candidates: 3,
     };
-    let ranked_a = rank_opportunities(&batch, config);
-    let ranked_b = rank_opportunities(&batch, config);
+    let ranked_a = rank_opportunity_batch(&batch, config).candidates;
+    let ranked_b = rank_opportunity_batch(&batch, config).candidates;
 
     assert_eq!(ranked_a, ranked_b);
     assert_eq!(ranked_a.len(), 3);
@@ -131,13 +131,14 @@ fn contiguous_same_sender_swaps_produce_a_bundle_candidate() {
         ),
     ];
 
-    let ranked = rank_opportunities(
+    let ranked = rank_opportunity_batch(
         &batch,
         SearcherConfig {
             min_score: 0,
             max_candidates: 8,
         },
-    );
+    )
+    .candidates;
 
     assert!(ranked.iter().any(|candidate| {
         format!("{:?}", candidate.strategy) == "BundleCandidate"

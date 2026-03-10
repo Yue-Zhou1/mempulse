@@ -1,4 +1,4 @@
-use viz_api::live_rpc::{LiveRpcConfig, resolve_record_chain_id, worker_count_for_config};
+use viz_api::live_rpc::{LiveRpcConfig, resolve_record_chain_id};
 
 const ENV_CHAINS: &str = "VIZ_API_CHAINS";
 const ENV_MAX_SEEN_HASHES: &str = "VIZ_API_MAX_SEEN_HASHES";
@@ -42,7 +42,7 @@ fn multi_chain_ingest_config_parses_multiple_chains_and_spawns_workers() {
     assert_eq!(chain1.chain_id(), Some(8453));
     assert_eq!(chain1.source_id().to_string(), "rpc-base-mainnet");
 
-    assert_eq!(worker_count_for_config(&config), 2);
+    assert_eq!(config.chain_configs().len(), 2);
 
     unsafe {
         std::env::remove_var(ENV_CHAINS);

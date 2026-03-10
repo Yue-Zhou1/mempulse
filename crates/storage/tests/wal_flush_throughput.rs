@@ -61,17 +61,6 @@ impl ClickHouseBatchSink for RecordingSink {
     }
 }
 
-#[test]
-fn wal_flush_throughput_exposes_high_volume_tuning_presets() {
-    let writer = StorageWriterConfig::high_throughput_defaults();
-    assert!(writer.flush_batch_size > StorageWriterConfig::default().flush_batch_size);
-    assert!(writer.flush_interval_ms < StorageWriterConfig::default().flush_interval_ms);
-
-    let wal =
-        StorageWal::high_throughput(temp_wal_path("preset")).expect("create high throughput wal");
-    assert!(wal.segment_max_bytes() > 64 * 1024 * 1024);
-}
-
 #[tokio::test]
 async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate() {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
@@ -80,13 +69,15 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
         flush_sizes: flush_sizes.clone(),
     });
     let wal_path = temp_wal_path("high-rate");
-    let wal = StorageWal::high_throughput(&wal_path).expect("create throughput wal");
+    let wal =
+        StorageWal::with_segment_size(&wal_path, 256 * 1024 * 1024).expect("create throughput wal");
 
-    let mut writer_config = StorageWriterConfig::high_throughput_defaults();
-    writer_config.flush_batch_size = 64;
-    writer_config.flush_interval_ms = 20;
-    writer_config.queue_capacity = 2_048;
-    writer_config.wal_path = Some(wal_path.clone());
+    let writer_config = StorageWriterConfig {
+        queue_capacity: 2_048,
+        flush_batch_size: 64,
+        flush_interval_ms: 20,
+        wal_path: Some(wal_path.clone()),
+    };
     let handle = spawn_single_writer(storage.clone(), sink, writer_config);
 
     for seq in 1..=256_u64 {

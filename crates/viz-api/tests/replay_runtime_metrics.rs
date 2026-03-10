@@ -123,7 +123,6 @@ async fn metrics_route_reports_replay_lag_checkpoint_duration_and_reorg_tail_dep
 
     assert!(payload.contains("mempulse_replay_lag_events 1"));
     assert!(payload.contains("mempulse_replay_tail_reorged_tx_total 1"));
-    assert!(payload.contains("mempulse_replay_reorg_depth 1"));
     assert!(payload.contains("mempulse_replay_checkpoint_duration_ms "));
     assert!(!payload.contains("mempulse_replay_checkpoint_duration_ms 0"));
 }
@@ -182,7 +181,7 @@ async fn metrics_route_serves_cached_replay_metrics_until_background_refresh() {
 
     let initial_payload = wait_for_metric(
         &app,
-        "mempulse_replay_reorg_depth 0",
+        "mempulse_replay_tail_reorged_tx_total 0",
         Duration::from_secs(1),
     )
     .await;
@@ -209,13 +208,13 @@ async fn metrics_route_serves_cached_replay_metrics_until_background_refresh() {
         .expect("read metrics payload");
     let payload = String::from_utf8(body.to_vec()).expect("metrics payload is utf8");
     assert!(
-        payload.contains("mempulse_replay_reorg_depth 0"),
+        payload.contains("mempulse_replay_tail_reorged_tx_total 0"),
         "expected cached replay metrics before refresh, got: {payload}"
     );
 
     let refreshed_payload = wait_for_metric(
         &app,
-        "mempulse_replay_reorg_depth 1",
+        "mempulse_replay_tail_reorged_tx_total 1",
         Duration::from_secs(1),
     )
     .await;

@@ -1,8 +1,8 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
 use searcher::{
-    SearcherConfig, SearcherInputTx, StrategyKind, rank_opportunities, rank_opportunity_batch,
-    scorer_version, strategy_version,
+    SearcherConfig, SearcherInputTx, StrategyKind, rank_opportunity_batch, scorer_version,
+    strategy_version,
 };
 
 fn hash(v: u8) -> TxHash {
@@ -42,13 +42,14 @@ fn ranked_candidates_include_score_breakdown_and_reasons() {
         vec![0x38, 0xed, 0x17, 0x39, 1, 2, 3, 4, 5, 6, 7, 8],
     )];
 
-    let ranked = rank_opportunities(
+    let ranked = rank_opportunity_batch(
         &batch,
         SearcherConfig {
             min_score: 0,
             max_candidates: 8,
         },
-    );
+    )
+    .candidates;
 
     let top = ranked.first().expect("at least one candidate");
     assert!(!top.reasons.is_empty());
@@ -136,12 +137,5 @@ fn ranked_batch_reports_bounded_metrics_and_bundle_attribution() {
         .expect("bundle candidate included in bounded result");
     assert_eq!(bundle.member_tx_hashes, vec![hash(0x70), hash(0x71)]);
 
-    let wrapper_ranked = rank_opportunities(
-        &batch,
-        SearcherConfig {
-            min_score: 0,
-            max_candidates: 2,
-        },
-    );
-    assert_eq!(wrapper_ranked, result.candidates);
+    assert_eq!(result.candidates.len(), 2);
 }

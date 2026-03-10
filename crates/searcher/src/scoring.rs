@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const SCORER_VERSION: &str = "scorer.v1";
+const SCORER_VERSION: &str = "scorer.v1";
 
 pub const fn scorer_version() -> &'static str {
     SCORER_VERSION

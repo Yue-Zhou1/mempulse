@@ -1,6 +1,6 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
+use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_score: 8_000,
         max_candidates: 64,
     };
-    let ranked = rank_opportunities(&batch, config);
+    let ranked = rank_opportunity_batch(&batch, config).candidates;
 
     let truth_positive = dataset
         .iter()

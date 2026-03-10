@@ -4,11 +4,11 @@ pub mod live_rpc;
 
 use anyhow::Result;
 use builder::{AssemblyEngine, AssemblyMetrics, AssemblySnapshot};
-use common::{Address, TxHash};
+use common::Address;
 use scheduler::{SchedulerHandle, SchedulerMetrics, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use sim_engine::AccountSeed;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -61,19 +61,12 @@ pub struct LiveRpcSearcherMetricsSnapshot {
     pub executable_candidates_total: u64,
     pub executable_bundle_candidates_total: u64,
     pub max_executable_candidates_in_batch: u64,
-    // Compatibility fields retained for existing dashboards after the legacy shadow path removal.
-    pub legacy_shadow_batches_total: u64,
-    pub legacy_shadow_candidates_total: u64,
-    pub max_legacy_shadow_candidates_in_batch: u64,
     pub comparison_batches_total: u64,
     pub executable_top_score_total: u64,
-    pub legacy_top_score_total: u64,
     pub executable_top_score_wins_total: u64,
-    pub legacy_top_score_wins_total: u64,
     pub top_score_ties_total: u64,
     pub overlapping_candidates_total: u64,
     pub executable_only_candidates_total: u64,
-    pub legacy_only_candidates_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,13 +157,6 @@ struct RemoteStateCache {
     account_seeds: HashMap<(String, Address), CachedAccountSeed>,
 }
 
-#[derive(Default)]
-struct SimulationTaskStore {
-    task_generations: HashMap<String, u64>,
-    task_members: HashMap<String, Vec<TxHash>>,
-    tasks_by_member: HashMap<TxHash, HashSet<String>>,
-}
-
 pub struct RuntimeCore {
     deps: RuntimeCoreDeps,
     config: RuntimeCoreConfig,
@@ -180,7 +166,6 @@ pub struct RuntimeCore {
     simulation_metrics: Arc<RwLock<LiveRpcSimulationMetricsSnapshot>>,
     simulation_status: Arc<RwLock<SimulationStatusStore>>,
     chain_status: Arc<RwLock<BTreeMap<String, LiveRpcChainStatus>>>,
-    simulation_task_store: Arc<RwLock<SimulationTaskStore>>,
     simulation_cache: Arc<RwLock<RemoteStateCache>>,
     simulation_http_client: reqwest::Client,
     live_rpc_feed_start_count: AtomicU64,
@@ -208,7 +193,6 @@ impl RuntimeCore {
                 )),
                 simulation_status: Arc::new(RwLock::new(SimulationStatusStore::default())),
                 chain_status: Arc::new(RwLock::new(BTreeMap::new())),
-                simulation_task_store: Arc::new(RwLock::new(SimulationTaskStore::default())),
                 simulation_cache: Arc::new(RwLock::new(RemoteStateCache::default())),
                 simulation_http_client: reqwest::Client::new(),
                 live_rpc_feed_start_count: AtomicU64::new(0),
@@ -333,14 +317,10 @@ impl RuntimeCoreHandle {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn reset_live_rpc_feed_start_count(&self) {
-        self.inner
-            .live_rpc_feed_start_count
-            .store(0, Ordering::Relaxed);
-    }
-
     pub fn reset_drop_metrics(&self) {
-        self.replace_drop_metrics(LiveRpcDropMetricsSnapshot::default());
+        if let Ok(mut guard) = self.inner.drop_metrics.write() {
+            *guard = LiveRpcDropMetricsSnapshot::default();
+        }
     }
 
     pub fn observe_drop_reason(&self, reason: LiveRpcDropReason) {
@@ -356,12 +336,6 @@ impl RuntimeCoreHandle {
                     guard.invalid_pending_hash = guard.invalid_pending_hash.saturating_add(1);
                 }
             }
-        }
-    }
-
-    pub fn replace_drop_metrics(&self, snapshot: LiveRpcDropMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.drop_metrics.write() {
-            *guard = snapshot;
         }
     }
 
@@ -393,12 +367,6 @@ impl RuntimeCoreHandle {
             guard.executable_only_candidates_total = guard
                 .executable_only_candidates_total
                 .saturating_add(executable_count);
-        }
-    }
-
-    pub fn replace_searcher_metrics(&self, snapshot: LiveRpcSearcherMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.searcher_metrics.write() {
-            *guard = snapshot;
         }
     }
 
@@ -514,23 +482,10 @@ impl RuntimeCoreHandle {
         }
     }
 
-    pub fn replace_simulation_metrics(&self, snapshot: LiveRpcSimulationMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            *guard = snapshot;
-        }
-    }
-
     pub fn record_simulation_status(&self, snapshot: LiveRpcSimulationStatusSnapshot) {
         if let Ok(mut guard) = self.inner.simulation_status.write() {
             guard.latest = Some(snapshot.clone());
             guard.by_id.insert(snapshot.id.clone(), snapshot);
-        }
-    }
-
-    pub fn clear_simulation_status(&self) {
-        if let Ok(mut guard) = self.inner.simulation_status.write() {
-            guard.latest = None;
-            guard.by_id.clear();
         }
     }
 
@@ -576,22 +531,6 @@ impl RuntimeCoreHandle {
         }
     }
 
-    #[cfg(test)]
-    pub fn clear_simulation_cache(&self) {
-        if let Ok(mut cache) = self.inner.simulation_cache.write() {
-            cache.account_seeds.clear();
-        }
-    }
-
-    pub fn replace_chain_status(&self, statuses: Vec<LiveRpcChainStatus>) {
-        if let Ok(mut guard) = self.inner.chain_status.write() {
-            guard.clear();
-            for status in statuses {
-                guard.insert(status.chain_key.clone(), status);
-            }
-        }
-    }
-
     pub fn reset_chain_status(&self) {
         if let Ok(mut guard) = self.inner.chain_status.write() {
             guard.clear();
@@ -604,46 +543,6 @@ impl RuntimeCoreHandle {
         }
     }
 
-    pub fn next_simulation_generation(&self, task_key: &str) -> u64 {
-        self.inner
-            .simulation_task_store
-            .read()
-            .map(|store| store.current_generation(task_key).saturating_add(1).max(1))
-            .unwrap_or(1)
-    }
-
-    pub fn commit_simulation_enqueue(&self, task_key: &str, generation: u64, members: &[TxHash]) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.commit_enqueue(task_key, generation, members);
-        }
-    }
-
-    pub fn is_current_simulation_task(&self, task_key: &str, generation: u64) -> bool {
-        self.inner
-            .simulation_task_store
-            .read()
-            .map(|store| store.is_current(task_key, generation))
-            .unwrap_or(false)
-    }
-
-    pub fn invalidate_simulation_hash(&self, hash: TxHash) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.invalidate_hash(hash);
-        }
-    }
-
-    pub fn complete_simulation_task(&self, task_key: &str, generation: u64) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.complete_current(task_key, generation);
-        }
-    }
-
-    pub fn reset_simulation_task_state(&self) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.clear();
-        }
-    }
-
     pub fn with_builder_engine_mut<R>(&self, f: impl FnOnce(&mut AssemblyEngine) -> R) -> R {
         let mut guard = self
             .inner
@@ -651,12 +550,6 @@ impl RuntimeCoreHandle {
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
         f(&mut guard)
-    }
-
-    pub fn reset_builder_state(&self) {
-        if let Ok(mut guard) = self.inner.builder_engine.write() {
-            *guard = AssemblyEngine::new(builder::AssemblyConfig::default());
-        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -668,96 +561,6 @@ impl RuntimeCoreHandle {
 struct SimulationStatusStore {
     latest: Option<LiveRpcSimulationStatusSnapshot>,
     by_id: HashMap<String, LiveRpcSimulationStatusSnapshot>,
-}
-
-impl SimulationTaskStore {
-    fn current_generation(&self, task_key: &str) -> u64 {
-        self.task_generations.get(task_key).copied().unwrap_or(0)
-    }
-
-    fn replace_membership(&mut self, task_key: &str, members: &[TxHash]) {
-        if let Some(previous) = self
-            .task_members
-            .insert(task_key.to_owned(), members.to_vec())
-        {
-            for member in previous {
-                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                    keys.remove(task_key);
-                    if keys.is_empty() {
-                        self.tasks_by_member.remove(&member);
-                    }
-                }
-            }
-        }
-
-        for member in members {
-            self.tasks_by_member
-                .entry(*member)
-                .or_default()
-                .insert(task_key.to_owned());
-        }
-    }
-
-    fn commit_enqueue(&mut self, task_key: &str, generation: u64, members: &[TxHash]) {
-        self.task_generations
-            .insert(task_key.to_owned(), generation);
-        self.replace_membership(task_key, members);
-    }
-
-    fn is_current(&self, task_key: &str, generation: u64) -> bool {
-        self.current_generation(task_key) == generation
-    }
-
-    fn invalidate_hash(&mut self, hash: TxHash) {
-        let Some(task_keys) = self.tasks_by_member.remove(&hash) else {
-            return;
-        };
-
-        for task_key in task_keys {
-            let next_generation = self.current_generation(&task_key).saturating_add(1).max(1);
-            self.task_generations
-                .insert(task_key.clone(), next_generation);
-
-            if let Some(previous_members) = self.task_members.remove(&task_key) {
-                for member in previous_members {
-                    if member == hash {
-                        continue;
-                    }
-
-                    if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                        keys.remove(&task_key);
-                        if keys.is_empty() {
-                            self.tasks_by_member.remove(&member);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn complete_current(&mut self, task_key: &str, generation: u64) {
-        if !self.is_current(task_key, generation) {
-            return;
-        }
-
-        self.task_generations.remove(task_key);
-        if let Some(previous_members) = self.task_members.remove(task_key) {
-            for member in previous_members {
-                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                    keys.remove(task_key);
-                    if keys.is_empty() {
-                        self.tasks_by_member.remove(&member);
-                    }
-                }
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.task_generations.clear();
-        self.task_members.clear();
-        self.tasks_by_member.clear();
-    }
 }
 
 fn current_unix_ms() -> i64 {
