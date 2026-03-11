@@ -3,7 +3,6 @@ pub mod live_rpc;
 pub mod stream_broadcast;
 
 use auth::{ApiAuthConfig, ApiRateLimiter};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
@@ -373,14 +372,6 @@ pub struct TransactionDetail {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamV2Hello {
-    pub op: String,
-    pub heartbeat_interval_ms: u64,
-    pub session_id: String,
-    pub server_time_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2838,22 +2829,9 @@ fn sim_id_for_result(result: &RelayDryRunResult) -> String {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[allow(dead_code)]
 struct StreamQuery {
     after: Option<u64>,
-    limit: Option<usize>,
     interval_ms: Option<u64>,
-    initial_credit: Option<u32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[allow(dead_code)]
-struct StreamV2ClientMessage {
-    op: String,
-    amount: Option<u32>,
-    channel_credit: Option<HashMap<String, u32>>,
-    snapshot_seq: Option<u64>,
-    last_seq: Option<u64>,
 }
 
 const DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY: usize = 256;
@@ -2903,37 +2881,6 @@ fn spawn_dashboard_stream_broadcaster_producer(
             after_seq_id = after_seq_id.max(latest_seq_id);
         }
     });
-}
-
-#[allow(dead_code)]
-async fn stream_v2(
-    State(state): State<AppState>,
-    Query(query): Query<StreamQuery>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    let after_seq_id = query.after.unwrap_or(0);
-    let batch_limit = query.limit.unwrap_or(20).clamp(1, 200);
-    let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
-    let initial_credit = query.initial_credit.unwrap_or(0).min(256);
-    let provider = state.provider.clone();
-
-    let hello = StreamV2Hello {
-        op: "HELLO".to_owned(),
-        heartbeat_interval_ms: 15_000,
-        session_id: format!("sess_{}", now_unix_ms()),
-        server_time_unix_ms: now_unix_ms(),
-    };
-    ws.on_upgrade(move |socket| {
-        handle_socket_v2(
-            socket,
-            hello,
-            provider,
-            after_seq_id,
-            batch_limit,
-            interval_ms,
-            initial_credit,
-        )
-    })
 }
 
 async fn events_v1(
@@ -3086,14 +3033,6 @@ fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent
         .id(frame.id)
         .event(frame.event)
         .data(frame.data)
-}
-
-#[allow(dead_code)]
-fn now_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn transaction_summary_from_event(event: &EventEnvelope) -> Option<TransactionSummary> {
@@ -3286,175 +3225,6 @@ fn build_dashboard_events_v1_dispatch(
         },
         market_stats: provider.market_stats(),
     })
-}
-
-#[allow(dead_code)]
-fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
-    if let Some(amount) = message.amount {
-        return amount.clamp(1, 256);
-    }
-    if let Some(channel_credit) = message.channel_credit.as_ref() {
-        if let Some(amount) = channel_credit.get("tx.main") {
-            return (*amount).clamp(1, 256);
-        }
-    }
-    1
-}
-
-#[allow(dead_code)]
-async fn handle_socket_v2(
-    mut socket: WebSocket,
-    hello: StreamV2Hello,
-    provider: Arc<dyn VizDataProvider>,
-    mut after_seq_id: u64,
-    batch_limit: usize,
-    interval_ms: u64,
-    initial_credit: u32,
-) {
-    if let Ok(payload) = serde_json::to_string(&hello)
-        && socket.send(Message::Text(payload.into())).await.is_err()
-    {
-        return;
-    }
-
-    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut credits = initial_credit;
-    let page_limit = batch_limit.max(1);
-    let max_scan_events_per_tick = page_limit.saturating_mul(64).max(64);
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                if credits == 0 {
-                    continue;
-                }
-                let events = provider.events(after_seq_id, &[], max_scan_events_per_tick);
-                if events.is_empty() {
-                    continue;
-                }
-
-                let mut seq_start = 0_u64;
-                let mut seq_end = after_seq_id;
-                let mut has_gap = false;
-                let mut transactions = Vec::new();
-                let mut feature_upsert = Vec::new();
-                let mut opportunity_upsert = Vec::new();
-
-                for event in events {
-                    if event.seq_id <= after_seq_id {
-                        continue;
-                    }
-                    if seq_start == 0 {
-                        seq_start = event.seq_id;
-                        if after_seq_id > 0 && seq_start > after_seq_id.saturating_add(1) {
-                            has_gap = true;
-                        }
-                    }
-                    after_seq_id = event.seq_id;
-                    seq_end = event.seq_id;
-                    if let Some(summary) = transaction_summary_from_event(&event) {
-                        let hash = summary.hash.clone();
-                        let dropped = push_stream_summary_with_cap(
-                            &mut transactions,
-                            summary,
-                            page_limit,
-                        );
-                        has_gap = has_gap || dropped;
-                        if let Some(feature) = feature_detail_for_hash(provider.as_ref(), &hash) {
-                            let dropped = push_stream_feature_with_cap(
-                                &mut feature_upsert,
-                                feature,
-                                page_limit,
-                            );
-                            has_gap = has_gap || dropped;
-                        }
-                    }
-                    if let Some(opportunity) = opportunity_detail_from_event(provider.as_ref(), &event)
-                    {
-                        let dropped = push_stream_opportunity_with_cap(
-                            &mut opportunity_upsert,
-                            opportunity,
-                            page_limit,
-                        );
-                        has_gap = has_gap || dropped;
-                    }
-                }
-
-                if seq_start == 0
-                    || (transactions.is_empty()
-                        && feature_upsert.is_empty()
-                        && opportunity_upsert.is_empty())
-                {
-                    continue;
-                }
-
-                let payload = match serde_json::to_string(&StreamV2Dispatch {
-                    op: "DISPATCH".to_owned(),
-                    event_type: "DELTA_BATCH".to_owned(),
-                    seq: seq_end,
-                    channel: "tx.main".to_owned(),
-                    has_gap,
-                    patch: StreamV2Patch {
-                        upsert: transactions,
-                        remove: Vec::new(),
-                        feature_upsert,
-                        opportunity_upsert,
-                    },
-                    watermark: StreamV2Watermark {
-                        latest_ingest_seq: seq_end,
-                    },
-                    market_stats: provider.market_stats(),
-                }) {
-                    Ok(payload) => payload,
-                    Err(_) => continue,
-                };
-
-                if socket.send(Message::Text(payload.into())).await.is_err() {
-                    return;
-                }
-                credits = credits.saturating_sub(1);
-            }
-            maybe_message = socket.recv() => match maybe_message {
-                None => break,
-                Some(Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Text(text))) => {
-                    let Ok(message) = serde_json::from_str::<StreamV2ClientMessage>(&text) else {
-                        continue;
-                    };
-                    if message.op.eq_ignore_ascii_case("IDENTIFY") {
-                        if let Some(snapshot_seq) = message.snapshot_seq {
-                            after_seq_id = after_seq_id.max(snapshot_seq);
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("RESUME") {
-                        if let Some(last_seq) = message.last_seq {
-                            after_seq_id = after_seq_id.max(last_seq);
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("HEARTBEAT") {
-                        let ack = serde_json::json!({ "op": "HEARTBEAT_ACK" });
-                        if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("CREDIT") {
-                        credits = credits.saturating_add(resolve_stream_v2_credit(&message));
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    if socket.send(Message::Pong(data)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
