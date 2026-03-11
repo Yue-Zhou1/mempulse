@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use common::{Address, BlockHash, PeerId, SourceId, TxHash};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;

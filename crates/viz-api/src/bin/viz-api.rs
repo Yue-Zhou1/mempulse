@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::Result;
 use node_runtime::{IngestMode, NodeRuntimeBuilder};
 use runtime_core::RuntimeIngestMode;

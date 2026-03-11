@@ -59,7 +59,8 @@ async fn wait_for(predicate: impl Fn() -> bool) {
 
 #[tokio::test]
 async fn scheduler_persisted_snapshot_captures_frontier_and_rehydrates_state() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender_a = sender(0xa1);
@@ -143,7 +144,8 @@ async fn scheduler_persisted_snapshot_captures_frontier_and_rehydrates_state() {
 
 #[tokio::test]
 async fn scheduler_get_pending_transactions_returns_requested_hashes_in_input_order() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender_a = sender(0xa1);

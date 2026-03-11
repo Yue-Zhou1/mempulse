@@ -1,0 +1,1 @@
+{"pending_count":256,"tail_event_count":32,"replay_event_count":32,"snapshot_present":true,"iterations":40,"write_p50_us":3,"write_p95_us":5,"write_p99_us":7,"write_avg_us":3,"rehydrate_p50_us":108,"rehydrate_p95_us":151,"rehydrate_p99_us":163,"rehydrate_avg_us":115}

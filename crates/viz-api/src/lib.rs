@@ -1,7 +1,10 @@
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod live_rpc;
 pub mod stream_broadcast;
 
+use auto_impl::auto_impl;
 use auth::{ApiAuthConfig, ApiRateLimiter};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -20,6 +23,7 @@ use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
     LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
 };
+use parking_lot::RwLock;
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
@@ -36,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
@@ -184,9 +188,9 @@ pub struct RuntimeBootstrap {
     /// before relying on live ingest to converge pending state.
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
-    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    scheduler_snapshot_writer_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
-    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     pub ingest_mode: IngestSourceMode,
 }
 
@@ -195,9 +199,9 @@ pub struct RuntimeBootstrapStartup {
     pub live_rpc_config: LiveRpcConfig,
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
-    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    scheduler_snapshot_writer_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
-    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
 }
 
 impl RuntimeBootstrap {
@@ -477,14 +481,12 @@ impl ReplayRuntimeMetricsCache {
     }
 
     fn snapshot(&self) -> ReplayRuntimeMetricsSnapshot {
-        self.snapshot.read().map(|guard| *guard).unwrap_or_default()
+        *self.snapshot.read()
     }
 
     fn refresh(&self) {
         let next = build_replay_runtime_metrics(&self.storage);
-        if let Ok(mut guard) = self.snapshot.write() {
-            *guard = next;
-        }
+        *self.snapshot.write() = next;
     }
 }
 
@@ -562,9 +564,11 @@ fn map_market_stats(snapshot: MarketStatsSnapshot) -> MarketStats {
     }
 }
 
+#[auto_impl(&, Box, Arc)]
 pub trait VizDataProvider: Send + Sync {
     fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
     -> Vec<EventEnvelope>;
+    #[must_use = "callers should inspect the latest sequence id when serving incremental data"]
     fn latest_seq_id(&self) -> Option<u64>;
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
@@ -576,6 +580,7 @@ pub trait VizDataProvider: Send + Sync {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
     fn market_stats(&self) -> MarketStats;
     fn dashboard_cache_metrics(&self) -> DashboardCacheMetrics;
+    #[must_use]
     fn dashboard_snapshot_v2(
         &self,
         tx_limit: usize,
@@ -665,23 +670,14 @@ impl InMemoryVizProvider {
     }
 
     pub fn dashboard_cache_refreshes(&self) -> u64 {
-        self.dashboard_cache
-            .read()
-            .map(|cache| cache.refreshes)
-            .unwrap_or(0)
+        self.dashboard_cache.read().refreshes
     }
 
     fn dashboard_cache_snapshot(&self) -> DashboardReadCache {
-        let storage = match self.storage.read() {
-            Ok(storage) => storage,
-            Err(_) => return DashboardReadCache::default(),
-        };
+        let storage = self.storage.read();
         let revision = storage.read_model_revision();
 
-        let mut cache = match self.dashboard_cache.write() {
-            Ok(cache) => cache,
-            Err(_) => return DashboardReadCache::default(),
-        };
+        let mut cache = self.dashboard_cache.write();
         if cache.revision != Some(revision) {
             let build_started_at = Instant::now();
             cache.revision = Some(revision);
@@ -856,23 +852,18 @@ impl VizDataProvider for InMemoryVizProvider {
         event_types: &[String],
         limit: usize,
     ) -> Vec<EventEnvelope> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                storage
-                    .scan_events(after_seq_id, limit.saturating_mul(2).max(limit))
-                    .into_iter()
-                    .filter(|event| {
-                        event_types.is_empty()
-                            || event_types.iter().any(|kind| {
-                                event_payload_type(&event.payload).eq_ignore_ascii_case(kind)
-                            })
-                    })
-                    .take(limit)
-                    .collect()
+        let storage = self.storage.read();
+        storage
+            .scan_events(after_seq_id, limit.saturating_mul(2).max(limit))
+            .into_iter()
+            .filter(|event| {
+                event_types.is_empty()
+                    || event_types
+                        .iter()
+                        .any(|kind| event_payload_type(&event.payload).eq_ignore_ascii_case(kind))
             })
-            .unwrap_or_default()
+            .take(limit)
+            .collect()
     }
 
     fn replay_points(&self) -> Vec<ReplayPoint> {
@@ -880,10 +871,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn latest_seq_id(&self) -> Option<u64> {
-        self.storage
-            .read()
-            .ok()
-            .and_then(|storage| storage.latest_seq_id())
+        self.storage.read().latest_seq_id()
     }
 
     fn propagation_edges(&self) -> Vec<PropagationEdge> {
@@ -920,45 +908,33 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                storage
-                    .recent_transactions(limit)
-                    .into_iter()
-                    .map(|tx| TransactionSummary {
-                        hash: format_bytes(&tx.hash),
-                        sender: format_bytes(&tx.sender),
-                        nonce: tx.nonce,
-                        tx_type: tx.tx_type,
-                        seen_unix_ms: tx.seen_unix_ms,
-                        source_id: tx.source_id,
-                    })
-                    .collect()
+        let storage = self.storage.read();
+        storage
+            .recent_transactions(limit)
+            .into_iter()
+            .map(|tx| TransactionSummary {
+                hash: format_bytes(&tx.hash),
+                sender: format_bytes(&tx.sender),
+                nonce: tx.nonce,
+                tx_type: tx.tx_type,
+                seen_unix_ms: tx.seen_unix_ms,
+                source_id: tx.source_id,
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn market_stats(&self) -> MarketStats {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| map_market_stats(storage.market_stats_snapshot()))
-            .unwrap_or_else(|| map_market_stats(MarketStatsSnapshot::default()))
+        map_market_stats(self.storage.read().market_stats_snapshot())
     }
 
     fn dashboard_cache_metrics(&self) -> DashboardCacheMetrics {
-        self.dashboard_cache
-            .read()
-            .ok()
-            .map(|cache| DashboardCacheMetrics {
-                refresh_total: cache.refreshes,
-                last_build_duration_ns: cache.last_build_duration_ns,
-                total_build_duration_ns: cache.total_build_duration_ns,
-                estimated_bytes: cache.estimated_bytes,
-            })
-            .unwrap_or_default()
+        let cache = self.dashboard_cache.read();
+        DashboardCacheMetrics {
+            refresh_total: cache.refreshes,
+            last_build_duration_ns: cache.last_build_duration_ns,
+            total_build_duration_ns: cache.total_build_duration_ns,
+            estimated_bytes: cache.estimated_bytes,
+        }
     }
 
     fn dashboard_snapshot_v2(
@@ -978,178 +954,90 @@ impl VizDataProvider for InMemoryVizProvider {
         let opp_scan_limit = chain_filter_scan_limit(opp_limit, chain_id);
         let tx_scan_limit = chain_filter_scan_limit(tx_limit, chain_id);
 
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let feature_summary = build_feature_summary(&storage)
-                    .into_iter()
-                    .take(summary_limit)
-                    .collect::<Vec<_>>();
+        let storage = self.storage.read();
+        let feature_summary = build_feature_summary(&storage)
+            .into_iter()
+            .take(summary_limit)
+            .collect::<Vec<_>>();
 
-                let feature_details = build_feature_details(&storage)
-                    .into_iter()
-                    .take(feature_scan_limit)
-                    .filter(|row| chain_matches_filter(row.chain_id, chain_id))
-                    .take(feature_limit)
-                    .collect::<Vec<_>>();
+        let feature_details = build_feature_details(&storage)
+            .into_iter()
+            .take(feature_scan_limit)
+            .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+            .take(feature_limit)
+            .collect::<Vec<_>>();
 
-                let opportunities = build_opportunities(&storage)
-                    .into_iter()
-                    .filter(|row| row.score >= min_score)
-                    .take(opp_scan_limit)
-                    .filter(|row| chain_matches_filter(row.chain_id, chain_id))
-                    .take(opp_limit)
-                    .collect::<Vec<_>>();
+        let opportunities = build_opportunities(&storage)
+            .into_iter()
+            .filter(|row| row.score >= min_score)
+            .take(opp_scan_limit)
+            .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+            .take(opp_limit)
+            .collect::<Vec<_>>();
 
-                let mut chain_id_by_hash = HashMap::new();
-                for row in storage.tx_full() {
-                    chain_id_by_hash.insert(row.hash, row.chain_id);
-                }
+        let mut chain_id_by_hash = HashMap::new();
+        for row in storage.tx_full() {
+            chain_id_by_hash.insert(row.hash, row.chain_id);
+        }
 
-                let mut transactions = Vec::with_capacity(tx_limit);
-                for row in storage.recent_transactions(tx_scan_limit) {
-                    let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
-                    if !chain_matches_filter(row_chain_id, chain_id) {
-                        continue;
-                    }
+        let mut transactions = Vec::with_capacity(tx_limit);
+        for row in storage.recent_transactions(tx_scan_limit) {
+            let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
+            if !chain_matches_filter(row_chain_id, chain_id) {
+                continue;
+            }
 
-                    transactions.push(TransactionSummary {
-                        hash: format_bytes(&row.hash),
-                        sender: format_bytes(&row.sender),
-                        nonce: row.nonce,
-                        tx_type: row.tx_type,
-                        seen_unix_ms: row.seen_unix_ms,
-                        source_id: row.source_id,
-                    });
-                    if transactions.len() >= tx_limit {
-                        break;
-                    }
-                }
+            transactions.push(TransactionSummary {
+                hash: format_bytes(&row.hash),
+                sender: format_bytes(&row.sender),
+                nonce: row.nonce,
+                tx_type: row.tx_type,
+                seen_unix_ms: row.seen_unix_ms,
+                source_id: row.source_id,
+            });
+            if transactions.len() >= tx_limit {
+                break;
+            }
+        }
 
-                DashboardSnapshotV2 {
-                    revision: storage.read_model_revision(),
-                    latest_seq_id: storage.latest_seq_id().unwrap_or(0),
-                    opportunities,
-                    feature_summary,
-                    feature_details,
-                    transactions,
-                    chain_ingest_status: Vec::new(),
-                    market_stats: map_market_stats(storage.market_stats_snapshot()),
-                }
-            })
-            .unwrap_or_else(|| DashboardSnapshotV2 {
-                revision: 0,
-                latest_seq_id: 0,
-                opportunities: Vec::new(),
-                feature_summary: Vec::new(),
-                feature_details: Vec::new(),
-                transactions: Vec::new(),
-                chain_ingest_status: Vec::new(),
-                market_stats: map_market_stats(MarketStatsSnapshot::default()),
-            })
+        DashboardSnapshotV2 {
+            revision: storage.read_model_revision(),
+            latest_seq_id: storage.latest_seq_id().unwrap_or(0),
+            opportunities,
+            feature_summary,
+            feature_details,
+            transactions,
+            chain_ingest_status: Vec::new(),
+            market_stats: map_market_stats(storage.market_stats_snapshot()),
+        }
     }
 
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let mut full_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_full() {
-                    full_by_hash.insert(row.hash, row);
-                }
-                let mut feature_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_features() {
-                    feature_by_hash.insert(row.hash, row);
-                }
-                let mut lifecycle_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_lifecycle() {
-                    lifecycle_by_hash.insert(row.hash, row);
-                }
+        let storage = self.storage.read();
+        let mut full_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_full() {
+            full_by_hash.insert(row.hash, row);
+        }
+        let mut feature_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_features() {
+            feature_by_hash.insert(row.hash, row);
+        }
+        let mut lifecycle_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_lifecycle() {
+            lifecycle_by_hash.insert(row.hash, row);
+        }
 
-                let mut emitted = std::collections::HashSet::new();
-                let mut out = Vec::new();
+        let mut emitted = std::collections::HashSet::new();
+        let mut out = Vec::new();
 
-                for seen in storage.tx_seen().iter().rev() {
-                    if !emitted.insert(seen.hash) {
-                        continue;
-                    }
-                    let full = full_by_hash.get(&seen.hash).copied();
-                    let feature = feature_by_hash.get(&seen.hash).copied();
-                    let lifecycle = lifecycle_by_hash.get(&seen.hash).copied();
-                    out.push(TransactionDetail {
-                        hash: format_bytes(&seen.hash),
-                        peer: seen.peer.clone(),
-                        first_seen_unix_ms: seen.first_seen_unix_ms,
-                        seen_count: seen.seen_count,
-                        tx_type: full.map(|row| row.tx_type),
-                        sender: full.map(|row| format_bytes(&row.sender)),
-                        to: full.and_then(|row| row.to.as_ref().map(|to| format_bytes(to))),
-                        chain_id: full.and_then(|row| row.chain_id),
-                        nonce: full.map(|row| row.nonce),
-                        value_wei: full.and_then(|row| row.value_wei),
-                        gas_limit: full.and_then(|row| row.gas_limit),
-                        gas_price_wei: full.and_then(|row| row.gas_price_wei),
-                        max_fee_per_gas_wei: full.and_then(|row| row.max_fee_per_gas_wei),
-                        max_priority_fee_per_gas_wei: full
-                            .and_then(|row| row.max_priority_fee_per_gas_wei),
-                        max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
-                        calldata_len: full.and_then(|row| row.calldata_len),
-                        raw_tx_len: full.map(|row| row.raw_tx.len()),
-                        lifecycle_status: lifecycle.map(|row| row.status.clone()),
-                        lifecycle_reason: lifecycle.and_then(|row| row.reason.clone()),
-                        lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
-                        protocol: feature.map(|row| row.protocol.clone()),
-                        category: feature.map(|row| row.category.clone()),
-                        mev_score: feature.map(|row| row.mev_score),
-                        urgency_score: feature.map(|row| row.urgency_score),
-                        feature_engine_version: feature
-                            .map(|row| row.feature_engine_version.clone()),
-                    });
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
-
-                out
-            })
-            .unwrap_or_default()
-    }
-
-    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
-        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
-        self.storage.read().ok().and_then(|storage| {
-            let seen = storage
-                .tx_seen()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash)?;
-            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
-            let feature = storage
-                .tx_features()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
-            let lifecycle = storage
-                .tx_lifecycle()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
-            let fallback_lifecycle = lifecycle
-                .is_none()
-                .then(|| current_lifecycle(&storage.list_events(), hash));
-            let (lifecycle_status, lifecycle_reason) = lifecycle
-                .map(|row| (Some(row.status.clone()), row.reason.clone()))
-                .unwrap_or_else(|| {
-                    fallback_lifecycle
-                        .flatten()
-                        .as_ref()
-                        .map(map_lifecycle_status)
-                        .map(|(status, reason)| (Some(status), reason))
-                        .unwrap_or((None, None))
-                });
-            Some(TransactionDetail {
+        for seen in storage.tx_seen().iter().rev() {
+            if !emitted.insert(seen.hash) {
+                continue;
+            }
+            let full = full_by_hash.get(&seen.hash).copied();
+            let feature = feature_by_hash.get(&seen.hash).copied();
+            let lifecycle = lifecycle_by_hash.get(&seen.hash).copied();
+            out.push(TransactionDetail {
                 hash: format_bytes(&seen.hash),
                 peer: seen.peer.clone(),
                 first_seen_unix_ms: seen.first_seen_unix_ms,
@@ -1167,30 +1055,88 @@ impl VizDataProvider for InMemoryVizProvider {
                 max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
                 calldata_len: full.and_then(|row| row.calldata_len),
                 raw_tx_len: full.map(|row| row.raw_tx.len()),
-                lifecycle_status,
-                lifecycle_reason,
+                lifecycle_status: lifecycle.map(|row| row.status.clone()),
+                lifecycle_reason: lifecycle.and_then(|row| row.reason.clone()),
                 lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
                 protocol: feature.map(|row| row.protocol.clone()),
                 category: feature.map(|row| row.category.clone()),
                 mev_score: feature.map(|row| row.mev_score),
                 urgency_score: feature.map(|row| row.urgency_score),
                 feature_engine_version: feature.map(|row| row.feature_engine_version.clone()),
-            })
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        out
+    }
+
+    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
+        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
+        let storage = self.storage.read();
+        let seen = storage
+            .tx_seen()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash)?;
+        let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+        let feature = storage
+            .tx_features()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash);
+        let lifecycle = storage
+            .tx_lifecycle()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash);
+        let fallback_lifecycle = lifecycle
+            .is_none()
+            .then(|| current_lifecycle(&storage.list_events(), hash));
+        let (lifecycle_status, lifecycle_reason) = lifecycle
+            .map(|row| (Some(row.status.clone()), row.reason.clone()))
+            .unwrap_or_else(|| {
+                fallback_lifecycle
+                    .flatten()
+                    .as_ref()
+                    .map(map_lifecycle_status)
+                    .map(|(status, reason)| (Some(status), reason))
+                    .unwrap_or((None, None))
+            });
+        Some(TransactionDetail {
+            hash: format_bytes(&seen.hash),
+            peer: seen.peer.clone(),
+            first_seen_unix_ms: seen.first_seen_unix_ms,
+            seen_count: seen.seen_count,
+            tx_type: full.map(|row| row.tx_type),
+            sender: full.map(|row| format_bytes(&row.sender)),
+            to: full.and_then(|row| row.to.as_ref().map(|to| format_bytes(to))),
+            chain_id: full.and_then(|row| row.chain_id),
+            nonce: full.map(|row| row.nonce),
+            value_wei: full.and_then(|row| row.value_wei),
+            gas_limit: full.and_then(|row| row.gas_limit),
+            gas_price_wei: full.and_then(|row| row.gas_price_wei),
+            max_fee_per_gas_wei: full.and_then(|row| row.max_fee_per_gas_wei),
+            max_priority_fee_per_gas_wei: full.and_then(|row| row.max_priority_fee_per_gas_wei),
+            max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
+            calldata_len: full.and_then(|row| row.calldata_len),
+            raw_tx_len: full.map(|row| row.raw_tx.len()),
+            lifecycle_status,
+            lifecycle_reason,
+            lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
+            protocol: feature.map(|row| row.protocol.clone()),
+            category: feature.map(|row| row.category.clone()),
+            mev_score: feature.map(|row| row.mev_score),
+            urgency_score: feature.map(|row| row.urgency_score),
+            feature_engine_version: feature.map(|row| row.feature_engine_version.clone()),
         })
     }
 
     fn metric_snapshot(&self) -> MetricSnapshot {
-        let (tx_seen_len, tx_full_len) = self
-            .storage
-            .read()
-            .ok()
-            .map(|storage| {
-                (
-                    storage.tx_seen().len() as u64,
-                    storage.tx_full().len() as u64,
-                )
-            })
-            .unwrap_or((0, 0));
+        let storage = self.storage.read();
+        let tx_seen_len = storage.tx_seen().len() as u64;
+        let tx_full_len = storage.tx_full().len() as u64;
         let queue_depth_capacity = 10_000_u64;
 
         MetricSnapshot {
@@ -1388,9 +1334,7 @@ fn start_runtime_core_for_bootstrap(bootstrap: &RuntimeBootstrap) -> RuntimeCore
 fn build_replay_runtime_metrics(
     storage: &Arc<RwLock<InMemoryStorage>>,
 ) -> ReplayRuntimeMetricsSnapshot {
-    let Ok(storage) = storage.read() else {
-        return ReplayRuntimeMetricsSnapshot::default();
-    };
+    let storage = storage.read();
 
     let latest_seq_id = storage.latest_seq_id().unwrap_or(0);
     let checkpoint_seq_id = storage
@@ -1446,24 +1390,19 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
     let rehydration_plan = storage
         .read()
-        .ok()
-        .map(|guard| guard.scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms))
-        .unwrap_or_default();
+        .scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms);
     let mut rebuild_scheduler_from_rpc = rehydration_plan.requires_rpc_rebuild;
     let replay_events = rehydration_plan.replay_events;
     let sanitized_snapshot = rehydration_plan
         .snapshot
         .map(|snapshot| sanitize_scheduler_snapshot_for_rehydration(snapshot, &replay_events));
-    let replay_transactions = storage
-        .read()
-        .ok()
-        .map(|guard| {
-            replay_events
-                .iter()
-                .filter_map(|event| validated_transaction_from_event(event, &guard))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let replay_transactions = {
+        let guard = storage.read();
+        replay_events
+            .iter()
+            .filter_map(|event| validated_transaction_from_event(event, &guard))
+            .collect::<Vec<_>>()
+    };
     let scheduler_config = resolve_scheduler_config();
     let scheduler = match spawn_scheduler_with_rehydration(
         scheduler_config,
@@ -1495,9 +1434,9 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
         live_rpc_config,
         rebuild_scheduler_from_rpc,
         scheduler_snapshot_interval_ms: rehydration.snapshot_interval_ms,
-        scheduler_snapshot_writer_abort: Arc::new(Mutex::new(None)),
+        scheduler_snapshot_writer_abort: Arc::new(OnceLock::new()),
         replay_runtime_metrics_cache,
-        replay_runtime_metrics_abort: Arc::new(Mutex::new(None)),
+        replay_runtime_metrics_abort: Arc::new(OnceLock::new()),
         ingest_mode,
     }
 }
@@ -1521,11 +1460,7 @@ pub fn spawn_scheduler_snapshot_writer(
             ticker.tick().await;
             match writer.try_reserve() {
                 Ok(permit) => {
-                    let event_seq_hi = storage
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.latest_seq_id())
-                        .unwrap_or(0);
+                    let event_seq_hi = storage.read().latest_seq_id().unwrap_or(0);
                     let mut snapshot =
                         scheduler.persisted_snapshot(current_unix_ms(), runtime_core.mono_ns());
                     snapshot.event_seq_hi = event_seq_hi;
@@ -1548,26 +1483,22 @@ pub fn spawn_scheduler_snapshot_writer(
 }
 
 fn start_scheduler_snapshot_writer_once(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
     interval_ms: u64,
     runtime_core: RuntimeCoreHandle,
 ) {
-    let mut guard = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if guard.is_some() {
+    if abort_slot.get().is_some() {
         return;
     }
 
     let task = spawn_scheduler_snapshot_writer(runtime_core, interval_ms);
-    *guard = Some(task.abort_handle());
+    if abort_slot.set(task.abort_handle()).is_err() {
+        task.abort();
+    }
 }
 
-fn abort_scheduler_snapshot_writer(abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>) {
-    let handle = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
+fn abort_scheduler_snapshot_writer(abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>) {
+    let handle = abort_slot.get();
     if let Some(handle) = handle {
         handle.abort();
     }
@@ -1589,28 +1520,24 @@ fn spawn_replay_runtime_metrics_refresher(
 }
 
 fn start_replay_runtime_metrics_refresher_once(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
     interval_ms: u64,
     cache: ReplayRuntimeMetricsCache,
 ) {
-    let mut guard = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if guard.is_some() {
+    if abort_slot.get().is_some() {
         return;
     }
 
     let task = spawn_replay_runtime_metrics_refresher(cache, interval_ms);
-    *guard = Some(task.abort_handle());
+    if abort_slot.set(task.abort_handle()).is_err() {
+        task.abort();
+    }
 }
 
 fn abort_replay_runtime_metrics_refresher(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
 ) {
-    let handle = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
+    let handle = abort_slot.get();
     if let Some(handle) = handle {
         handle.abort();
     }
@@ -2280,11 +2207,7 @@ async fn transaction_by_hash(
 }
 
 async fn relay_dry_run_status(State(state): State<AppState>) -> Json<RelayDryRunStatus> {
-    let status = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let status = state.relay_dry_run_status.read().clone();
     Json(status)
 }
 
@@ -2292,11 +2215,7 @@ async fn bundle_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<BundleDetail>, StatusCode> {
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let relay = state.relay_dry_run_status.read().clone();
     let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
     let bundle_id = bundle_id_for_result(&latest);
     if id != "latest" && id != bundle_id {
@@ -2332,11 +2251,7 @@ async fn sim_by_id(
         }));
     }
 
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let relay = state.relay_dry_run_status.read().clone();
     let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
 
     let bundle_id = bundle_id_for_result(&latest);
@@ -2369,11 +2284,7 @@ async fn sim_by_id(
 fn render_prometheus_metrics(state: &AppState) -> String {
     let snapshot = state.provider.metric_snapshot();
     let dashboard_cache_metrics = state.provider.dashboard_cache_metrics();
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let relay = state.relay_dry_run_status.read().clone();
     let relay_success_rate = if relay.total_submissions == 0 {
         0.0
     } else {
@@ -4494,7 +4405,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_snapshot_route_returns_scheduler_state() {
-        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x51, 7))
@@ -4534,7 +4446,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_metrics_route_returns_scheduler_metrics() {
-        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x61, 9))
@@ -4738,7 +4651,8 @@ mod tests {
 
     #[tokio::test]
     async fn sim_route_reads_runtime_core_status_provider_when_injected() {
-        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, _runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let handle = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -4848,11 +4762,32 @@ mod tests {
         bootstrap.abort_background_tasks();
     }
 
+    #[tokio::test]
+    async fn scheduler_snapshot_abort_slot_is_write_once_and_aborts_registered_task() {
+        let abort_slot = Arc::new(std::sync::OnceLock::new());
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let extra_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(abort_slot.set(task.abort_handle()).is_ok());
+        assert!(abort_slot.set(extra_task.abort_handle()).is_err());
+
+        abort_scheduler_snapshot_writer(&abort_slot);
+
+        let join_err = task.await.expect_err("registered task should be aborted");
+        assert!(join_err.is_cancelled());
+
+        extra_task.abort();
+    }
+
     #[test]
     fn in_memory_provider_recent_transactions_are_latest_first_and_deduped() {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.append_event(seed_decoded_event(1, 1, 1));
             guard.append_event(seed_decoded_event(2, 2, 2));
             // Same hash as seq 1, newer nonce should replace previous recent-tx record.
@@ -4868,10 +4803,22 @@ mod tests {
     }
 
     #[test]
+    fn viz_data_provider_auto_impl_supports_arc_wrappers() {
+        fn latest_seq_id_of<P: VizDataProvider>(provider: &P) -> Option<u64> {
+            provider.latest_seq_id()
+        }
+
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        let provider = Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
+
+        assert_eq!(latest_seq_id_of(&provider), None);
+    }
+
+    #[test]
     fn in_memory_provider_feature_summary_is_aggregated_and_sorted() {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             for (seq, protocol, category) in [
                 (11_u64, "uniswap-v3", "swap"),
                 (22_u64, "aave-v3", "borrow"),
@@ -4959,7 +4906,7 @@ mod tests {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         let hash = hash_from_seq(99);
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.upsert_tx_seen(storage::TxSeenRecord {
                 hash,
                 peer: "rpc-ws".to_owned(),
@@ -5022,7 +4969,7 @@ mod tests {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         let hash = hash_from_seq(77);
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.append_event(EventEnvelope {
                 seq_id: 1,
                 ingest_ts_unix_ms: 1_700_000_000_000,

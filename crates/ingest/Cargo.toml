@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
+auto_impl = { workspace = true }
 common = { path = "../common" }
 event-log = { path = "../event-log" }
 hashbrown = { workspace = true }

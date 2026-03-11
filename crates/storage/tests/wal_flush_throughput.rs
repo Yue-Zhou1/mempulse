@@ -1,8 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use common::SourceId;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal, StorageWriteOp,
@@ -52,11 +52,11 @@ struct RecordingSink {
 
 #[async_trait]
 impl ClickHouseBatchSink for RecordingSink {
-    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
-        self.flush_sizes
-            .write()
-            .expect("lock flush sizes")
-            .push(events.len());
+    async fn flush_event_batch(
+        &self,
+        events: Vec<EventEnvelope>,
+    ) -> std::result::Result<(), storage::StorageError> {
+        self.flush_sizes.write().push(events.len());
         Ok(())
     }
 }
@@ -92,12 +92,7 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let sizes = flush_sizes
-        .read()
-        .expect("lock flush sizes")
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    let sizes = flush_sizes.read().iter().copied().collect::<Vec<_>>();
     assert!(!sizes.is_empty());
     assert!(sizes.iter().copied().max().unwrap_or(0) >= 64);
 
@@ -107,7 +102,7 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
         "wal should be cleared after successful flush"
     );
 
-    let events = storage.read().expect("lock storage").list_events();
+    let events = storage.read().list_events();
     assert_eq!(events.len(), 256);
 
     let _ = std::fs::remove_file(wal_path);

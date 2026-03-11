@@ -43,7 +43,8 @@ fn sender(seed: u8) -> Address {
 
 #[tokio::test]
 async fn scheduler_admit_outcome_reports_sender_queue_transitions() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender = sender(0xa1);

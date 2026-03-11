@@ -1,10 +1,11 @@
 use common::{Address, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxConfirmed, TxDecoded, TxReorged, TxReplaced};
+use parking_lot::RwLock;
 use scheduler::{
     PersistedSchedulerSnapshot, PersistedSenderQueueEntry, PersistedSenderQueueSnapshot,
     ValidatedTransaction,
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{EventStore, InMemoryStorage, TxFullRecord};
 use tokio::time::{Duration, Instant, sleep};
 use viz_api::{
@@ -133,7 +134,6 @@ async fn binary_bootstrap_rehydrates_scheduler_from_storage_snapshot() {
 
     storage
         .write()
-        .expect("storage writable")
         .write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_321,
             captured_at_mono_ns: 321,
@@ -170,7 +170,7 @@ async fn binary_bootstrap_replays_post_snapshot_decoded_tail_events() {
     let tail = sample_validated_tx(2, sender(0xa1), 8);
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&ready));
         guard.append_event(decoded_event(1, &ready));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
@@ -205,7 +205,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_confirmed_in_wal_tail() {
     let ready = sample_validated_tx(1, sender(0xa1), 7);
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&ready));
         guard.append_event(decoded_event(1, &ready));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
@@ -244,7 +244,7 @@ async fn binary_bootstrap_recovers_reorged_transaction_without_tail_decode_event
     };
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&reopened));
         guard.append_event(decoded_event(1, &reopened));
         guard.append_event(confirmed);
@@ -286,7 +286,7 @@ async fn binary_bootstrap_prunes_snapshot_transactions_replaced_in_wal_tail() {
     let replacement = sample_validated_tx(2, sender(0xa1), 7);
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&replaced));
         guard.append_event(decoded_event(1, &replaced));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
@@ -323,7 +323,6 @@ async fn binary_bootstrap_ignores_snapshot_when_finalized_gap_is_stale() {
 
     storage
         .write()
-        .expect("storage writable")
         .write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_000,
             captured_at_mono_ns: 321,
@@ -340,7 +339,7 @@ async fn binary_bootstrap_ignores_snapshot_when_finalized_gap_is_stale() {
         });
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.append_event(EventEnvelope {
             seq_id: 1,
             ingest_ts_unix_ms: 1_700_000_000_500,
@@ -377,14 +376,7 @@ async fn binary_bootstrap_exposes_snapshot_writer_shutdown_handle() {
         },
     );
 
-    wait_for(|| {
-        storage
-            .read()
-            .ok()
-            .and_then(|guard| guard.scheduler_snapshot().cloned())
-            .is_some()
-    })
-    .await;
+    wait_for(|| storage.read().scheduler_snapshot().cloned().is_some()).await;
 
     bootstrap.abort_background_tasks();
 
@@ -398,7 +390,6 @@ async fn binary_bootstrap_exposes_snapshot_writer_shutdown_handle() {
 
     let persisted = storage
         .read()
-        .expect("storage readable")
         .scheduler_snapshot()
         .cloned()
         .expect("scheduler snapshot persisted");

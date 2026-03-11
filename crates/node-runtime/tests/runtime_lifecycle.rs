@@ -1,7 +1,8 @@
 use node_runtime::NodeRuntimeBuilder;
+use parking_lot::RwLock;
 use runtime_core::{RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode};
 use scheduler::{SchedulerConfig, scheduler_channel};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use storage::{InMemoryStorage, StorageWriteHandle, StorageWriteOp};
 use tokio::sync::mpsc;
 
@@ -13,7 +14,8 @@ async fn runtime_exposes_shutdown_handle() {
 
 #[tokio::test]
 async fn runtime_builder_starts_runtime_core_and_exposes_handle_to_startup() {
-    let (scheduler, _scheduler_runtime) = scheduler_channel(SchedulerConfig::default());
+    let (scheduler, _scheduler_runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let (storage_tx, _storage_rx) = mpsc::channel::<StorageWriteOp>(8);
     let startup_seen = Arc::new(Mutex::new(None));
     let startup_seen_for_closure = startup_seen.clone();

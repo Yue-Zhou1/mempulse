@@ -1,5 +1,6 @@
 use ahash::RandomState;
-use anyhow::Result;
+use auto_impl::auto_impl;
+use crate::IngestError;
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxFetched, TxSeen};
 use hashbrown::{HashMap, HashSet};
@@ -8,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<T> = HashSet<T, RandomState>;
+type Result<T> = std::result::Result<T, IngestError>;
 
 #[derive(Clone, Debug)]
 pub struct RpcIngestConfig {
@@ -31,11 +33,13 @@ pub struct RawTransaction {
     pub raw: Vec<u8>,
 }
 
+#[auto_impl(&mut, Box)]
 pub trait PendingTxProvider {
     fn pending_hashes(&mut self) -> Result<Vec<TxHash>>;
     fn fetch_transaction(&mut self, hash: TxHash) -> Result<Option<RawTransaction>>;
 }
 
+#[auto_impl(&mut, Box)]
 pub trait IngestClock {
     fn now_unix_ms(&mut self) -> i64;
     fn now_mono_ns(&mut self) -> u64;
@@ -102,7 +106,10 @@ where
 
     pub fn process_pending_batch(&mut self) -> Result<Vec<EventEnvelope>> {
         let mut events = Vec::new();
-        let hashes = self.provider.pending_hashes()?;
+        let hashes = self
+            .provider
+            .pending_hashes()
+            .map_err(IngestError::into_rpc_connect)?;
         let depth_current = hashes.len();
 
         for (idx, hash) in hashes.into_iter().enumerate() {
@@ -141,7 +148,11 @@ where
                 seen_at_mono_ns,
             })));
 
-            if let Some(tx) = self.provider.fetch_transaction(hash)? {
+            if let Some(tx) = self
+                .provider
+                .fetch_transaction(hash)
+                .map_err(|err| err.into_tx_fetch(hash))?
+            {
                 let fetched_at_unix_ms = self.clock.now_unix_ms();
                 events.push(self.new_event(EventPayload::TxFetched(TxFetched {
                     hash,
@@ -177,7 +188,7 @@ where
     ) -> String {
         format!(
             "{reason};lane=rpc;source={};queue={queue_name};depth_current={depth_current};depth_peak={depth_peak}",
-            self.source_id.0
+            self.source_id.as_str()
         )
     }
 
@@ -237,6 +248,8 @@ impl PendingTxProvider for InMemoryPendingTxProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
+    use std::fmt::{Display, Formatter};
 
     #[derive(Default)]
     struct StepClock {
@@ -265,6 +278,43 @@ mod tests {
             hash: hash(value),
             tx_type,
             raw: vec![value; 4],
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestProviderError(&'static str);
+
+    impl Display for TestProviderError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl Error for TestProviderError {}
+
+    fn provider_error(message: &'static str) -> anyhow::Error {
+        anyhow::Error::new(TestProviderError(message))
+    }
+
+    struct FailingPendingTxProvider {
+        hashes: VecDeque<Vec<TxHash>>,
+        pending_error: Option<&'static str>,
+        fetch_error: Option<&'static str>,
+    }
+
+    impl PendingTxProvider for FailingPendingTxProvider {
+        fn pending_hashes(&mut self) -> Result<Vec<TxHash>> {
+            if let Some(message) = self.pending_error.take() {
+                return Err(provider_error(message).into());
+            }
+            Ok(self.hashes.pop_front().unwrap_or_default())
+        }
+
+        fn fetch_transaction(&mut self, _hash: TxHash) -> Result<Option<RawTransaction>> {
+            if let Some(message) = self.fetch_error.take() {
+                return Err(provider_error(message).into());
+            }
+            Ok(None)
         }
     }
 
@@ -400,5 +450,68 @@ mod tests {
         assert_eq!(dropped[0].hash, hash(3));
         assert!(dropped[0].reason.contains("QueueFull"));
         assert!(dropped[0].reason.contains("queue=rpc.pending_batch"));
+    }
+
+    #[test]
+    fn pending_tx_provider_auto_impl_supports_box_wrappers() {
+        fn next_hashes<P: PendingTxProvider>(provider: &mut P) -> Result<Vec<TxHash>> {
+            provider.pending_hashes()
+        }
+
+        let mut provider = Box::new(InMemoryPendingTxProvider::new(
+            vec![vec![hash(4)]],
+            vec![tx(4, 2)],
+        ));
+
+        let hashes = next_hashes(&mut provider).expect("boxed provider should implement trait");
+        assert_eq!(hashes, vec![hash(4)]);
+    }
+
+    #[test]
+    fn ingest_clock_auto_impl_supports_box_wrappers() {
+        fn tick<C: IngestClock>(clock: &mut C) -> (i64, u64) {
+            (clock.now_unix_ms(), clock.now_mono_ns())
+        }
+
+        let mut clock = Box::new(StepClock::default());
+        assert_eq!(tick(&mut clock), (1, 1));
+    }
+
+    #[test]
+    fn pending_hash_errors_are_labeled_as_rpc_connection_failures() {
+        let provider = FailingPendingTxProvider {
+            hashes: VecDeque::new(),
+            pending_error: Some("rpc offline"),
+            fetch_error: None,
+        };
+        let clock = StepClock::default();
+        let mut service = RpcIngestService::new(provider, SourceId::new("rpc-mainnet"), clock);
+
+        let err = service
+            .process_pending_batch()
+            .expect_err("pending hash fetch should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("RPC connection failed:"));
+        assert!(message.contains("rpc offline"));
+    }
+
+    #[test]
+    fn fetch_transaction_errors_include_transaction_context() {
+        let provider = FailingPendingTxProvider {
+            hashes: vec![vec![hash(9)]].into(),
+            pending_error: None,
+            fetch_error: Some("fetch failed"),
+        };
+        let clock = StepClock::default();
+        let mut service = RpcIngestService::new(provider, SourceId::new("rpc-mainnet"), clock);
+
+        let err = service
+            .process_pending_batch()
+            .expect_err("transaction fetch should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("transaction fetch failed for"));
+        assert!(message.contains("fetch failed"));
     }
 }

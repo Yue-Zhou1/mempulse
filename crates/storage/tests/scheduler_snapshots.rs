@@ -1,10 +1,11 @@
 use common::{Address, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxConfirmed, TxDecoded};
+use parking_lot::RwLock;
 use scheduler::{
     PersistedSchedulerSnapshot, PersistedSenderQueueEntry, PersistedSenderQueueSnapshot,
     ValidatedTransaction,
 };
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{
     EventStore, InMemoryStorage, NoopClickHouseSink, StorageWriteOp, StorageWriterConfig,
     spawn_single_writer,
@@ -100,7 +101,7 @@ async fn storage_writer_persists_scheduler_snapshot() {
         .expect("enqueue snapshot write");
     sleep(Duration::from_millis(25)).await;
 
-    let guard = storage.read().expect("storage readable");
+    let guard = storage.read();
     let persisted = guard
         .scheduler_snapshot()
         .cloned()
@@ -148,7 +149,7 @@ async fn storage_writer_preserves_snapshot_watermark_from_capture_time() {
     permit.send(StorageWriteOp::WriteSchedulerSnapshot(snapshot.clone()));
     sleep(Duration::from_millis(25)).await;
 
-    let guard = storage.read().expect("storage readable");
+    let guard = storage.read();
     let persisted = guard
         .scheduler_snapshot()
         .cloned()

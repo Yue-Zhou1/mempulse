@@ -1,10 +1,11 @@
 use common::{Address, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
+use parking_lot::RwLock;
 use runtime_core::{
     RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
 };
 use scheduler::{SchedulerConfig, ValidatedTransaction, scheduler_channel};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{EventStore, InMemoryStorage, NoopClickHouseSink, spawn_single_writer};
 use tokio::time::{Duration, Instant, sleep};
 use viz_api::spawn_scheduler_snapshot_writer;
@@ -66,7 +67,8 @@ async fn scheduler_snapshot_writer_periodically_persists_scheduler_state() {
         Arc::new(NoopClickHouseSink),
         storage::StorageWriterConfig::default(),
     );
-    let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (scheduler, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
     let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
         deps: RuntimeCoreDeps {
@@ -90,8 +92,8 @@ async fn scheduler_snapshot_writer_periodically_persists_scheduler_state() {
     wait_for(|| {
         storage
             .read()
-            .ok()
-            .and_then(|guard| guard.scheduler_snapshot().cloned())
+            .scheduler_snapshot()
+            .cloned()
             .is_some_and(|snapshot| snapshot.pending.len() == 1)
     })
     .await;
@@ -108,7 +110,8 @@ async fn scheduler_snapshot_writer_stamps_capture_time_event_watermark() {
         Arc::new(NoopClickHouseSink),
         storage::StorageWriterConfig::default(),
     );
-    let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (scheduler, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
     let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
         deps: RuntimeCoreDeps {
@@ -128,7 +131,6 @@ async fn scheduler_snapshot_writer_stamps_capture_time_event_watermark() {
 
     storage
         .write()
-        .expect("storage writable")
         .append_event(decoded_event(1, &already_durable));
 
     scheduler.admit(pending).await.expect("admit tx");
@@ -136,8 +138,8 @@ async fn scheduler_snapshot_writer_stamps_capture_time_event_watermark() {
     wait_for(|| {
         storage
             .read()
-            .ok()
-            .and_then(|guard| guard.scheduler_snapshot().cloned())
+            .scheduler_snapshot()
+            .cloned()
             .is_some_and(|snapshot| snapshot.pending.len() == 1 && snapshot.event_seq_hi == 1)
     })
     .await;

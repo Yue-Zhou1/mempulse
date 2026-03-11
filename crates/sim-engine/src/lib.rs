@@ -2,7 +2,6 @@
 
 mod state_provider;
 
-use anyhow::Result;
 use common::{Address, TxHash};
 use event_log::TxDecoded;
 use revm::context_interface::ContextTr;
@@ -14,11 +13,48 @@ use revm::{Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext, contex
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
+use std::sync::Arc;
 
 pub use state_provider::{AccountSeed, NoopStateProvider, StateProvider};
 
 const MAX_SYNTHETIC_CALLDATA_BYTES: u32 = 8_192;
 const SEEDED_BALANCE_WEI: u128 = 1_000_000_000_000_000_000_000_000_000_000;
+
+type SharedError = Arc<dyn StdError + Send + Sync>;
+type Result<T> = std::result::Result<T, SimError>;
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum SimError {
+    #[error("EVM execution reverted: {reason}")]
+    Reverted { reason: String },
+    #[error("state fetch failed: {0}")]
+    StateFetch(SharedError),
+    #[error(transparent)]
+    Other(SharedError),
+}
+
+impl SimError {
+    fn into_shared_error<E>(error: E) -> SharedError
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Arc::from(error.into())
+    }
+
+    pub fn state_fetch<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Self::StateFetch(Self::into_shared_error(error))
+    }
+}
+
+impl From<anyhow::Error> for SimError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(Self::into_shared_error(error))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChainContext {

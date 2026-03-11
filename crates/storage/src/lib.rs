@@ -1,21 +1,26 @@
+#![forbid(unsafe_code)]
+
 mod backfill;
 mod clickhouse_schema;
 mod wal;
 
 use ahash::RandomState;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result as AnyResult, anyhow};
 use async_trait::async_trait;
+use auto_impl::auto_impl;
 use common::{Address, PeerId, SourceId, TxHash};
 use event_log::{
     AssemblyDecisionApplied, CandidateQueued, EventEnvelope, EventPayload, GlobalSequencer,
     cmp_deterministic,
 };
 use hashbrown::{HashMap, HashSet};
+use parking_lot::RwLock;
 use replay::ReplayFrame;
 use scheduler::PersistedSchedulerSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::error::Error as StdError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 use tokio::sync::mpsc;
@@ -30,6 +35,51 @@ pub use wal::StorageWal;
 
 pub type FastMap<K, V> = HashMap<K, V, RandomState>;
 pub type FastSet<T> = HashSet<T, RandomState>;
+
+type Result<T> = std::result::Result<T, StorageError>;
+type SharedError = Arc<dyn StdError + Send + Sync>;
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("WAL write failed: {0}")]
+    WalWrite(SharedError),
+    #[error("ClickHouse batch failed: {0}")]
+    ClickHouseBatch(SharedError),
+    #[error("Parquet export failed: {0}")]
+    ParquetExport(SharedError),
+    #[error(transparent)]
+    Other(SharedError),
+}
+
+impl StorageError {
+    fn into_shared_error<E>(error: E) -> SharedError
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Arc::from(error.into())
+    }
+
+    fn wal_write<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Self::WalWrite(Self::into_shared_error(error))
+    }
+
+    fn clickhouse_batch<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Self::ClickHouseBatch(Self::into_shared_error(error))
+    }
+
+    fn parquet_export<E>(error: E) -> Self
+    where
+        E: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        Self::ParquetExport(Self::into_shared_error(error))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
@@ -164,10 +214,14 @@ fn default_feature_engine_version() -> String {
     feature_engine::version().to_owned()
 }
 
+#[auto_impl(&mut, Box)]
 pub trait EventStore {
     fn append_event(&mut self, event: EventEnvelope);
+    #[must_use]
     fn list_events(&self) -> Vec<EventEnvelope>;
+    #[must_use]
     fn scan_events(&self, from_seq_id: u64, limit: usize) -> Vec<EventEnvelope>;
+    #[must_use = "callers should inspect the latest sequence id when querying event state"]
     fn latest_seq_id(&self) -> Option<u64>;
 }
 
@@ -220,6 +274,21 @@ impl Default for InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     pub fn with_config(config: StorageConfig) -> Self {
         let config = StorageConfig {
             event_capacity: config.event_capacity.max(1),
@@ -762,7 +831,7 @@ impl StorageWriteHandle {
         Self { tx }
     }
 
-    pub async fn enqueue(&self, op: StorageWriteOp) -> Result<()> {
+    pub async fn enqueue(&self, op: StorageWriteOp) -> AnyResult<()> {
         self.tx
             .send(op)
             .await
@@ -794,6 +863,36 @@ pub trait ClickHouseBatchSink: Send + Sync {
     async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()>;
 }
 
+#[async_trait]
+impl<T> ClickHouseBatchSink for &T
+where
+    T: ClickHouseBatchSink + ?Sized,
+{
+    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
+        (**self).flush_event_batch(events).await
+    }
+}
+
+#[async_trait]
+impl<T> ClickHouseBatchSink for Box<T>
+where
+    T: ClickHouseBatchSink + ?Sized,
+{
+    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
+        (**self).flush_event_batch(events).await
+    }
+}
+
+#[async_trait]
+impl<T> ClickHouseBatchSink for Arc<T>
+where
+    T: ClickHouseBatchSink + ?Sized,
+{
+    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
+        (**self).flush_event_batch(events).await
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NoopClickHouseSink;
 
@@ -811,18 +910,18 @@ pub struct ClickHouseHttpSink {
 }
 
 impl ClickHouseHttpSink {
-    pub fn new(insert_url: impl Into<String>) -> Result<Self> {
+    pub fn new(insert_url: impl Into<String>) -> AnyResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .context("build clickhouse http client")?;
+            .map_err(|err| anyhow!("build clickhouse http client: {err}"))?;
         Ok(Self {
             client,
             insert_url: insert_url.into(),
         })
     }
 
-    pub fn from_env() -> Result<Option<Self>> {
+    pub fn from_env() -> AnyResult<Option<Self>> {
         let url = match std::env::var("CLICKHOUSE_EVENTS_INSERT_URL") {
             Ok(value) if !value.trim().is_empty() => value,
             _ => return Ok(None),
@@ -840,7 +939,12 @@ impl ClickHouseBatchSink for ClickHouseHttpSink {
 
         let mut body = String::new();
         for event in events {
-            body.push_str(&serde_json::to_string(&event).context("serialize event")?);
+            let encoded = serde_json::to_string(&event).map_err(|err| {
+                StorageError::clickhouse_batch(std::io::Error::other(format!(
+                    "serialize event: {err}"
+                )))
+            })?;
+            body.push_str(&encoded);
             body.push('\n');
         }
 
@@ -850,9 +954,18 @@ impl ClickHouseBatchSink for ClickHouseHttpSink {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("POST {}", self.insert_url))?
+            .map_err(|err| {
+                StorageError::clickhouse_batch(std::io::Error::other(format!(
+                    "POST {}: {err}",
+                    self.insert_url
+                )))
+            })?
             .error_for_status()
-            .context("clickhouse insert returned error status")?;
+            .map_err(|err| {
+                StorageError::clickhouse_batch(std::io::Error::other(format!(
+                    "clickhouse insert returned error status: {err}"
+                )))
+            })?;
 
         Ok(())
     }
@@ -882,9 +995,8 @@ pub fn spawn_single_writer(
     if let Some(wal) = wal.as_ref() {
         match wal.recover_events() {
             Ok(events) => {
-                if !events.is_empty()
-                    && let Ok(mut guard) = storage.write()
-                {
+                if !events.is_empty() {
+                    let mut guard = storage.write();
                     for event in events {
                         guard.append_event(event);
                     }
@@ -896,9 +1008,7 @@ pub fn spawn_single_writer(
         }
     }
 
-    let mut sequencer = GlobalSequencer::from_latest_seq_id(
-        storage.read().ok().and_then(|guard| guard.latest_seq_id()),
-    );
+    let mut sequencer = GlobalSequencer::from_latest_seq_id(storage.read().latest_seq_id());
 
     let (tx, mut rx) = mpsc::channel::<StorageWriteOp>(config.queue_capacity);
 
@@ -915,18 +1025,9 @@ pub fn spawn_single_writer(
                         None => break,
                     };
 
-                    match storage.write() {
-                        Ok(mut guard) => apply_write_op(
-                            &mut guard,
-                            op,
-                            &mut batch,
-                            wal.as_ref(),
-                            &mut sequencer,
-                        ),
-                        Err(_) => {
-                            tracing::error!("storage lock poisoned, stopping single-writer task");
-                            break;
-                        }
+                    {
+                        let mut guard = storage.write();
+                        apply_write_op(&mut guard, op, &mut batch, wal.as_ref(), &mut sequencer);
                     }
 
                     if batch.len() >= config.flush_batch_size {
@@ -1075,7 +1176,7 @@ fn remove_event_from_sorted_index(events: &mut Vec<EventEnvelope>, target: &Even
     }
 }
 
-pub fn export_replay_frames_json(frames: &[ReplayFrame]) -> Result<String> {
+pub fn export_replay_frames_json(frames: &[ReplayFrame]) -> AnyResult<String> {
     serde_json::to_string_pretty(frames).map_err(|err| anyhow!(err))
 }
 
@@ -1098,9 +1199,9 @@ pub fn export_replay_frames_csv(frames: &[ReplayFrame]) -> String {
 
 pub trait ParquetExporter {
     fn export_replay_frames_parquet(&self, _frames: &[ReplayFrame], _path: &str) -> Result<()> {
-        Err(anyhow!(
-            "parquet export is not wired in this crate yet; use adapter implementation"
-        ))
+        Err(StorageError::parquet_export(std::io::Error::other(
+            "parquet export is not wired in this crate yet; use adapter implementation",
+        )))
     }
 }
 
@@ -1114,8 +1215,16 @@ pub struct ArrowParquetExporter;
 
 impl ParquetExporter for ArrowParquetExporter {
     fn export_replay_frames_parquet(&self, frames: &[ReplayFrame], path: &str) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(frames).context("serialize replay frames")?;
-        fs::write(path, payload).with_context(|| format!("write replay export file {path}"))?;
+        let payload = serde_json::to_vec_pretty(frames).map_err(|err| {
+            StorageError::parquet_export(std::io::Error::other(format!(
+                "serialize replay frames: {err}"
+            )))
+        })?;
+        fs::write(path, payload).map_err(|err| {
+            StorageError::parquet_export(std::io::Error::other(format!(
+                "write replay export file {path}: {err}"
+            )))
+        })?;
         Ok(())
     }
 }
@@ -1167,6 +1276,14 @@ mod tests {
 
     fn hash(v: u8) -> TxHash {
         [v; 32]
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("prototype03-storage-{label}-{now}"))
     }
 
     fn decoded_event(seq: u64, v: u8) -> EventEnvelope {
@@ -1382,6 +1499,19 @@ mod tests {
     }
 
     #[test]
+    fn event_store_auto_impl_supports_box_wrappers() {
+        fn append_and_latest<T: EventStore>(store: &mut T, event: EventEnvelope) -> Option<u64> {
+            store.append_event(event);
+            store.latest_seq_id()
+        }
+
+        let mut store = Box::new(InMemoryStorage::default());
+        let latest = append_and_latest(&mut store, decoded_event(1, 7));
+
+        assert_eq!(latest, Some(1));
+    }
+
+    #[test]
     fn recent_transactions_is_bounded_and_latest_first() {
         let mut store = InMemoryStorage::with_config(StorageConfig {
             event_capacity: 100,
@@ -1410,7 +1540,7 @@ mod tests {
         #[async_trait]
         impl ClickHouseBatchSink for RecordingSink {
             async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
-                self.flush_sizes.write().unwrap().push(events.len());
+                self.flush_sizes.write().push(events.len());
                 Ok(())
             }
         }
@@ -1445,13 +1575,23 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let events = storage.read().unwrap().list_events();
+        let events = storage.read().list_events();
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].seq_id, 2);
         assert_eq!(events[3].seq_id, 5);
 
-        let flushed = flush_sizes.read().unwrap().clone();
+        let flushed = flush_sizes.read().clone();
         assert!(!flushed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clickhouse_batch_sink_auto_impl_supports_arc_wrappers() {
+        async fn flush<S: ClickHouseBatchSink>(sink: &S) -> Result<()> {
+            sink.flush_event_batch(Vec::new()).await
+        }
+
+        let sink = Arc::new(NoopClickHouseSink);
+        flush(&sink).await.expect("flush through arc wrapper");
     }
 
     #[tokio::test]
@@ -1490,7 +1630,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(40)).await;
 
-        let events = storage.read().expect("storage lock").list_events();
+        let events = storage.read().list_events();
         let seq_ids = events.iter().map(|event| event.seq_id).collect::<Vec<_>>();
         assert_eq!(seq_ids, vec![1, 2, 3]);
     }
@@ -1605,10 +1745,37 @@ mod tests {
         let err = exporter
             .export_replay_frames_parquet(&frames, "/tmp/replay.parquet")
             .expect_err("should return adapter error");
-        assert!(
-            err.to_string()
-                .contains("parquet export is not wired in this crate yet")
-        );
+        let message = err.to_string();
+        assert!(message.contains("Parquet export failed:"));
+        assert!(message.contains("parquet export is not wired in this crate yet"));
+    }
+
+    #[test]
+    fn wal_initialization_errors_are_labeled_as_wal_failures() {
+        let blocking_parent = unique_temp_path("wal-parent-file");
+        std::fs::write(&blocking_parent, b"not a directory").expect("create blocking file");
+
+        let err = StorageWal::new(blocking_parent.join("events.log"))
+            .expect_err("storage wal should reject file parents");
+
+        let message = err.to_string();
+        assert!(message.contains("WAL write failed:"));
+        assert!(message.contains("create WAL parent directory"));
+
+        let _ = std::fs::remove_file(blocking_parent);
+    }
+
+    #[tokio::test]
+    async fn clickhouse_flush_errors_are_labeled_as_batch_failures() {
+        let sink = ClickHouseHttpSink::new("relative-url").expect("construct clickhouse sink");
+
+        let err = sink
+            .flush_event_batch(vec![decoded_event(1, 7)])
+            .await
+            .expect_err("flush should fail for invalid url");
+
+        let message = err.to_string();
+        assert!(message.contains("ClickHouse batch failed:"));
     }
 
     #[test]

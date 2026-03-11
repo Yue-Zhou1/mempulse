@@ -1,8 +1,8 @@
 use common::Address;
 use event_log::TxDecoded;
 use sim_engine::{
-    AccountSeed, ChainContext, SimulationFailCategory, SimulationMode, SimulationTxInput,
-    StateProvider, simulate_with_mode,
+    AccountSeed, ChainContext, SimError, SimulationFailCategory, SimulationMode,
+    SimulationTxInput, StateProvider, simulate_with_mode,
 };
 
 fn address(v: u8) -> Address {
@@ -32,7 +32,7 @@ struct FixedNonceProvider {
 static ZERO_NONCE_PROVIDER: FixedNonceProvider = FixedNonceProvider { nonce: 0 };
 
 impl StateProvider for FixedNonceProvider {
-    fn account_seed(&self, _address: Address) -> anyhow::Result<Option<AccountSeed>> {
+    fn account_seed(&self, _address: Address) -> Result<Option<AccountSeed>, SimError> {
         Ok(Some(AccountSeed {
             balance_wei: 2_000_000_000_000_000_000_000_000_000_000,
             nonce: self.nonce,

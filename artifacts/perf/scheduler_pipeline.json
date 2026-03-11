@@ -1,0 +1,1 @@
+{"batch_size":256,"ready_total":256,"pending_total":256,"iterations":40,"p50_us":6324,"p95_us":6627,"p99_us":7619,"avg_us":6296}

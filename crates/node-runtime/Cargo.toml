@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 runtime-core = { path = "../runtime-core" }
 
 [dev-dependencies]
+parking_lot = { workspace = true }
 scheduler = { path = "../scheduler" }
 storage = { path = "../storage" }
 tokio = { workspace = true }

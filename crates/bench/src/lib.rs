@@ -298,7 +298,8 @@ pub fn summarize_latency_samples(samples: &[u64]) -> LatencySummary {
 async fn scheduler_pipeline_iteration(
     transactions: &[ValidatedTransaction],
 ) -> SchedulerPipelineOutcome {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     for transaction in transactions.iter().cloned() {
@@ -318,7 +319,8 @@ async fn scheduler_pipeline_iteration(
 async fn simulation_roundtrip_iteration(
     transactions: &[ValidatedTransaction],
 ) -> SimulationRoundtripOutcome {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     for transaction in transactions.iter().cloned() {
@@ -329,11 +331,11 @@ async fn simulation_roundtrip_iteration(
         .iter()
         .enumerate()
         .map(|(idx, transaction)| SchedulerCandidate {
-            candidate_id: format!("cand-{idx}"),
+            candidate_id: format!("cand-{idx}").into(),
             tx_hash: transaction.hash(),
             member_tx_hashes: vec![transaction.hash()],
             score: 10_000 + idx as u32,
-            strategy: "SandwichCandidate".to_owned(),
+            strategy: "SandwichCandidate".into(),
             detected_unix_ms: transaction.observed_at_unix_ms,
         })
         .collect::<Vec<_>>();
@@ -437,7 +439,8 @@ fn synthetic_scheduler_snapshot(
 ) -> PersistedSchedulerSnapshot {
     let runtime = build_tokio_runtime();
     runtime.block_on(async {
-        let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+        let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
 
         for transaction in transactions.iter().cloned() {
