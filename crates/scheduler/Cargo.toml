@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 event-log = { path = "../event-log" }
+parking_lot = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -2,9 +2,10 @@ use axum::body::Body;
 use axum::http::Request;
 use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::{AlertThresholdConfig, MetricSnapshot};
+use parking_lot::RwLock;
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tower::util::ServiceExt;
 use viz_api::live_rpc::{
     LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,

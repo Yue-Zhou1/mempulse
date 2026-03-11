@@ -1,6 +1,7 @@
 use common::SourceId;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
     EventStore, InMemoryStorage, NoopClickHouseSink, StorageWal, StorageWriterConfig,
@@ -66,7 +67,7 @@ async fn writer_recovers_unflushed_events_from_wal_on_restart() {
     );
 
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let events = storage.read().expect("storage lock").list_events();
+    let events = storage.read().list_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].seq_id, 1);
 

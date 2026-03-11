@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
-use common::{Address, SourceId, TxHash};
+use common::{Address, CandidateId, SourceId, StrategyId, TxHash};
 use event_log::TxDecoded;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,6 +33,22 @@ pub struct SchedulerConfig {
     pub replacement_fee_bump_bps: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SchedulerConfigError {
+    #[error("handoff_queue_capacity must be >= 1, got 0")]
+    HandoffQueueCapacityZero,
+    #[error("max_pending_per_sender must be >= 1, got 0")]
+    MaxPendingPerSenderZero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SchedulerInitError {
+    #[error(transparent)]
+    Config(#[from] SchedulerConfigError),
+    #[error(transparent)]
+    Snapshot(#[from] SchedulerSnapshotError),
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -44,18 +61,18 @@ impl Default for SchedulerConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerCandidate {
-    pub candidate_id: String,
+    pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
     #[serde(default)]
     pub member_tx_hashes: Vec<TxHash>,
     pub score: u32,
-    pub strategy: String,
+    pub strategy: StrategyId,
     pub detected_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimulationTaskSpec {
-    pub candidate_id: String,
+    pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
     #[serde(default)]
     pub member_tx_hashes: Vec<TxHash>,
@@ -70,7 +87,7 @@ pub struct SchedulerCandidateDispatch {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerSimulationResult {
-    pub candidate_id: String,
+    pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
     #[serde(default)]
     pub member_tx_hashes: Vec<TxHash>,
@@ -215,6 +232,8 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    #[must_use = "scheduler admission outcomes must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn admit_outcome(
         &self,
         tx: ValidatedTransaction,
@@ -226,6 +245,8 @@ impl SchedulerHandle {
         .await
     }
 
+    #[must_use = "scheduler admission results must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn admit(
         &self,
         tx: ValidatedTransaction,
@@ -235,6 +256,7 @@ impl SchedulerHandle {
             .map(|outcome| outcome.admission)
     }
 
+    #[inline]
     pub fn try_admit(&self, tx: ValidatedTransaction) -> Result<(), SchedulerEnqueueError> {
         self.try_send_command(SchedulerCommand::Admit {
             tx: Box::new(tx),
@@ -242,6 +264,8 @@ impl SchedulerHandle {
         })
     }
 
+    #[must_use = "candidate registration results must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn register_candidates(
         &self,
         candidates: Vec<SchedulerCandidate>,
@@ -253,6 +277,8 @@ impl SchedulerHandle {
         .await
     }
 
+    #[must_use = "simulation application results must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn apply_simulation_result(
         &self,
         result: SchedulerSimulationResult,
@@ -264,6 +290,8 @@ impl SchedulerHandle {
         .await
     }
 
+    #[must_use = "candidate invalidation results must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn invalidate_candidate_hash(
         &self,
         hash: TxHash,
@@ -275,6 +303,8 @@ impl SchedulerHandle {
         .await
     }
 
+    #[must_use = "head advancement results must be handled to observe enqueue failures"]
+    #[inline]
     pub async fn advance_head(&self, block_number: u64) -> Result<(), SchedulerEnqueueError> {
         self.send_command_with_reply(|reply_tx| SchedulerCommand::AdvanceHead {
             block_number,
@@ -319,21 +349,14 @@ impl SchedulerHandle {
         }
     }
 
+    #[must_use]
     pub fn snapshot(&self) -> SchedulerSnapshot {
-        let state = self
-            .shared
-            .state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let state = self.shared.state.read();
         state.snapshot()
     }
 
     pub fn get_pending_transactions(&self, hashes: &[TxHash]) -> Vec<ValidatedTransaction> {
-        let state = self
-            .shared
-            .state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let state = self.shared.state.read();
         state.pending_transactions(hashes)
     }
 
@@ -344,20 +367,12 @@ impl SchedulerHandle {
     ) -> PersistedSchedulerSnapshot {
         // Callers must stamp `event_seq_hi` with the event watermark captured
         // alongside this snapshot before persisting it.
-        let state = self
-            .shared
-            .state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let state = self.shared.state.read();
         state.persisted_snapshot(captured_at_unix_ms, captured_at_mono_ns)
     }
 
     pub fn metrics(&self) -> SchedulerMetrics {
-        let state = self
-            .shared
-            .state
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let state = self.shared.state.read();
         let handoff_queue_capacity = self.ingress_tx.max_capacity();
         let queue_depth = handoff_queue_capacity.saturating_sub(self.ingress_tx.capacity());
 
@@ -386,12 +401,17 @@ pub enum SchedulerEnqueueError {
     QueueClosed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SchedulerSnapshotError {
+    #[error("duplicate pending transaction hash in snapshot: {hash:?}")]
     DuplicatePendingHash { hash: TxHash },
+    #[error("missing pending transaction for sender queue entry: {hash:?}")]
     MissingPendingTransaction { hash: TxHash },
+    #[error("duplicate sender nonce in snapshot: sender {sender:?}, nonce {nonce}")]
     DuplicateSenderNonce { sender: Address, nonce: u64 },
+    #[error("sender queue entry does not match pending transaction sender/nonce: {hash:?}")]
     QueueEntryMismatch { hash: TxHash },
+    #[error("snapshot executable frontier does not match reconstructed sender queues")]
     ExecutableFrontierMismatch,
 }
 
@@ -436,16 +456,19 @@ impl SchedulerRuntime {
     }
 }
 
-pub fn scheduler_channel(config: SchedulerConfig) -> (SchedulerHandle, SchedulerRuntime) {
-    scheduler_channel_with_state(config, SchedulerState::default())
+pub fn scheduler_channel(
+    config: SchedulerConfig,
+) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerConfigError> {
+    let config = validate_config(config)?;
+    Ok(scheduler_channel_with_state(config, SchedulerState::default()))
 }
 
 pub fn scheduler_channel_with_rehydration(
     config: SchedulerConfig,
     snapshot: Option<PersistedSchedulerSnapshot>,
     replay_transactions: Vec<ValidatedTransaction>,
-) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerSnapshotError> {
-    let config = normalize_config(config);
+) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerInitError> {
+    let config = validate_config(config)?;
     let mut state = match snapshot {
         Some(snapshot) => SchedulerState::from_persisted_snapshot(snapshot)?,
         None => SchedulerState::default(),
@@ -460,7 +483,6 @@ fn scheduler_channel_with_state(
     config: SchedulerConfig,
     state: SchedulerState,
 ) -> (SchedulerHandle, SchedulerRuntime) {
-    let config = normalize_config(config);
     let (ingress_tx, ingress_rx) = mpsc::channel(config.handoff_queue_capacity);
     let shared = Arc::new(SharedState {
         config,
@@ -482,7 +504,7 @@ pub fn spawn_scheduler_with_rehydration(
     config: SchedulerConfig,
     snapshot: Option<PersistedSchedulerSnapshot>,
     replay_transactions: Vec<ValidatedTransaction>,
-) -> Result<SchedulerHandle, SchedulerSnapshotError> {
+) -> Result<SchedulerHandle, SchedulerInitError> {
     let (handle, runtime) =
         scheduler_channel_with_rehydration(config, snapshot, replay_transactions)?;
     Ok(spawn_runtime(handle, runtime))
@@ -499,12 +521,14 @@ fn spawn_runtime(handle: SchedulerHandle, runtime: SchedulerRuntime) -> Schedule
     handle
 }
 
-fn normalize_config(config: SchedulerConfig) -> SchedulerConfig {
-    SchedulerConfig {
-        handoff_queue_capacity: config.handoff_queue_capacity.max(1),
-        max_pending_per_sender: config.max_pending_per_sender.max(1),
-        replacement_fee_bump_bps: config.replacement_fee_bump_bps,
+fn validate_config(config: SchedulerConfig) -> Result<SchedulerConfig, SchedulerConfigError> {
+    if config.handoff_queue_capacity == 0 {
+        return Err(SchedulerConfigError::HandoffQueueCapacityZero);
     }
+    if config.max_pending_per_sender == 0 {
+        return Err(SchedulerConfigError::MaxPendingPerSenderZero);
+    }
+    Ok(config)
 }
 
 fn normalized_member_hashes(tx_hash: TxHash, members: &[TxHash]) -> Vec<TxHash> {
@@ -525,10 +549,7 @@ struct SharedState {
 
 impl SharedState {
     fn admit(&self, tx: ValidatedTransaction) -> SchedulerAdmissionOutcome {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state.write();
         state.admit(tx, self.config)
     }
 
@@ -536,10 +557,7 @@ impl SharedState {
         &self,
         candidates: Vec<SchedulerCandidate>,
     ) -> SchedulerCandidateDispatch {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state.write();
         state.register_candidates(candidates)
     }
 
@@ -547,26 +565,17 @@ impl SharedState {
         &self,
         result: SchedulerSimulationResult,
     ) -> SchedulerSimulationApplyOutcome {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state.write();
         state.apply_simulation_result(result)
     }
 
     fn advance_head(&self, block_number: u64) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state.write();
         state.advance_head(block_number);
     }
 
     fn invalidate_candidate_hash(&self, hash: TxHash) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self.state.write();
         state.invalidate_candidate_hash(hash);
     }
 }
@@ -583,7 +592,7 @@ struct SchedulerState {
     pending: BTreeMap<TxHash, ValidatedTransaction>,
     sender_queues: BTreeMap<Address, BTreeMap<u64, TxHash>>,
     sender_queue_counts: BTreeMap<Address, SenderQueueCounts>,
-    candidates: BTreeMap<String, CandidateEntry>,
+    candidates: BTreeMap<CandidateId, CandidateEntry>,
     head_block_number: u64,
     admitted_total: u64,
     duplicate_total: u64,

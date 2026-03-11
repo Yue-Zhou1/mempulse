@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
+auto_impl = { workspace = true }
 axum = { workspace = true }
 builder = { path = "../builder" }
 common = { path = "../common" }
@@ -14,6 +15,7 @@ feature-engine = { path = "../feature-engine" }
 futures = { workspace = true }
 hashbrown = { workspace = true }
 node-runtime = { path = "../node-runtime" }
+parking_lot = { workspace = true }
 replay = { path = "../replay" }
 runtime-core = { path = "../runtime-core" }
 scheduler = { path = "../scheduler" }

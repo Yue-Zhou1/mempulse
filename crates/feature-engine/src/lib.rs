@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod registry;
 
 use common::{Address, TxHash};

@@ -1,6 +1,7 @@
 use common::SourceId;
 use event_log::{EventEnvelope, EventPayload, TxSeen};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use storage::{EventStore, InMemoryStorage, OpportunityRecord, TxFeaturesRecord};
 use viz_api::{InMemoryVizProvider, VizDataProvider};
 
@@ -25,7 +26,7 @@ fn seen_event(seq_id: u64, hash_seed: u8) -> EventEnvelope {
 
 fn seed_storage() -> Arc<RwLock<InMemoryStorage>> {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
-    let mut guard = storage.write().expect("lock storage for seed");
+    let mut guard = storage.write();
     for seq in 1..=6 {
         guard.append_event(seen_event(seq, seq as u8));
     }
@@ -99,10 +100,7 @@ fn dashboard_snapshot_perf_invalidates_cache_when_storage_advances() {
     let _ = provider.replay_points();
     assert_eq!(provider.dashboard_cache_refreshes(), 1);
 
-    storage
-        .write()
-        .expect("lock storage for update")
-        .append_event(seen_event(7, 7));
+    storage.write().append_event(seen_event(7, 7));
 
     let replay = provider.replay_points();
     assert_eq!(provider.dashboard_cache_refreshes(), 2);

@@ -1,11 +1,12 @@
 use axum::{body::Body, http::Request};
 use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
+use parking_lot::RwLock;
 use runtime_core::{
     RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
 };
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{
     InMemoryStorage, PeerStatsRecord, StorageTryEnqueueError, StorageWriteHandle, StorageWriteOp,
 };
@@ -61,7 +62,8 @@ fn queue_drop_policy_bounds_queue_and_classifies_full_vs_closed() {
 #[tokio::test]
 async fn queue_drop_policy_exposes_reasoned_drop_metrics_in_prometheus() {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
-    let (scheduler, _runtime) = scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+    let (scheduler, _runtime) = scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+        .expect("valid scheduler config");
     let (storage_tx, _storage_rx) = mpsc::channel(8);
     let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
         deps: RuntimeCoreDeps {

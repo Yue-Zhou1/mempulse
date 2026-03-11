@@ -9,11 +9,11 @@ fn sample_candidate(
     member_tx_hashes: Vec<TxHash>,
 ) -> SchedulerCandidate {
     SchedulerCandidate {
-        candidate_id: candidate_id.to_owned(),
+        candidate_id: candidate_id.into(),
         tx_hash,
         member_tx_hashes,
         score: 12_345,
-        strategy: "SandwichCandidate".to_owned(),
+        strategy: "SandwichCandidate".into(),
         detected_unix_ms: 1_700_000_000_000,
     }
 }
@@ -34,7 +34,8 @@ fn sample_sim_result(
 
 #[tokio::test]
 async fn scheduler_registers_candidates_and_issues_simulation_tasks() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let candidate = sample_candidate("cand-1", [0x11; 32], vec![[0x11; 32]]);
@@ -44,14 +45,15 @@ async fn scheduler_registers_candidates_and_issues_simulation_tasks() {
         .expect("register candidates");
 
     assert_eq!(dispatch.simulation_tasks.len(), 1);
-    assert_eq!(dispatch.simulation_tasks[0].candidate_id, "cand-1");
+    assert_eq!(dispatch.simulation_tasks[0].candidate_id.as_str(), "cand-1");
 
     runtime_task.abort();
 }
 
 #[tokio::test]
 async fn scheduler_discards_stale_simulation_results_after_head_advance() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let candidate = sample_candidate("cand-1", [0x11; 32], vec![[0x11; 32]]);

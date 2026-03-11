@@ -2,8 +2,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use common::{Address, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxReorged};
+use parking_lot::RwLock;
 use scheduler::{PersistedSchedulerSnapshot, ValidatedTransaction};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{EventStore, InMemoryStorage, TxFullRecord};
 use tokio::time::{Duration, Instant, sleep};
 use tower::util::ServiceExt;
@@ -89,7 +90,7 @@ async fn metrics_route_reports_replay_lag_checkpoint_duration_and_reorg_tail_dep
     let tx = sample_validated_tx(1, sender(0xa1), 7);
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&tx));
         guard.append_event(decoded_event(1, &tx));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
@@ -158,7 +159,7 @@ async fn metrics_route_serves_cached_replay_metrics_until_background_refresh() {
     let tx = sample_validated_tx(2, sender(0xb2), 8);
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.upsert_tx_full(tx_full_record(&tx));
         guard.write_scheduler_snapshot(PersistedSchedulerSnapshot {
             captured_at_unix_ms: 1_700_000_000_500,
@@ -189,7 +190,7 @@ async fn metrics_route_serves_cached_replay_metrics_until_background_refresh() {
     assert!(initial_payload.contains("mempulse_replay_tail_reorged_tx_total 0"));
 
     {
-        let mut guard = storage.write().expect("storage writable");
+        let mut guard = storage.write();
         guard.append_event(reorg_event(1, &tx));
     }
 

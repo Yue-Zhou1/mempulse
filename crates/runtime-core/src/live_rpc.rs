@@ -7,7 +7,7 @@ pub use crate::{
 use ahash::RandomState;
 use anyhow::{Context, Result, anyhow};
 use builder::{AssemblyCandidate, AssemblyDecision};
-use common::{Address, SourceId, TxHash};
+use common::{Address, CandidateId, SourceId, TxHash};
 use event_log::{
     AssemblyDecisionApplied, BundleSubmitted, CandidateQueued, EventPayload, OppDetected,
     SimCompleted, SimDispatched, TxBlocked, TxDecoded, TxDropped, TxFetched, TxReady, TxReplaced,
@@ -18,6 +18,7 @@ use feature_engine::{
 };
 use futures::{SinkExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
+use parking_lot::RwLock;
 use scheduler::{
     SchedulerAdmission, SchedulerCandidate, SchedulerEnqueueError, SchedulerHandle,
     SchedulerQueueState, SchedulerQueueTransition, SchedulerSimulationResult, SimulationTaskSpec,
@@ -34,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, StorageTryEnqueueError, StorageWriteHandle,
@@ -302,19 +303,13 @@ impl LiveRpcSimulationService {
 
     fn runtime(&self) -> LiveRpcSimulationRuntime {
         {
-            let runtime = self
-                .runtime
-                .read()
-                .unwrap_or_else(|poison| poison.into_inner());
+            let runtime = self.runtime.read();
             if !runtime.ingress_tx.is_closed() {
                 return runtime.clone();
             }
         }
 
-        let mut runtime = self
-            .runtime
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut runtime = self.runtime.write();
         if runtime.ingress_tx.is_closed() {
             *runtime = spawn_live_rpc_simulation_runtime(self.queue_capacity, self.worker_total);
         }
@@ -536,7 +531,7 @@ fn apply_builder_assembly_state_with_owner(
     state_owner: &LiveRpcStateOwner,
     task: &SimulationTask,
     outcome: &RemoteSimulationOutcome,
-    accepted_candidate_ids: &BTreeSet<String>,
+    accepted_candidate_ids: &BTreeSet<CandidateId>,
 ) -> Vec<BuilderDecisionRecord> {
     let Some(batch) = outcome.simulation_batch.as_ref() else {
         return Vec::new();
@@ -2605,11 +2600,11 @@ fn build_candidate_queued_payload(
     opportunity: &OpportunityRecord,
 ) -> EventPayload {
     EventPayload::CandidateQueued(CandidateQueued {
-        candidate_id: candidate.candidate_id.clone(),
+        candidate_id: candidate.candidate_id.to_string(),
         tx_hash: candidate.tx_hash,
         member_tx_hashes: candidate.member_tx_hashes.clone(),
         chain_id: opportunity.chain_id,
-        strategy: candidate.strategy.clone(),
+        strategy: candidate.strategy.to_string(),
         score: candidate.score,
         protocol: opportunity.protocol.clone(),
         category: opportunity.category.clone(),
@@ -2623,7 +2618,7 @@ fn build_candidate_queued_payload(
 
 fn build_sim_dispatched_payload(spec: &SimulationTaskSpec) -> EventPayload {
     EventPayload::SimDispatched(SimDispatched {
-        candidate_id: spec.candidate_id.clone(),
+        candidate_id: spec.candidate_id.to_string(),
         tx_hash: spec.tx_hash,
         member_tx_hashes: spec.member_tx_hashes.clone(),
         block_number: spec.block_number,
@@ -2638,7 +2633,8 @@ fn scheduler_candidate_from_executable_opportunity(
             "{:?}:{}",
             opportunity.candidate.strategy,
             format_fixed_hex(&opportunity.record.tx_hash)
-        ),
+        )
+        .into(),
         tx_hash: opportunity.record.tx_hash,
         member_tx_hashes: if opportunity.candidate.member_tx_hashes.is_empty() {
             vec![opportunity.record.tx_hash]
@@ -2646,7 +2642,7 @@ fn scheduler_candidate_from_executable_opportunity(
             opportunity.candidate.member_tx_hashes.clone()
         },
         score: opportunity.record.score,
-        strategy: opportunity.record.strategy.clone(),
+        strategy: opportunity.record.strategy.clone().into(),
         detected_unix_ms: opportunity.record.detected_unix_ms,
     }
 }
@@ -3088,7 +3084,10 @@ struct CachedStateProviderView {
 }
 
 impl StateProvider for CachedStateProviderView {
-    fn account_seed(&self, address: Address) -> Result<Option<AccountSeed>> {
+    fn account_seed(
+        &self,
+        address: Address,
+    ) -> std::result::Result<Option<AccountSeed>, sim_engine::SimError> {
         Ok(self.account_seeds.get(&address).copied())
     }
 }
@@ -3519,11 +3518,7 @@ fn format_method_selector_hex(selector: Option<[u8; 4]>) -> String {
 }
 
 fn current_seq_hi(storage: &Arc<RwLock<InMemoryStorage>>) -> u64 {
-    storage
-        .read()
-        .ok()
-        .and_then(|store| store.latest_seq_id())
-        .unwrap_or(0)
+    storage.read().latest_seq_id().unwrap_or(0)
 }
 
 fn current_unix_ms() -> i64 {
@@ -4067,7 +4062,7 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
         let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let tx = validated_transaction_from_live_tx(
@@ -4115,7 +4110,7 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
         let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let tx = validated_transaction_from_live_tx(
@@ -4152,7 +4147,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4218,7 +4213,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4270,7 +4265,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -4337,7 +4332,7 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let first = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
                 storage: Arc::new(RwLock::new(InMemoryStorage::default())),
@@ -4384,7 +4379,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(256);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4445,7 +4440,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(512);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4529,7 +4524,7 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(32);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4567,7 +4562,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4619,7 +4614,8 @@ mod tests {
             handoff_queue_capacity: 1,
             max_pending_per_sender: 64,
             replacement_fee_bump_bps: 1_000,
-        });
+        })
+        .expect("valid scheduler config");
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
         let chain = test_chain();
@@ -4669,7 +4665,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         drop(runtime);
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4695,7 +4691,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4763,7 +4759,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4851,7 +4847,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4910,7 +4906,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default());
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 

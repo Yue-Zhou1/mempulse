@@ -1,6 +1,7 @@
 use common::SourceId;
 use event_log::{EventPayload, TxSeen};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::Duration;
 use storage::{
     EventStore, InMemoryStorage, NoopClickHouseSink, StorageWriteOp, StorageWriterConfig,
@@ -43,7 +44,7 @@ async fn append_event_sequence_is_assigned_by_storage_writer() {
 
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    let events = storage.read().expect("storage lock").list_events();
+    let events = storage.read().list_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].seq_id, 1);
 }

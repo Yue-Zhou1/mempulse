@@ -1,7 +1,8 @@
 use common::{Address, TxHash};
 use event_log::TxDecoded;
 use sim_engine::{
-    AccountSeed, ChainContext, SimulationMode, SimulationTxInput, StateProvider, simulate_with_mode,
+    AccountSeed, ChainContext, SimError, SimulationMode, SimulationTxInput, StateProvider,
+    simulate_with_mode,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -30,7 +31,7 @@ impl MockStateProvider {
 }
 
 impl StateProvider for MockStateProvider {
-    fn account_seed(&self, _address: Address) -> anyhow::Result<Option<AccountSeed>> {
+    fn account_seed(&self, _address: Address) -> Result<Option<AccountSeed>, SimError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(Some(AccountSeed {
             balance_wei: 2_000_000_000_000_000_000_000_000_000_000,
