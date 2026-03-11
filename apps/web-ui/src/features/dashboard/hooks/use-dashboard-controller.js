@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { resolveApiBase } from '../../../network/api-base.js';
 import { readWindowRuntimeConfig, resolveUiRuntimeConfig } from '../domain/ui-config.js';
 import {
@@ -45,7 +45,6 @@ export function useDashboardController() {
     maxFeatureHistory,
     maxOpportunityHistory,
     maxRenderedTransactions,
-    streamBatchMs,
     samplingLagThresholdMs,
     samplingStride,
     samplingFlushIdleMs,
@@ -101,10 +100,6 @@ export function useDashboardController() {
   const snapshotInFlightRef = useRef(false);
   const nextSnapshotAtRef = useRef(0);
 
-  const resolveTransactionDetail = useCallback(
-    (hash) => getTransactionDetailByHash(hash),
-    [],
-  );
   const selectedDetail = useSelectedTransactionDetail(selectedHash);
 
   const derived = useDashboardDerivedState({
@@ -115,7 +110,7 @@ export function useDashboardController() {
     featureDetailRows,
     opportunityRows,
     selectedHash,
-    resolveTransactionDetail,
+    resolveTransactionDetail: getTransactionDetailByHash,
     transactionDetailVersion,
     recentTxRows,
     selectedOpportunityKey,
@@ -150,7 +145,6 @@ export function useDashboardController() {
     maxTransactionHistory,
     maxFeatureHistory,
     maxOpportunityHistory,
-    streamBatchMs,
     streamTransport,
     samplingLagThresholdMs,
     samplingStride,
@@ -191,7 +185,7 @@ export function useDashboardController() {
     enqueueTickerCommit,
     flushTickerCommit,
     cancelTickerCommit,
-    resolveTransactionDetail,
+    resolveTransactionDetail: getTransactionDetailByHash,
     setSelectedOpportunityKey,
     setStatusMessage,
     setHasError,

@@ -5,6 +5,7 @@ import {
   opportunityCandidateTone,
   opportunityRowKey,
   resolveMainnetLabel,
+  resolvePerfNow,
   shortHex,
 } from '../lib/dashboard-helpers.js';
 import { buildVirtualizedOpportunityWindow } from '../lib/opportunity-virtualized-model.js';
@@ -13,13 +14,6 @@ import { cn } from '../../../shared/lib/utils.js';
 
 const OPPORTUNITY_ROW_HEIGHT_PX = 96;
 const OPPORTUNITY_OVERSCAN_ROWS = 4;
-
-function resolvePerfNow() {
-  if (typeof globalThis?.performance?.now === 'function') {
-    return globalThis.performance.now();
-  }
-  return Date.now();
-}
 
 function OpportunitiesScreenImpl({ model, actions }) {
   const {

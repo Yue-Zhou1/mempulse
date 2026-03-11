@@ -1,3 +1,5 @@
+import { normalizeToken } from './screen-mode.js';
+
 export const DASHBOARD_STYLE_NEWSPAPER = 'newspaper';
 export const DASHBOARD_STYLE_MODERN_FINANCIAL = 'modern-financial';
 
@@ -16,10 +18,6 @@ const DASHBOARD_STYLE_SET = new Set(
   DASHBOARD_STYLE_OPTIONS.map((option) => option.id),
 );
 const DASHBOARD_STYLE_STORAGE_KEY = 'mempulse_ui_style_mode';
-
-function normalizeToken(value) {
-  return String(value ?? '').trim().toLowerCase();
-}
 
 export function normalizeDashboardStyleMode(value) {
   const normalized = normalizeToken(value);

@@ -12,6 +12,7 @@ import {
   isAbortError,
   normalizeChainStatusRows,
   opportunityRowKey,
+  resolvePerfNow,
 } from '../lib/dashboard-helpers.js';
 import {
   clearTransactionDetailCache,
@@ -30,13 +31,6 @@ const streamInitialReconnectMs = 1000;
 const streamMaxReconnectMs = 30000;
 const steadySnapshotRefreshMs = 15000;
 const statusMessageThrottleMs = 1500;
-
-function resolvePerfNow() {
-  if (typeof globalThis?.performance?.now === 'function') {
-    return globalThis.performance.now();
-  }
-  return Date.now();
-}
 
 function resolveUsedHeapSize() {
   const heapBytes = globalThis?.performance?.memory?.usedJSHeapSize;
@@ -318,16 +312,6 @@ export function resolveDashboardStatusMessageUpdate({
   };
 }
 
-export function resolveDashboardStreamConnector({
-  streamTransport,
-  connectEventSource,
-  connectWorker,
-}) {
-  void streamTransport;
-  void connectWorker;
-  return connectEventSource;
-}
-
 export function applyDashboardSseResetResync({
   cancelled = false,
   reset,
@@ -356,7 +340,6 @@ export function useDashboardLifecycleEffects({
   maxTransactionHistory,
   maxFeatureHistory,
   maxOpportunityHistory,
-  streamBatchMs,
   streamTransport,
   samplingLagThresholdMs,
   samplingStride,
@@ -448,7 +431,6 @@ export function useDashboardLifecycleEffects({
   useEffect(() => {
     let cancelled = false;
     const perfMonitor = createDashboardPerfMonitor(globalThis?.window);
-    void streamBatchMs;
     const runtimePolicy = resolveDashboardRuntimePolicy(activeScreen);
     let heapSampleTimer = null;
     let fallbackSnapshotPollTimer = null;
@@ -580,10 +562,6 @@ export function useDashboardLifecycleEffects({
       if (typeof perf.clearResourceTimings === 'function') {
         perf.clearResourceTimings();
       }
-    };
-
-    const appendPendingRows = (targetRows, incomingRows, maxItems) => {
-      appendBoundedRows(targetRows, incomingRows, maxItems);
     };
 
     const cancelPendingDeltaFlush = () => {
@@ -1162,14 +1140,14 @@ export function useDashboardLifecycleEffects({
       }
 
       pendingDeltaMarketStats = batch.marketStats ?? pendingDeltaMarketStats;
-      appendPendingRows(
+      appendBoundedRows(
         pendingDeltaOpportunityRows,
         batch.opportunityRows,
         pendingDeltaOpportunityCap,
       );
       if (runtimePolicy.shouldProcessTxStream) {
-        appendPendingRows(pendingDeltaFeatureRows, batch.featureRows, pendingDeltaFeatureCap);
-        appendPendingRows(
+        appendBoundedRows(pendingDeltaFeatureRows, batch.featureRows, pendingDeltaFeatureCap);
+        appendBoundedRows(
           pendingDeltaTransactions,
           batch.transactions,
           pendingDeltaTransactionCap,
@@ -1224,37 +1202,30 @@ export function useDashboardLifecycleEffects({
         return;
       }
 
-      const connectTransport = resolveDashboardStreamConnector({
-        streamTransport,
-        connectEventSource: () => {
-          connectEventSource({
-            apiBase,
-            afterSeqId: latestSeqIdRef.current,
-            onOpen: () => {
-              handleStreamOpen('sse-open');
-            },
-            onBatch: handleStreamBatch,
-            onReset: (reset) => {
-              applyDashboardSseResetResync({
-                cancelled,
-                reset,
-                latestSeqIdRef,
-                scheduleSnapshot,
-                forceTxWindowSnapshot: runtimePolicy.shouldForceTxWindowSnapshot,
-              });
-            },
-            onError: (error) => {
-              if (cancelled) {
-                return;
-              }
-              setHasError(true);
-              publishStatusMessage(`SSE stream error: ${error.message}`, { force: true });
-            },
+      connectEventSource({
+        apiBase,
+        afterSeqId: latestSeqIdRef.current,
+        onOpen: () => {
+          handleStreamOpen('sse-open');
+        },
+        onBatch: handleStreamBatch,
+        onReset: (reset) => {
+          applyDashboardSseResetResync({
+            cancelled,
+            reset,
+            latestSeqIdRef,
+            scheduleSnapshot,
+            forceTxWindowSnapshot: runtimePolicy.shouldForceTxWindowSnapshot,
           });
         },
-        connectWorker: () => {},
+        onError: (error) => {
+          if (cancelled) {
+            return;
+          }
+          setHasError(true);
+          publishStatusMessage(`SSE stream error: ${error.message}`, { force: true });
+        },
       });
-      connectTransport?.();
     };
 
     publishStatusMessage(`Connecting events(v1/sse) to ${apiBase}`, { force: true });
@@ -1313,7 +1284,6 @@ export function useDashboardLifecycleEffects({
     maxFeatureHistory,
     maxOpportunityHistory,
     maxTransactionHistory,
-    streamBatchMs,
     streamTransport,
     samplingLagThresholdMs,
     samplingStride,
@@ -1332,7 +1302,6 @@ export function useDashboardLifecycleEffects({
     setHasError,
     setMarketStats,
     setOpportunityRows,
-    resolveTransactionDetail,
     setSelectedOpportunityKey,
     setStatusMessage,
     snapshotInFlightRef,
