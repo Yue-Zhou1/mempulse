@@ -1,6 +1,6 @@
+use crate::IngestError;
 use ahash::RandomState;
 use auto_impl::auto_impl;
-use crate::IngestError;
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxFetched, TxSeen};
 use hashbrown::{HashMap, HashSet};

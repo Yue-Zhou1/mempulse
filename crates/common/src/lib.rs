@@ -31,9 +31,7 @@ impl Display for SourceId {
     }
 }
 
-#[derive(
-    Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CandidateId(pub String);
 
@@ -88,9 +86,7 @@ impl Deref for CandidateId {
     }
 }
 
-#[derive(
-    Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StrategyId(pub String);
 

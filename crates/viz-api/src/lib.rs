@@ -4,8 +4,8 @@ pub mod auth;
 pub mod live_rpc;
 pub mod stream_broadcast;
 
-use auto_impl::auto_impl;
 use auth::{ApiAuthConfig, ApiRateLimiter};
+use auto_impl::auto_impl;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
@@ -1534,9 +1534,7 @@ fn start_replay_runtime_metrics_refresher_once(
     }
 }
 
-fn abort_replay_runtime_metrics_refresher(
-    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
-) {
+fn abort_replay_runtime_metrics_refresher(abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>) {
     let handle = abort_slot.get();
     if let Some(handle) = handle {
         handle.abort();
@@ -4251,7 +4249,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_snapshot_route_returns_scheduler_state() {
         let (scheduler, runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x51, 7))
@@ -4292,7 +4290,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_metrics_route_returns_scheduler_metrics() {
         let (scheduler, runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x61, 9))
@@ -4497,7 +4495,7 @@ mod tests {
     #[tokio::test]
     async fn sim_route_reads_runtime_core_status_provider_when_injected() {
         let (scheduler, _runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let handle = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {

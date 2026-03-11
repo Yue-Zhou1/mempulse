@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn runtime_core_starts_with_default_views() {
         let (scheduler, _runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = mpsc::channel::<StorageWriteOp>(8);
         let args = RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -617,7 +617,7 @@ mod tests {
 
     fn make_runtime_core() -> super::RuntimeCoreHandle {
         let (scheduler, _runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = mpsc::channel::<StorageWriteOp>(8);
         RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {

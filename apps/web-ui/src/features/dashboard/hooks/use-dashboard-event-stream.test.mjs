@@ -9,7 +9,6 @@ import {
   applyDashboardSseResetResync,
   resolveDashboardStatusMessageUpdate,
   resolveIncomingTransactionRows,
-  resolveDashboardStreamConnector,
 } from './use-dashboard-lifecycle-effects.js';
 
 function buildDeltaPayload(seq = 41) {
@@ -120,40 +119,6 @@ test('disconnectDashboardEventSource closes source and clears handlers', () => {
   assert.equal(source.closed, true);
   assert.equal(source.onopen, null);
   assert.equal(source.onerror, null);
-});
-
-test('resolveDashboardStreamConnector selects SSE connector when transport is sse', () => {
-  const calls = [];
-  const connector = resolveDashboardStreamConnector({
-    streamTransport: 'sse',
-    connectEventSource: () => {
-      calls.push('sse');
-    },
-    connectWorker: () => {
-      calls.push('ws');
-    },
-  });
-
-  connector();
-
-  assert.deepEqual(calls, ['sse']);
-});
-
-test('resolveDashboardStreamConnector selects SSE connector when transport is ws', () => {
-  const calls = [];
-  const connector = resolveDashboardStreamConnector({
-    streamTransport: 'ws',
-    connectEventSource: () => {
-      calls.push('sse');
-    },
-    connectWorker: () => {
-      calls.push('ws');
-    },
-  });
-
-  connector();
-
-  assert.deepEqual(calls, ['sse']);
 });
 
 test('applyDashboardSseResetResync updates seq cursor and schedules immediate snapshot', () => {

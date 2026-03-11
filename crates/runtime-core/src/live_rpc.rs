@@ -4062,7 +4062,8 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
         let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let tx = validated_transaction_from_live_tx(
@@ -4110,7 +4111,8 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
         let chain = test_chain_with_http_url(format!("http://{rpc_addr}"));
         let tx = validated_transaction_from_live_tx(
@@ -4147,7 +4149,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4213,7 +4216,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4265,7 +4269,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let runtime_core = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -4332,7 +4337,8 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, _runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let first = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
                 storage: Arc::new(RwLock::new(InMemoryStorage::default())),
@@ -4379,7 +4385,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(256);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4440,7 +4447,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(512);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4524,7 +4532,8 @@ mod tests {
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(32);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4562,7 +4571,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4665,7 +4675,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(8);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         drop(runtime);
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4691,7 +4702,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(64);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4759,7 +4771,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4847,7 +4860,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 
@@ -4906,7 +4920,8 @@ mod tests {
         let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel(128);
         let writer = StorageWriteHandle::from_sender(storage_tx);
         let (scheduler, runtime) =
-            scheduler::scheduler_channel(scheduler::SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler::scheduler_channel(scheduler::SchedulerConfig::default())
+                .expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         let (_runtime_core, state_owner) = test_runtime_core_owner(&writer, &scheduler);
 

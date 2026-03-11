@@ -1,5 +1,5 @@
-use auto_impl::auto_impl;
 use crate::Result;
+use auto_impl::auto_impl;
 use common::Address;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

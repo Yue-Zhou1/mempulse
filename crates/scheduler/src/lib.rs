@@ -460,7 +460,10 @@ pub fn scheduler_channel(
     config: SchedulerConfig,
 ) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerConfigError> {
     let config = validate_config(config)?;
-    Ok(scheduler_channel_with_state(config, SchedulerState::default()))
+    Ok(scheduler_channel_with_state(
+        config,
+        SchedulerState::default(),
+    ))
 }
 
 pub fn scheduler_channel_with_rehydration(

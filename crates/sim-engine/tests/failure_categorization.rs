@@ -1,8 +1,8 @@
 use common::Address;
 use event_log::TxDecoded;
 use sim_engine::{
-    AccountSeed, ChainContext, SimError, SimulationFailCategory, SimulationMode,
-    SimulationTxInput, StateProvider, simulate_with_mode,
+    AccountSeed, ChainContext, SimError, SimulationFailCategory, SimulationMode, SimulationTxInput,
+    StateProvider, simulate_with_mode,
 };
 
 fn address(v: u8) -> Address {

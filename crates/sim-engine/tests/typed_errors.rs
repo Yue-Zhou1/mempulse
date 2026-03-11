@@ -56,8 +56,12 @@ fn rpc_backed_state_provider_errors_are_typed() {
         calldata: Some(vec![0xde, 0xad, 0xbe, 0xef]),
     }];
 
-    let err = simulate_with_mode(&context(), &txs, SimulationMode::RpcBacked(&FailingStateProvider))
-        .expect_err("state fetch should fail");
+    let err = simulate_with_mode(
+        &context(),
+        &txs,
+        SimulationMode::RpcBacked(&FailingStateProvider),
+    )
+    .expect_err("state fetch should fail");
 
     assert!(matches!(err, SimError::StateFetch(_)));
     assert!(err.to_string().contains("state fetch failed"));
@@ -70,7 +74,10 @@ fn reverted_error_displays_reason() {
         reason: "execution reverted".to_owned(),
     };
 
-    assert_eq!(err.to_string(), "EVM execution reverted: execution reverted");
+    assert_eq!(
+        err.to_string(),
+        "EVM execution reverted: execution reverted"
+    );
 }
 
 #[test]

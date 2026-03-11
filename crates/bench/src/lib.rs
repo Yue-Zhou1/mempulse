@@ -440,7 +440,7 @@ fn synthetic_scheduler_snapshot(
     let runtime = build_tokio_runtime();
     runtime.block_on(async {
         let (handle, runtime) =
-        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
 
         for transaction in transactions.iter().cloned() {

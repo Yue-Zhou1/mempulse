@@ -5,7 +5,10 @@ fn candidate_and_strategy_ids_roundtrip_through_serde() {
     let candidate = CandidateId::from("cand-1");
     let strategy = StrategyId::from("SandwichCandidate");
 
-    assert_eq!(serde_json::to_string(&candidate).expect("serialize"), "\"cand-1\"");
+    assert_eq!(
+        serde_json::to_string(&candidate).expect("serialize"),
+        "\"cand-1\""
+    );
     assert_eq!(
         serde_json::to_string(&strategy).expect("serialize"),
         "\"SandwichCandidate\""

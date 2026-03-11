@@ -121,10 +121,9 @@ impl StorageWal {
             .with_context(|| format!("read WAL directory {}", parent.display()))
             .map_err(StorageError::wal_write)?
         {
-            let entry =
-                entry
-                    .with_context(|| format!("read WAL directory entry {}", parent.display()))
-                    .map_err(StorageError::wal_write)?;
+            let entry = entry
+                .with_context(|| format!("read WAL directory entry {}", parent.display()))
+                .map_err(StorageError::wal_write)?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -176,7 +175,9 @@ fn read_events_from_path(path: &Path) -> Result<Vec<EventEnvelope>> {
     let reader = BufReader::new(file);
     let mut events = Vec::new();
     for line in reader.lines() {
-        let line = line.context("read WAL line").map_err(StorageError::wal_write)?;
+        let line = line
+            .context("read WAL line")
+            .map_err(StorageError::wal_write)?;
         if line.trim().is_empty() {
             continue;
         }
