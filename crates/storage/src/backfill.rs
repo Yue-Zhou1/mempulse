@@ -1,3 +1,5 @@
+//! Backfill helpers for replaying historical events into storage.
+
 use crate::{EventStore, InMemoryStorage};
 use event_log::{EventEnvelope, sort_deterministic};
 use parking_lot::RwLock;
@@ -5,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Retention settings applied while backfilling historical events.
 pub struct BackfillConfig {
     pub retention_window_ms: i64,
 }
@@ -18,12 +21,14 @@ impl Default for BackfillConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Counts describing one backfill run.
 pub struct BackfillSummary {
     pub inserted: u64,
     pub skipped_duplicates: u64,
     pub pruned_by_retention: u64,
 }
 
+/// Applies historical events into an in-memory storage instance with deduplication.
 pub struct BackfillWriter {
     storage: Arc<RwLock<InMemoryStorage>>,
     config: BackfillConfig,
@@ -31,6 +36,7 @@ pub struct BackfillWriter {
 }
 
 impl BackfillWriter {
+    /// Creates a backfill writer with normalized retention settings.
     pub fn new(storage: Arc<RwLock<InMemoryStorage>>, config: BackfillConfig) -> Self {
         Self {
             storage,
@@ -41,6 +47,7 @@ impl BackfillWriter {
         }
     }
 
+    /// Applies events in deterministic order and returns insertion/prune counters.
     pub fn apply_events(&mut self, events: &[EventEnvelope], now_unix_ms: i64) -> BackfillSummary {
         let retention_cutoff = now_unix_ms.saturating_sub(self.config.retention_window_ms);
         let mut sorted = events.to_vec();

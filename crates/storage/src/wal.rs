@@ -1,3 +1,5 @@
+//! Simple segmented write-ahead log used to recover event batches after restart.
+
 use crate::{Result, StorageError};
 use anyhow::Context;
 use event_log::EventEnvelope;
@@ -7,16 +9,19 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug)]
+/// Line-delimited JSON WAL with simple size-based segment rotation.
 pub struct StorageWal {
     path: PathBuf,
     segment_max_bytes: u64,
 }
 
 impl StorageWal {
+    /// Creates a WAL with the default segment size.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         Self::with_segment_size(path, DEFAULT_SEGMENT_MAX_BYTES)
     }
 
+    /// Creates a WAL with an explicit maximum segment size.
     pub fn with_segment_size(path: impl Into<PathBuf>, segment_max_bytes: u64) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -30,6 +35,7 @@ impl StorageWal {
         })
     }
 
+    /// Appends one event to the current active segment.
     pub fn append_event(&self, event: &EventEnvelope) -> Result<()> {
         let segment_path = self.active_segment_path_for_append()?;
         let mut file = OpenOptions::new()
@@ -47,6 +53,7 @@ impl StorageWal {
         Ok(())
     }
 
+    /// Recovers and sorts all events currently present in the WAL.
     pub fn recover_events(&self) -> Result<Vec<EventEnvelope>> {
         let mut events = Vec::new();
         let segments = self.segment_paths()?;
@@ -62,6 +69,7 @@ impl StorageWal {
         Ok(events)
     }
 
+    /// Returns recovered events strictly after the provided sequence id.
     pub fn scan(&self, from_seq_id: u64, limit: usize) -> Result<Vec<EventEnvelope>> {
         let limit = limit.max(1);
         let events = self.recover_events()?;
@@ -72,6 +80,7 @@ impl StorageWal {
             .collect())
     }
 
+    /// Clears all WAL segments after a successful downstream flush.
     pub fn clear(&self) -> Result<()> {
         let segments = self.segment_paths()?;
         for (_, path) in segments {
@@ -88,6 +97,7 @@ impl StorageWal {
         Ok(())
     }
 
+    /// Returns the base path used for WAL segment discovery.
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Axum HTTP and SSE API for inspecting storage, replay, and runtime-core state.
+
 pub mod auth;
 pub mod live_rpc;
 pub mod stream_broadcast;
@@ -73,6 +75,7 @@ use event_log::{OppDetected, TxConfirmed, TxDecoded, TxFetched, TxReorged, TxSee
 use scheduler::scheduler_channel;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Controls scheduler snapshot persistence and restart-time rehydration.
 pub struct SchedulerRehydrationConfig {
     pub snapshot_interval_ms: u64,
     pub snapshot_max_finality_age_ms: u64,
@@ -87,21 +90,32 @@ impl Default for SchedulerRehydrationConfig {
     }
 }
 
+/// Returns current live-rpc chain health snapshots.
 pub type LiveRpcChainStatusProvider = Arc<dyn Fn() -> Vec<LiveRpcChainStatus> + Send + Sync>;
+/// Returns live-rpc drop counters.
 pub type LiveRpcDropMetricsProvider = Arc<dyn Fn() -> LiveRpcDropMetricsSnapshot + Send + Sync>;
+/// Returns live-rpc searcher-stage metrics.
 pub type LiveRpcSearcherMetricsProvider =
     Arc<dyn Fn() -> LiveRpcSearcherMetricsSnapshot + Send + Sync>;
+/// Returns live-rpc simulation metrics.
 pub type LiveRpcSimulationMetricsProvider =
     Arc<dyn Fn() -> LiveRpcSimulationMetricsSnapshot + Send + Sync>;
+/// Returns replay-runtime metrics computed from storage.
 pub type ReplayRuntimeMetricsProvider = Arc<dyn Fn() -> ReplayRuntimeMetricsSnapshot + Send + Sync>;
+/// Returns live-rpc simulation status by id.
 pub type LiveRpcSimulationStatusProvider =
     Arc<dyn Fn(&str) -> Option<LiveRpcSimulationStatusSnapshot> + Send + Sync>;
+/// Returns the current scheduler snapshot.
 pub type SchedulerSnapshotProvider = Arc<dyn Fn() -> SchedulerSnapshot + Send + Sync>;
+/// Returns scheduler metrics.
 pub type SchedulerMetricsProvider = Arc<dyn Fn() -> SchedulerMetrics + Send + Sync>;
+/// Returns the current builder snapshot.
 pub type BuilderSnapshotProvider = Arc<dyn Fn() -> AssemblySnapshot + Send + Sync>;
+/// Returns builder metrics.
 pub type BuilderMetricsProvider = Arc<dyn Fn() -> AssemblyMetrics + Send + Sync>;
 
 #[derive(Clone)]
+/// Shared application state injected into Axum handlers.
 pub struct AppState {
     pub provider: Arc<dyn VizDataProvider>,
     pub dashboard_stream_broadcaster: Arc<DashboardStreamBroadcaster>,
@@ -123,6 +137,7 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
+/// Set of runtime-core-backed provider closures used by the API layer.
 pub struct RuntimeCoreViewProviders {
     pub live_rpc_chain_status_provider: LiveRpcChainStatusProvider,
     pub live_rpc_drop_metrics_provider: LiveRpcDropMetricsProvider,
@@ -136,6 +151,7 @@ pub struct RuntimeCoreViewProviders {
 }
 
 impl RuntimeCoreViewProviders {
+    /// Creates API providers backed by a runtime-core handle.
     pub fn from_runtime_core(handle: RuntimeCoreHandle) -> Self {
         Self {
             live_rpc_chain_status_provider: {
@@ -179,6 +195,7 @@ impl RuntimeCoreViewProviders {
 }
 
 #[derive(Clone)]
+/// Runtime wiring returned by bootstrap helpers for embedding and server startup.
 pub struct RuntimeBootstrap {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
@@ -195,6 +212,7 @@ pub struct RuntimeBootstrap {
 }
 
 #[derive(Clone)]
+/// Startup-only subset of `RuntimeBootstrap` consumed by outer runtime initialization.
 pub struct RuntimeBootstrapStartup {
     pub live_rpc_config: LiveRpcConfig,
     pub rebuild_scheduler_from_rpc: bool,
@@ -205,11 +223,13 @@ pub struct RuntimeBootstrapStartup {
 }
 
 impl RuntimeBootstrap {
+    /// Aborts all background tasks spawned by the bootstrap helpers.
     pub fn abort_background_tasks(&self) {
         abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
         abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
     }
 
+    /// Starts scheduler snapshot and replay metrics background tasks.
     pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
         start_scheduler_snapshot_writer_once(
             &self.scheduler_snapshot_writer_abort,
@@ -223,6 +243,7 @@ impl RuntimeBootstrap {
         );
     }
 
+    /// Builds runtime-core startup arguments from the bootstrap state.
     pub fn runtime_core_start_args(&self, ingest_mode: RuntimeIngestMode) -> RuntimeCoreStartArgs {
         RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -237,6 +258,7 @@ impl RuntimeBootstrap {
         }
     }
 
+    /// Splits the bootstrap into runtime-core args and startup-only state.
     pub fn into_runtime_startup(
         self,
         ingest_mode: RuntimeIngestMode,
@@ -265,11 +287,13 @@ impl RuntimeBootstrap {
 }
 
 impl RuntimeBootstrapStartup {
+    /// Aborts all background tasks associated with this startup bundle.
     pub fn abort_background_tasks(&self) {
         abort_scheduler_snapshot_writer(&self.scheduler_snapshot_writer_abort);
         abort_replay_runtime_metrics_refresher(&self.replay_runtime_metrics_abort);
     }
 
+    /// Starts scheduler snapshot and replay metrics background tasks.
     pub fn start_background_tasks(&self, runtime_core: RuntimeCoreHandle) {
         start_scheduler_snapshot_writer_once(
             &self.scheduler_snapshot_writer_abort,
@@ -285,6 +309,7 @@ impl RuntimeBootstrapStartup {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Replay chart point for the dashboard timeline.
 pub struct ReplayPoint {
     pub seq_hi: u64,
     pub timestamp_unix_ms: i64,
@@ -292,6 +317,7 @@ pub struct ReplayPoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Synthetic propagation edge used by visualization endpoints.
 pub struct PropagationEdge {
     pub source: String,
     pub destination: String,
@@ -300,6 +326,7 @@ pub struct PropagationEdge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Aggregated feature summary row served to the dashboard.
 pub struct FeatureSummary {
     pub protocol: String,
     pub category: String,
@@ -307,6 +334,7 @@ pub struct FeatureSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Per-transaction feature detail returned by dashboard and recent-feature endpoints.
 pub struct FeatureDetail {
     pub hash: String,
     pub protocol: String,
@@ -319,6 +347,7 @@ pub struct FeatureDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Searcher opportunity detail returned by dashboard and opportunity endpoints.
 pub struct OpportunityDetail {
     pub tx_hash: String,
     pub status: String,
@@ -335,6 +364,7 @@ pub struct OpportunityDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Compact transaction row returned by list endpoints.
 pub struct TransactionSummary {
     pub hash: String,
     pub sender: String,
@@ -345,6 +375,7 @@ pub struct TransactionSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Expanded transaction detail assembled from storage projections.
 pub struct TransactionDetail {
     pub hash: String,
     pub peer: String,
@@ -374,11 +405,13 @@ pub struct TransactionDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Health-check response payload.
 pub struct HealthResponse {
     pub status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Incremental dashboard patch payload for the SSE stream.
 pub struct StreamV2Patch {
     pub upsert: Vec<TransactionSummary>,
     pub remove: Vec<String>,
@@ -389,11 +422,13 @@ pub struct StreamV2Patch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Sequence watermark attached to SSE dispatches.
 pub struct StreamV2Watermark {
     pub latest_ingest_seq: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// One SSE dispatch sent to dashboard subscribers.
 pub struct StreamV2Dispatch {
     pub op: String,
     #[serde(rename = "type")]
@@ -407,6 +442,7 @@ pub struct StreamV2Dispatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Full dashboard snapshot served by `/dashboard/snapshot-v2`.
 pub struct DashboardSnapshotV2 {
     pub revision: u64,
     pub latest_seq_id: u64,
@@ -419,6 +455,7 @@ pub struct DashboardSnapshotV2 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Market-level counters derived from storage.
 pub struct MarketStats {
     pub total_signal_volume: u64,
     pub total_tx_count: u64,
@@ -429,6 +466,7 @@ pub struct MarketStats {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Summary of pending-set changes across a replay range.
 pub struct ReplayRangeDiffSummary {
     pub from_pending_count: usize,
     pub to_pending_count: usize,
@@ -439,6 +477,7 @@ pub struct ReplayRangeDiffSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Response payload for replay-range diff requests.
 pub struct ReplayRangeResponse {
     pub from_seq_id: u64,
     pub to_seq_id: u64,
@@ -449,6 +488,7 @@ pub struct ReplayRangeResponse {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Metrics describing the cached dashboard read model.
 pub struct DashboardCacheMetrics {
     pub refresh_total: u64,
     pub last_build_duration_ns: u64,
@@ -457,6 +497,7 @@ pub struct DashboardCacheMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Replay metrics refreshed in the background from stored events.
 pub struct ReplayRuntimeMetricsSnapshot {
     pub lag_events: u64,
     pub checkpoint_duration_ms: u64,
@@ -491,6 +532,7 @@ impl ReplayRuntimeMetricsCache {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Relay dry-run detail returned by bundle endpoints.
 pub struct BundleDetail {
     pub id: String,
     pub relay_url: String,
@@ -502,6 +544,7 @@ pub struct BundleDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Simulation detail returned by simulation endpoints.
 pub struct SimDetail {
     pub id: String,
     pub bundle_id: String,
@@ -515,6 +558,7 @@ pub struct SimDetail {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Top-level ingest mode chosen for the API/runtime bundle.
 pub enum IngestSourceMode {
     Rpc,
     P2p,
@@ -522,6 +566,7 @@ pub enum IngestSourceMode {
 }
 
 impl IngestSourceMode {
+    /// Returns the stable string label used by config and diagnostics.
     pub fn as_str(self) -> &'static str {
         match self {
             IngestSourceMode::Rpc => "rpc",
@@ -531,6 +576,7 @@ impl IngestSourceMode {
     }
 }
 
+/// Resolves the ingest mode from an optional environment override.
 pub fn resolve_ingest_source_mode(env_override: Option<&str>) -> IngestSourceMode {
     match env_override.map(str::trim).map(str::to_ascii_lowercase) {
         Some(mode) if mode == "p2p" => IngestSourceMode::P2p,
@@ -565,6 +611,7 @@ fn map_market_stats(snapshot: MarketStatsSnapshot) -> MarketStats {
 }
 
 #[auto_impl(&, Box, Arc)]
+/// Read-only data provider interface used by HTTP handlers and SSE generation.
 pub trait VizDataProvider: Send + Sync {
     fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
     -> Vec<EventEnvelope>;
@@ -635,6 +682,7 @@ pub trait VizDataProvider: Send + Sync {
 }
 
 #[derive(Clone)]
+/// In-memory `VizDataProvider` backed by `storage::InMemoryStorage`.
 pub struct InMemoryVizProvider {
     storage: Arc<RwLock<InMemoryStorage>>,
     propagation: Arc<Vec<PropagationEdge>>,
@@ -656,6 +704,7 @@ struct DashboardReadCache {
 }
 
 impl InMemoryVizProvider {
+    /// Creates an in-memory provider with the given propagation graph and replay stride.
     pub fn new(
         storage: Arc<RwLock<InMemoryStorage>>,
         propagation: Arc<Vec<PropagationEdge>>,
@@ -669,6 +718,7 @@ impl InMemoryVizProvider {
         }
     }
 
+    /// Returns how many times the dashboard read cache has been rebuilt.
     pub fn dashboard_cache_refreshes(&self) -> u64 {
         self.dashboard_cache.read().refreshes
     }
@@ -1154,6 +1204,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 }
 
+/// Builds the Axum router for all HTTP and SSE endpoints.
 pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -1196,16 +1247,19 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Builds default application state together with the runtime bootstrap bundle.
 pub fn default_state_with_runtime() -> (AppState, RuntimeBootstrap) {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
     default_state_with_runtime_from_storage(storage)
 }
 
+/// Builds only the runtime bootstrap bundle with default storage.
 pub fn default_runtime_bootstrap() -> RuntimeBootstrap {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
     runtime_bootstrap_from_storage(storage)
 }
 
+/// Builds application state and bootstrap wiring from an existing storage instance.
 pub fn default_state_with_runtime_from_storage(
     storage: Arc<RwLock<InMemoryStorage>>,
 ) -> (AppState, RuntimeBootstrap) {
@@ -1219,6 +1273,7 @@ pub fn default_state_with_runtime_from_storage(
     (state, bootstrap)
 }
 
+/// Builds the runtime bootstrap bundle from an existing storage instance.
 pub fn runtime_bootstrap_from_storage(storage: Arc<RwLock<InMemoryStorage>>) -> RuntimeBootstrap {
     runtime_bootstrap_from_storage_and_rehydration(
         storage,
@@ -1235,6 +1290,7 @@ pub fn runtime_bootstrap_from_storage(storage: Arc<RwLock<InMemoryStorage>>) -> 
     )
 }
 
+/// Builds application state and bootstrap wiring with explicit scheduler rehydration config.
 pub fn default_state_with_runtime_from_storage_and_rehydration(
     storage: Arc<RwLock<InMemoryStorage>>,
     rehydration: SchedulerRehydrationConfig,
@@ -1249,6 +1305,7 @@ pub fn default_state_with_runtime_from_storage_and_rehydration(
     (state, bootstrap)
 }
 
+/// Builds the runtime bootstrap bundle with explicit scheduler rehydration config.
 pub fn runtime_bootstrap_from_storage_and_rehydration(
     storage: Arc<RwLock<InMemoryStorage>>,
     rehydration: SchedulerRehydrationConfig,
@@ -1256,6 +1313,7 @@ pub fn runtime_bootstrap_from_storage_and_rehydration(
     runtime_bootstrap_from_storage_and_rehydration_impl(storage, rehydration)
 }
 
+/// Creates `AppState` from an existing bootstrap plus runtime-core-backed view providers.
 pub fn app_state_from_runtime_bootstrap(
     bootstrap: &RuntimeBootstrap,
     runtime_views: RuntimeCoreViewProviders,
@@ -1441,10 +1499,12 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
     }
 }
 
+/// Builds default application state and eagerly starts the default runtime bundle.
 pub fn default_state() -> AppState {
     default_state_with_runtime().0
 }
 
+/// Spawns the background task that periodically persists scheduler snapshots.
 pub fn spawn_scheduler_snapshot_writer(
     runtime_core: RuntimeCoreHandle,
     interval_ms: u64,
@@ -1806,6 +1866,7 @@ fn parse_event_type_filters(raw: Option<&str>) -> Vec<String> {
     filters
 }
 
+/// Evenly downsamples a slice to at most `max_points` entries.
 pub fn downsample<T: Clone>(values: &[T], max_points: usize) -> Vec<T> {
     if values.len() <= max_points || max_points == 0 {
         return values.to_vec();

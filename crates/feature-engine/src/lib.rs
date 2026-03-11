@@ -1,3 +1,5 @@
+//! Lightweight protocol and intent classification for decoded transactions.
+
 #![forbid(unsafe_code)]
 
 pub mod registry;
@@ -8,10 +10,12 @@ use registry::ProtocolRegistry;
 
 pub const FEATURE_ENGINE_VERSION: &str = "feature-engine.v1";
 
+/// Returns the current feature-engine version string stamped into outputs.
 pub const fn version() -> &'static str {
     FEATURE_ENGINE_VERSION
 }
 
+/// Inputs required to classify one transaction.
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureInput<'a> {
     pub to: Option<&'a Address>,
@@ -26,6 +30,7 @@ pub struct FeatureInput<'a> {
     pub max_fee_per_blob_gas_wei: Option<u128>,
 }
 
+/// Feature scores and labels derived from one transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeatureAnalysis {
     pub protocol: &'static str,
@@ -35,6 +40,7 @@ pub struct FeatureAnalysis {
     pub method_selector: Option<[u8; 4]>,
 }
 
+/// Decoded transaction paired with the derived feature analysis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeaturedTransaction {
     pub hash: TxHash,
@@ -46,6 +52,7 @@ pub struct FeaturedTransaction {
 }
 
 const WEI_PER_GWEI: u128 = 1_000_000_000;
+/// Computes protocol, category, MEV score, and urgency score for a transaction.
 pub fn analyze_transaction(input: FeatureInput<'_>) -> FeatureAnalysis {
     let method_selector = selector(input.calldata);
     let protocol = classify_protocol(input.to, method_selector);
@@ -80,6 +87,7 @@ pub fn analyze_transaction(input: FeatureInput<'_>) -> FeatureAnalysis {
     }
 }
 
+/// Runs feature analysis directly from a decoded transaction and calldata.
 pub fn analyze_decoded_transaction(tx: &TxDecoded, calldata: &[u8]) -> FeaturedTransaction {
     let analysis = analyze_transaction(FeatureInput {
         to: tx.to.as_ref(),

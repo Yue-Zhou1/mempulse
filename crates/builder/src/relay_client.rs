@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Minimal relay client with retry, backoff, and circuit-breaker behavior for dry runs.
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -12,6 +14,7 @@ const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 2;
 const CIRCUIT_BREAKER_WINDOW_MS: i64 = 5_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Relay-facing block template payload used for dry-run submission.
 pub struct BlockTemplate {
     pub slot: u64,
     pub parent_hash: String,
@@ -22,6 +25,7 @@ pub struct BlockTemplate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Trace of a single relay submission attempt.
 pub struct RelayAttemptTrace {
     pub attempt: u32,
     pub endpoint: String,
@@ -32,6 +36,7 @@ pub struct RelayAttemptTrace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Result of one relay dry-run submission, including all retries.
 pub struct RelayDryRunResult {
     pub relay_url: String,
     pub accepted: bool,
@@ -42,6 +47,7 @@ pub struct RelayDryRunResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Retry and timeout configuration for a relay client.
 pub struct RelayClientConfig {
     pub relay_url: String,
     pub max_retries: u32,
@@ -50,6 +56,7 @@ pub struct RelayClientConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+/// Rolling aggregate of relay dry-run outcomes.
 pub struct RelayDryRunStatus {
     pub latest: Option<RelayDryRunResult>,
     pub total_submissions: u64,
@@ -58,6 +65,7 @@ pub struct RelayDryRunStatus {
 }
 
 impl RelayDryRunStatus {
+    /// Records one completed submission attempt into the aggregate status view.
     pub fn record(&mut self, result: RelayDryRunResult) {
         self.total_submissions = self.total_submissions.saturating_add(1);
         if result.accepted {
@@ -77,6 +85,7 @@ struct RelayHealthState {
 }
 
 #[derive(Clone)]
+/// HTTP relay client used to dry-run assembled templates against a builder relay.
 pub struct RelayClient {
     http: reqwest::Client,
     config: RelayClientConfig,
@@ -84,6 +93,7 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
+    /// Creates a relay client and validates the basic transport configuration.
     pub fn new(config: RelayClientConfig) -> Result<Self> {
         if config.relay_url.trim().is_empty() {
             bail!("relay_url must not be empty");
@@ -97,6 +107,7 @@ impl RelayClient {
         })
     }
 
+    /// Submits a dry-run request with retry and circuit-breaker behavior.
     pub async fn submit_dry_run(&self, template: &BlockTemplate) -> Result<RelayDryRunResult> {
         let started = unix_ms_now();
         if self.is_circuit_open(started) {

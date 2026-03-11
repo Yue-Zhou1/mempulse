@@ -1,3 +1,5 @@
+//! Dashboard SSE replay buffer and broadcast fan-out.
+
 use crate::StreamV2Dispatch;
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -5,12 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Event published onto the dashboard SSE stream.
 pub enum DashboardStreamBroadcastEvent {
     Delta(Box<StreamV2Dispatch>),
     Reset { reason: String, latest_seq_id: u64 },
 }
 
 impl DashboardStreamBroadcastEvent {
+    /// Returns the sequence watermark carried by this broadcast event.
     pub fn seq_id(&self) -> u64 {
         match self {
             DashboardStreamBroadcastEvent::Delta(dispatch) => {
@@ -22,6 +26,7 @@ impl DashboardStreamBroadcastEvent {
 }
 
 #[derive(Debug)]
+/// Broadcast channel with a bounded replay buffer for late SSE subscribers.
 pub struct DashboardStreamBroadcaster {
     sender: broadcast::Sender<DashboardStreamBroadcastEvent>,
     replay: Mutex<VecDeque<DashboardStreamBroadcastEvent>>,
@@ -30,6 +35,7 @@ pub struct DashboardStreamBroadcaster {
 }
 
 impl DashboardStreamBroadcaster {
+    /// Creates a broadcaster with normalized replay and channel capacities.
     pub fn new(replay_capacity: usize, channel_capacity: usize) -> Self {
         let normalized_replay_capacity = replay_capacity.max(1);
         let normalized_channel_capacity = channel_capacity.max(1);
@@ -42,15 +48,18 @@ impl DashboardStreamBroadcaster {
         }
     }
 
+    /// Returns the latest published sequence id.
     pub fn latest_seq_id(&self) -> u64 {
         self.latest_seq_id.load(Ordering::Relaxed)
     }
 
+    /// Publishes one incremental dashboard delta.
     pub fn publish_delta(&self, dispatch: StreamV2Dispatch) {
         let event = DashboardStreamBroadcastEvent::Delta(Box::new(dispatch));
         self.publish_event(event);
     }
 
+    /// Returns replay events after `after_seq_id` plus a live broadcast receiver.
     pub fn subscribe_from(
         &self,
         after_seq_id: u64,

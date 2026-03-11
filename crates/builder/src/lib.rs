@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Block-assembly primitives and relay dry-run utilities.
+
 mod assembly;
 mod relay_client;
 

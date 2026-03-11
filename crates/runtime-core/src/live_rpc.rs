@@ -1,3 +1,5 @@
+//! Live RPC ingest, scheduler bootstrap, and remote simulation helpers.
+
 use crate::RuntimeCoreHandle;
 pub use crate::{
     LiveRpcChainStatus, LiveRpcDropMetricsSnapshot, LiveRpcDropReason,
@@ -600,6 +602,7 @@ fn apply_builder_assembly_state_with_owner(
     decisions
 }
 
+/// Maps storage writer backpressure into the public live-rpc drop taxonomy.
 pub fn classify_storage_enqueue_drop_reason(error: StorageTryEnqueueError) -> LiveRpcDropReason {
     match error {
         StorageTryEnqueueError::QueueFull => LiveRpcDropReason::StorageQueueFull,
@@ -690,6 +693,7 @@ enum ChainConfigInput {
 }
 
 #[derive(Clone, Debug)]
+/// Chain-scoped websocket/http configuration for live-rpc ingest.
 pub struct ChainRpcConfig {
     chain_key: String,
     chain_id: Option<u64>,
@@ -698,24 +702,29 @@ pub struct ChainRpcConfig {
 }
 
 impl ChainRpcConfig {
+    /// Returns the stable logical key for the chain.
     pub fn chain_key(&self) -> &str {
         &self.chain_key
     }
 
+    /// Returns the configured chain id when known.
     pub fn chain_id(&self) -> Option<u64> {
         self.chain_id
     }
 
+    /// Returns the source id attached to events emitted for this chain.
     pub fn source_id(&self) -> &SourceId {
         &self.source_id
     }
 
+    /// Returns the primary websocket endpoint, if any.
     pub fn primary_ws_url(&self) -> Option<&str> {
         self.endpoints
             .first()
             .map(|endpoint| endpoint.ws_url.as_str())
     }
 
+    /// Returns the primary HTTP endpoint, if any.
     pub fn primary_http_url(&self) -> Option<&str> {
         self.endpoints
             .first()
@@ -724,6 +733,7 @@ impl ChainRpcConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Top-level configuration for live-rpc websocket ingest and batch fetching.
 pub struct LiveRpcConfig {
     chains: Vec<ChainRpcConfig>,
     max_seen_hashes: usize,
@@ -732,6 +742,7 @@ pub struct LiveRpcConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Batch fetch tuning parameters for `eth_getTransactionByHash` requests.
 pub struct BatchFetchConfig {
     pub batch_size: usize,
     pub max_in_flight: usize,
@@ -778,6 +789,7 @@ impl Default for LiveRpcConfig {
 }
 
 impl LiveRpcConfig {
+    /// Builds live-rpc configuration from defaults, optional config files, and env overrides.
     pub fn from_env() -> Result<Self> {
         let chains_override = read_env_trimmed(ENV_CHAINS);
         let ws_override = read_env_trimmed(ENV_ETH_WS_URL);
@@ -847,20 +859,24 @@ impl LiveRpcConfig {
         Ok(config)
     }
 
+    /// Returns all configured chain definitions.
     pub fn chain_configs(&self) -> &[ChainRpcConfig] {
         &self.chains
     }
 
+    /// Returns the primary websocket URL for the first configured chain.
     pub fn primary_ws_url(&self) -> Option<&str> {
         self.chains.first().and_then(|chain| chain.primary_ws_url())
     }
 
+    /// Returns the primary HTTP URL for the first configured chain.
     pub fn primary_http_url(&self) -> Option<&str> {
         self.chains
             .first()
             .and_then(|chain| chain.primary_http_url())
     }
 
+    /// Returns the default source id for the first configured chain.
     pub fn source_id(&self) -> &SourceId {
         self.chains
             .first()
@@ -868,19 +884,23 @@ impl LiveRpcConfig {
             .unwrap_or_else(|| panic!("live rpc config has no chains"))
     }
 
+    /// Returns the size of the recent-hash dedup window.
     pub fn max_seen_hashes(&self) -> usize {
         self.max_seen_hashes
     }
 
+    /// Returns batch fetch tuning parameters.
     pub fn batch_fetch(&self) -> BatchFetchConfig {
         self.batch_fetch
     }
 
+    /// Returns the silent-chain rotation timeout in seconds.
     pub fn silent_chain_timeout_secs(&self) -> u64 {
         self.silent_chain_timeout_secs
     }
 }
 
+/// Resolves the chain id stored on records by preferring the transaction payload when present.
 pub fn resolve_record_chain_id(
     configured_chain_id: Option<u64>,
     tx_chain_id: Option<u64>,
@@ -888,6 +908,7 @@ pub fn resolve_record_chain_id(
     tx_chain_id.or(configured_chain_id)
 }
 
+/// Returns how many RPC fetch batches may be dispatched immediately.
 pub fn dispatchable_batch_count(
     queue_len: usize,
     batch_size: usize,
@@ -900,10 +921,12 @@ pub fn dispatchable_batch_count(
     batches.min(max_in_flight.max(1))
 }
 
+/// Returns the exponential retry backoff for a batch fetch attempt.
 pub fn retry_backoff_delay_ms(base_backoff_ms: u64, attempt: usize) -> u64 {
     base_backoff_ms.saturating_mul(1_u64 << attempt.min(16))
 }
 
+/// Rotates to the next endpoint index, wrapping around when needed.
 pub fn rotate_endpoint_index(current: usize, endpoint_count: usize) -> usize {
     if endpoint_count <= 1 {
         0
@@ -912,6 +935,7 @@ pub fn rotate_endpoint_index(current: usize, endpoint_count: usize) -> usize {
     }
 }
 
+/// Returns whether a chain should rotate endpoints because it has gone silent for too long.
 pub fn should_rotate_silent_chain(
     last_pending_unix_ms: i64,
     now_unix_ms: i64,
@@ -1065,6 +1089,7 @@ fn parse_endpoint_urls(chain_key: &str, ws_url: &str, http_url: &str) -> Result<
     })
 }
 
+/// Starts websocket ingest workers for all configured chains on the current Tokio runtime.
 pub fn start_live_rpc_feed_with_runtime_core(
     runtime_core: RuntimeCoreHandle,
     config: LiveRpcConfig,
@@ -1123,6 +1148,7 @@ fn start_live_rpc_feed_with_owner(
     }
 }
 
+/// Starts one-shot pending-pool rebuild workers for all configured chains.
 pub fn start_live_rpc_pending_pool_rebuild_with_runtime_core(
     runtime_core: RuntimeCoreHandle,
     config: LiveRpcConfig,
@@ -1622,6 +1648,7 @@ struct WsRpcMessage<'a> {
     params: Option<WsSubscriptionParams<'a>>,
 }
 
+/// Extracts a pending transaction hash from a websocket frame payload.
 pub fn parse_pending_hash<'a>(
     payload: &'a str,
     subscription_id: &mut Option<String>,
@@ -1698,6 +1725,8 @@ async fn process_pending_hash_batch(
                 continue;
             }
         };
+        // Dedup before issuing the RPC batch so reconnect storms do not fan out into redundant
+        // detail fetches or duplicate storage writes.
         if remember_hash(hash, seen_hashes, seen_order, session.max_seen_hashes) {
             deduped_observations.push(observation);
             deduped_raw.push(hash);
@@ -1915,6 +1944,8 @@ async fn process_pending_hash_with_fetched_tx_with_owner(
         None
     };
 
+    // Persist `TxSeen` first so downstream decoded/queue events never exist without the
+    // observation that introduced the hash into the system.
     let _tx_seen_seq_id = next_seq_id.fetch_add(1, Ordering::Relaxed);
     if !try_enqueue_storage_write_with_owner(
         state_owner,
@@ -3429,6 +3460,7 @@ fn rpc_tx_to_live_tx(tx: RpcTransaction, hash_hex: &str) -> Result<LiveTx> {
     })
 }
 
+/// Parses a fixed-width hex string into a byte array of the requested size.
 pub fn parse_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     let bytes = parse_hex_bytes(value)?;
     if bytes.len() != N {
@@ -3480,6 +3512,7 @@ fn format_error_chain(err: &anyhow::Error) -> String {
     rendered
 }
 
+/// Formats bytes as a `0x`-prefixed lowercase hex string.
 pub fn format_fixed_hex(bytes: &[u8]) -> String {
     let mut out = String::from("0x");
     out.reserve(bytes.len().saturating_mul(2));

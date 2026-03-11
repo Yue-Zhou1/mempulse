@@ -6,6 +6,7 @@ use crate::{
 };
 use feature_engine::{FeaturedTransaction, version as feature_engine_version};
 
+/// Strategy families that can be emitted by the searcher.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
@@ -21,6 +22,7 @@ const BACKRUN_STRATEGY_VERSION: &str = "strategy.backrun.v1";
 const ARB_STRATEGY_VERSION: &str = "strategy.arb.v1";
 const BUNDLE_STRATEGY_VERSION: &str = "strategy.bundle.v1";
 
+/// Returns the version string for one strategy family.
 pub const fn strategy_version(kind: StrategyKind) -> &'static str {
     match kind {
         StrategyKind::SandwichCandidate => SANDWICH_STRATEGY_VERSION,

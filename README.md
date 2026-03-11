@@ -2,14 +2,130 @@
 
 Mempulse is a Rust + React workspace for ingesting live mempool traffic, deriving MEV-oriented features, running scheduler/search/simulation/builder workflows, persisting runtime state, and serving replay plus dashboard APIs.
 
-## Current Architecture
+## Architecture
 
-1. `ingest` normalizes pending transactions from RPC and devp2p sources into canonical event-log envelopes.
-2. `runtime-core` orchestrates ingest, storage, scheduler, searcher, simulation, and builder components.
-3. `storage` persists WAL-backed events, bounded read models, and scheduler snapshots, while `replay` reconstructs lifecycle state deterministically.
-4. `viz-api` exposes HTTP and SSE endpoints, and `apps/web-ui` consumes `snapshot-v2` plus `events-v1`.
+```
+    External sources
+    +----------------------+      +----------------------+
+    | EVM RPC endpoints    |      | devp2p peers         |
+    | WS + HTTP pending tx |      | announces / pooled tx|
+    +----------+-----------+      +-----------+----------+
+               \                              /
+                \                            /
+                 +-----------v--------------+
+                 |       runtime-core       |  crates/runtime-core
+                 | live ingest + pipeline   |  - owns live tx intake
+                 | orchestration            |  - coordinates scheduler,
+                 |                          |    feature/search/sim/builder
+                 +-----+---------------+----+  - exposes runtime metrics/views
+                       |               |
+           event-log   |               | live snapshots
+           envelopes   |               |
+                       v               v
+              +--------+-----+   +-----+------+
+              | storage       |   |  viz-api   |  crates/viz-api
+              | + replay      |   |  Axum + SSE|  - storage-backed reads
+              | projections   |   |            |  - runtime-core live views
+              +--------+-----+   +-----+------+
+                       ^               |
+                       |               |
+                +------+-----+   +-----+------+
+                | event-log   |   |  web-ui    |  apps/web-ui
+                | + common    |   | React/Vite |
+                +------------+   +------------+
 
-## Real-World Use Cases
+    Library crates used by the live runtime:
+    [ ingest ] [ scheduler ] [ feature-engine ] [ searcher ] [ sim-engine ] [ builder ]
+
+    Bootstrap / lifecycle wrapper:
+    node-runtime (crates/node-runtime) starts runtime-core and manages shutdown hooks
+```
+
+**Current live pipeline inside `runtime-core`:**
+```
+      +-----------------------+
+      | ingress normalization |
+      +-----------+-----------+
+                  |
+      +-----------v-----------+
+      | scheduler admission   |
+      | + nonce-gap tracking  |
+      +-----------+-----------+
+                  |
+      +-----------v-----------+
+      | feature-engine        |
+      | protocol + scoring    |
+      +-----------+-----------+
+                  |
+      +-----------v-----------+
+      | searcher ranking      |
+      | + bundle synthesis    |
+      +-----------+-----------+
+                  |
+      +-----------v-----------+
+      | sim-engine execution  |
+      +-----------+-----------+
+                  |
+      +-----------v-----------+
+      | builder assembly      |
+      | + dry-run utilities   |
+      +-----------------------+
+```
+
+**Data flow summary:**
+1. `node-runtime` is the thin process wrapper: it starts `runtime-core`, applies ingest mode selection, and manages shutdown hooks.
+2. `runtime-core` owns the current live pipeline. It subscribes to pending transactions over RPC WebSocket (`eth_subscribe:newPendingTransactions`), fetches transaction payloads over HTTP by hash or from the pending block, normalizes observations into canonical `event-log` envelopes, and tracks live runtime metrics and status views.
+3. `ingest` contains reusable RPC/devp2p ingest services and tx decoding helpers. The current live runtime uses those concepts, while the main orchestration and live RPC helpers live in `runtime-core`.
+4. `scheduler` admits transactions with dedup and fee-bump replacement, tracks per-sender nonce gaps and execution order, and marks transactions ready or blocked for downstream work.
+5. `feature-engine` classifies protocols and computes MEV/urgency scores; `searcher` ranks opportunities and synthesizes bundle candidates from adjacent nonces.
+6. `sim-engine` executes candidates in deterministic or RPC-backed modes. Accepted simulation results feed `builder` assembly state; the builder crate currently provides assembly decisions and relay dry-run utilities rather than confirmed live relay submission.
+7. `storage` persists events to the WAL and optional ClickHouse sink while maintaining bounded in-memory projections; `replay` reconstructs lifecycle state and checkpoint parity from the stored event stream.
+8. `viz-api` serves HTTP + SSE endpoints to the `web-ui`, combining storage-backed dashboard/read models with `runtime-core`-backed live metrics, scheduler snapshots, simulation status, and builder state.
+
+## Project Structure
+
+```
+mempulse/
+├── apps/
+│   └── web-ui/                    React 19 + Vite dashboard client
+│       └── src/
+│           ├── main.jsx           Entry point — mounts React app
+│           ├── App.jsx            Root component and routing shell
+│           ├── styles.css         Global Tailwind base styles
+│           ├── features/
+│           │   └── dashboard/     Self-contained dashboard feature module
+│           │       ├── components/  UI components (radar, opps, tx dialog, perf panel)
+│           │       ├── domain/      Pure domain logic (stores, filters, circular buffer)
+│           │       ├── hooks/       React hooks (stream, controller, derived state)
+│           │       ├── lib/         Utility models (virtualized tables, animations, health)
+│           │       ├── workers/     Web Worker for off-thread SSE stream processing
+│           │       └── index.js     Public API of the dashboard feature
+│           ├── network/           API base URL resolution and fetch helpers
+│           ├── runtime/           Runtime flags, Vite env config, devtools hook
+│           ├── shared/            Cross-feature utilities (e.g. Tailwind cn helper)
+│           └── test/              Test setup and browser API mocks
+├── crates/
+│   ├── common/          Shared IDs, alert primitives, metrics helpers, domain types
+│   ├── event-log/       Canonical append-only event contracts
+│   ├── ingest/          Reusable RPC/devp2p ingest services and tx decode helpers
+│   ├── feature-engine/  Protocol classification and MEV feature derivation
+│   ├── scheduler/       Pending queue, nonce-gap handling, replacement policy, sim handoff
+│   ├── searcher/        Opportunity scoring and explainable ranking output
+│   ├── sim-engine/      Deterministic and RPC-backed execution simulation
+│   ├── builder/         Candidate assembly and relay dry-run packaging
+│   ├── storage/         In-memory projections, WAL recovery, parquet export, ClickHouse adapters
+│   ├── replay/          Lifecycle replay, checkpoint parity, replay diff summaries
+│   ├── runtime-core/    Long-lived runtime orchestration and live RPC workers
+│   ├── node-runtime/    Thin runtime bootstrap and lifecycle wrapper used by viz-api
+│   ├── viz-api/         Axum API, SSE transport, metrics, replay, and dashboard endpoints
+│   └── bench/           Perf harnesses for tx pipeline, scheduler, simulation, and storage
+├── configs/             Chain configuration (chain_config.json)
+├── docker/              Dockerfile and ClickHouse setup
+├── docs/                Architecture docs, demo guides, implementation plans, perf baselines
+└── scripts/             Demo, verification, and perf regression scripts
+```
+
+## Common Use Cases
 
 In practical terms, this repo can be used as the backbone for a mempool intelligence and runtime-analysis stack. It can watch live pending transaction flow, classify and score what is happening, persist the event stream for later replay, and expose that state through APIs and a dashboard so operators or researchers can inspect the system in real time.
 
@@ -21,24 +137,6 @@ In practical terms, this repo can be used as the backbone for a mempool intellig
 What it is not:
 
 - This repo is not a turnkey profit-generating bot by itself; it is the infrastructure layer for observing, testing, and operating mempool-aware systems.
-
-## Workspace Layout
-
-- `crates/common`: shared IDs, alert primitives, metrics helpers, and domain types
-- `crates/event-log`: canonical append-only event contracts
-- `crates/ingest`: RPC and devp2p ingestion, pending transaction fetch, and decode logic
-- `crates/feature-engine`: protocol classification and MEV feature derivation
-- `crates/scheduler`: pending queueing, nonce-gap handling, replacement policy, and simulation handoff
-- `crates/searcher`: opportunity scoring and explainable ranking output
-- `crates/sim-engine`: deterministic and RPC-backed execution simulation
-- `crates/builder`: candidate assembly and relay dry-run packaging
-- `crates/storage`: in-memory projections, WAL recovery, parquet export, ClickHouse adapters, and scheduler snapshot persistence
-- `crates/replay`: lifecycle replay, checkpoint parity, and replay diff summaries
-- `crates/runtime-core`: long-lived runtime orchestration and live RPC workers
-- `crates/node-runtime`: runtime bootstrap and lifecycle wrapper used by the API binary
-- `crates/viz-api`: Axum API, SSE transport, metrics, replay, and dashboard endpoints
-- `crates/bench`: perf harnesses for tx pipeline, scheduler pipeline, simulation roundtrip, and storage snapshot
-- `apps/web-ui`: React 19 + Vite dashboard client
 
 ## Running Locally
 
@@ -153,12 +251,6 @@ bash scripts/perf_regression_check.sh
 
 Perf artifacts are written under `artifacts/perf/`.
 
-## Reference Docs
+## License
 
-- `docs/demo/v2_demo.md`
-- `docs/demo/sample_output.md`
-- `docs/plans/v2_scope_kpi.md`
-- `docs/plans/2026-02-21-mev-infra-v2-implementation.md`
-- `docs/architecture/v2_architecture_diagram.md`
-- `docs/perf/v2_baseline.md`
-- `docs/mempool_mev_implementation.md`
+Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -1,7 +1,10 @@
+//! Helpers for normalizing raw transaction inputs into typed decoded records.
+
 use common::{Address, TxHash};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Supported transaction families handled by the ingest decoder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxType {
@@ -11,6 +14,9 @@ pub enum TxType {
     Eip4844,
 }
 
+/// Provider-facing transaction input before hex parsing and fee normalization.
+///
+/// Hex fields accept either `0x`-prefixed or plain hex strings.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RawTxInput {
     pub hash: String,
@@ -28,6 +34,7 @@ pub struct RawTxInput {
     pub calldata: Option<String>,
 }
 
+/// Canonical fee representation derived from the transaction type.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NormalizedFees {
     pub gas_price: Option<u128>,
@@ -36,6 +43,7 @@ pub struct NormalizedFees {
     pub max_fee_per_blob_gas: Option<u128>,
 }
 
+/// Fully decoded transaction record used by downstream ingest consumers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecodedTx {
     pub hash: TxHash,
@@ -51,6 +59,8 @@ pub struct DecodedTx {
 }
 
 impl DecodedTx {
+    /// Computes the effective gas price paid by the transaction at the supplied
+    /// base fee.
     pub fn effective_gas_price(&self, base_fee: u128) -> Option<u128> {
         match self.tx_type {
             TxType::Legacy | TxType::Eip2930 => self.fees.gas_price,
@@ -63,6 +73,7 @@ impl DecodedTx {
     }
 }
 
+/// Errors raised while parsing or normalizing a raw transaction input.
 #[derive(Debug, Error)]
 pub enum DecodeError {
     #[error("invalid hex value for field '{field}'")]
@@ -78,6 +89,8 @@ pub enum DecodeError {
     JsonDecode(#[from] serde_json::Error),
 }
 
+/// Decodes one provider-facing transaction payload into the normalized
+/// representation used by the rest of the runtime.
 pub fn decode_from_raw(input: RawTxInput) -> Result<DecodedTx, DecodeError> {
     let fees = normalize_fees(&input)?;
     let hash = parse_fixed_hex::<32>(&input.hash, "hash")?;
@@ -86,12 +99,16 @@ pub fn decode_from_raw(input: RawTxInput) -> Result<DecodedTx, DecodeError> {
     let to = match input.to.as_ref() {
         None => None,
         Some(value) if value.is_empty() => None,
+        // Empty `to` values are normalized to contract creation for providers
+        // that serialize `None` as an empty string.
         Some(value) => Some(parse_fixed_hex::<20>(value, "to")?),
     };
 
     let calldata = match input.calldata {
         None => Vec::new(),
         Some(value) if value.is_empty() => Vec::new(),
+        // Missing and empty calldata are treated the same so downstream code
+        // does not need to distinguish the provider's encoding choice.
         Some(value) => parse_variable_hex(&value, "calldata")?,
     };
 

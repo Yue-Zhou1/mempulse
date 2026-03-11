@@ -1,3 +1,5 @@
+//! devp2p ingest state machine and metrics.
+
 use ahash::RandomState;
 use common::{PeerId, SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxDropped, TxFetched, TxSeen};
@@ -6,9 +8,13 @@ use std::collections::VecDeque;
 
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 
+/// Tuning knobs for the devp2p pooled-transaction ingest path.
 #[derive(Clone, Debug)]
 pub struct P2pIngestConfig {
+    /// Maximum number of outstanding `GetPooledTransactions` requests retained
+    /// before new hashes are dropped.
     pub fetch_queue_capacity: usize,
+    /// Maximum number of first-seen hashes retained for deduplication.
     pub max_seen_hashes: usize,
 }
 
@@ -21,6 +27,7 @@ impl Default for P2pIngestConfig {
     }
 }
 
+/// Runtime counters exported by the devp2p ingest path.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct P2pMetrics {
     pub announcements_total: u64,
@@ -32,6 +39,7 @@ pub struct P2pMetrics {
     pub tx_decode_emitted_total: u64,
 }
 
+/// Aggregated propagation-delay view for one peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PropagationStats {
     pub count: u64,
@@ -39,12 +47,14 @@ pub struct PropagationStats {
     pub p99_delay_ms: u32,
 }
 
+/// Request to fetch one or more pooled transactions from a specific peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetPooledTransactionsRequest {
     pub peer_id: PeerId,
     pub hashes: Vec<TxHash>,
 }
 
+/// Minimal payload needed to emit fetched and decoded p2p transaction events.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct P2pTxPayload {
     pub hash: TxHash,
@@ -58,6 +68,8 @@ struct FirstSeen {
     unix_ms: i64,
 }
 
+/// Stateful ingest service for devp2p transaction announcements and pooled
+/// transaction payloads.
 #[derive(Clone, Debug)]
 pub struct P2pIngestService {
     config: P2pIngestConfig,
@@ -71,6 +83,7 @@ pub struct P2pIngestService {
 }
 
 impl P2pIngestService {
+    /// Creates a new devp2p ingest service with bounded queues and dedup state.
     pub fn new(config: P2pIngestConfig, source_id: SourceId) -> Self {
         Self {
             config: P2pIngestConfig {
@@ -87,6 +100,8 @@ impl P2pIngestService {
         }
     }
 
+    /// Accepts a batch of announced hashes from one peer and returns the
+    /// corresponding `TxSeen` or `TxDropped` events.
     pub fn handle_new_pooled_transaction_hashes(
         &mut self,
         peer_id: PeerId,
@@ -101,6 +116,9 @@ impl P2pIngestService {
             if let Some(first_seen) = self.first_seen.get(&hash) {
                 let delay = now_unix_ms.saturating_sub(first_seen.unix_ms) as u32;
                 self.metrics.duplicates_dropped_total += 1;
+                // A duplicate announcement is still useful: it records how long
+                // the hash took to propagate from its first sighting to this
+                // peer, but it must not enqueue another fetch.
                 events.push(self.new_event(
                     now_unix_ms,
                     now_mono_ns,
@@ -124,6 +142,8 @@ impl P2pIngestService {
             if self.fetch_queue.len() >= self.config.fetch_queue_capacity {
                 self.metrics.queue_dropped_total += 1;
                 self.metrics.queue_depth_current = self.fetch_queue.len();
+                // Backpressure is applied at enqueue time so the fetch loop
+                // stays bounded even during announcement bursts.
                 events.push(self.new_event(
                     now_unix_ms,
                     now_mono_ns,
@@ -172,6 +192,7 @@ impl P2pIngestService {
         );
         self.seen_order.push_back(hash);
 
+        // Evict the oldest first-seen hashes to cap dedup memory usage.
         while self.seen_order.len() > self.config.max_seen_hashes {
             if let Some(oldest) = self.seen_order.pop_front() {
                 self.first_seen.remove(&oldest);
@@ -179,12 +200,15 @@ impl P2pIngestService {
         }
     }
 
+    /// Pops the next queued pooled-transaction fetch request, if any.
     pub fn dequeue_get_pooled_transactions(&mut self) -> Option<GetPooledTransactionsRequest> {
         let request = self.fetch_queue.pop_front();
         self.metrics.queue_depth_current = self.fetch_queue.len();
         request
     }
 
+    /// Accepts full pooled transactions from a peer and emits fetched and
+    /// decoded events for each payload.
     pub fn handle_pooled_transactions(
         &mut self,
         _peer_id: PeerId,
@@ -227,6 +251,8 @@ impl P2pIngestService {
         events
     }
 
+    /// Returns per-peer propagation delay aggregates computed from duplicate
+    /// announcements.
     pub fn propagation_stats_by_peer(&self) -> FastMap<PeerId, PropagationStats> {
         self.propagation_delays_by_peer
             .iter()
@@ -258,6 +284,7 @@ impl P2pIngestService {
             .collect()
     }
 
+    /// Returns the current devp2p ingest counters.
     pub fn metrics(&self) -> &P2pMetrics {
         &self.metrics
     }

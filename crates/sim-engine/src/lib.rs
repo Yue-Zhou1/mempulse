@@ -1,3 +1,5 @@
+//! Transaction simulation helpers for deterministic and RPC-backed execution.
+
 #![forbid(unsafe_code)]
 
 mod state_provider;
@@ -24,6 +26,7 @@ const SEEDED_BALANCE_WEI: u128 = 1_000_000_000_000_000_000_000_000_000_000;
 type SharedError = Arc<dyn StdError + Send + Sync>;
 type Result<T> = std::result::Result<T, SimError>;
 
+/// Errors produced while executing or preparing transaction simulation.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum SimError {
     #[error("EVM execution reverted: {reason}")]
@@ -42,6 +45,7 @@ impl SimError {
         Arc::from(error.into())
     }
 
+    /// Wraps a state-provider failure as a typed simulation error.
     pub fn state_fetch<E>(error: E) -> Self
     where
         E: Into<Box<dyn StdError + Send + Sync>>,
@@ -56,6 +60,7 @@ impl From<anyhow::Error> for SimError {
     }
 }
 
+/// Block and chain context shared across a simulation batch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChainContext {
     pub chain_id: u64,
@@ -67,6 +72,7 @@ pub struct ChainContext {
     pub state_root: TxHash,
 }
 
+/// Simulation outcome for one transaction hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxSimulationResult {
     pub hash: TxHash,
@@ -77,6 +83,7 @@ pub struct TxSimulationResult {
     pub trace_id: u64,
 }
 
+/// Aggregate simulation output for a batch executed against one chain context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimulationBatchResult {
     pub chain_context: ChainContext,
@@ -84,6 +91,7 @@ pub struct SimulationBatchResult {
     pub final_state_diff_hash: TxHash,
 }
 
+/// Transaction input accepted by the simulator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimulationTxInput {
     pub decoded: TxDecoded,
@@ -91,6 +99,7 @@ pub struct SimulationTxInput {
     pub calldata: Option<Vec<u8>>,
 }
 
+/// High-level failure classification used by downstream metrics and APIs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SimulationFailCategory {
     Revert,
@@ -100,12 +109,14 @@ pub enum SimulationFailCategory {
     Unknown,
 }
 
+/// Execution mode for the simulator.
 #[derive(Clone, Copy)]
 pub enum SimulationMode<'a> {
     SyntheticDeterministic,
     RpcBacked(&'a dyn StateProvider),
 }
 
+/// Runs a deterministic simulation batch without any external state lookups.
 pub fn simulate_deterministic(
     chain_context: &ChainContext,
     txs: &[TxDecoded],
@@ -125,6 +136,7 @@ pub fn simulate_deterministic(
     )
 }
 
+/// Runs a simulation batch using the requested execution mode.
 pub fn simulate_with_mode(
     chain_context: &ChainContext,
     txs: &[SimulationTxInput],
@@ -179,6 +191,8 @@ pub fn simulate_with_mode(
                 let fail_tag = fail_category.map_or(0_u8, fail_category_tag);
                 aggregate.update([fail_tag]);
 
+                // Commit after hashing so the aggregate digest reflects the
+                // exact per-transaction outcome sequence.
                 evm.db().commit(result_and_state.state);
                 tx_results.push(TxSimulationResult {
                     hash: tx.decoded.hash,
@@ -238,6 +252,8 @@ fn seed_sender_accounts(
             SimulationMode::SyntheticDeterministic => None,
             SimulationMode::RpcBacked(provider) => provider.account_seed(sender)?,
         };
+        // Deterministic mode fabricates funded senders, while RPC-backed mode
+        // preserves upstream balance and nonce when available.
         let balance = seeded
             .map(|account| account.balance_wei)
             .unwrap_or(SEEDED_BALANCE_WEI);

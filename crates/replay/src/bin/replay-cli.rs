@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! CLI for replaying stored event logs into frame snapshots.
+
 use anyhow::{Context, Result, anyhow};
 use event_log::EventEnvelope;
 use replay::{ReplayMode, replay_frames};

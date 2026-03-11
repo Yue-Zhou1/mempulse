@@ -1,3 +1,5 @@
+//! Deterministic perf harness helpers used by benchmark and regression tests.
+
 #![forbid(unsafe_code)]
 
 use common::{Address, SourceId, TxHash};
@@ -12,6 +14,7 @@ use std::time::Instant;
 use storage::{EventStore, InMemoryStorage};
 use tokio::runtime::{Builder, Runtime};
 
+/// Summary statistics computed from a latency sample set.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LatencySummary {
     pub iterations: usize,
@@ -21,6 +24,7 @@ pub struct LatencySummary {
     pub avg_us: u64,
 }
 
+/// Latency report for the end-to-end searcher pipeline harness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PipelineLatencyReport {
     pub batch_size: usize,
@@ -31,12 +35,14 @@ pub struct PipelineLatencyReport {
     pub avg_us: u64,
 }
 
+/// Outcome snapshot for one scheduler pipeline iteration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerPipelineOutcome {
     pub ready_total: usize,
     pub pending_total: usize,
 }
 
+/// Latency report for the scheduler pipeline harness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerPipelineReport {
     pub batch_size: usize,
@@ -46,12 +52,14 @@ pub struct SchedulerPipelineReport {
     pub latency: LatencySummary,
 }
 
+/// Outcome snapshot for one simulation roundtrip iteration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimulationRoundtripOutcome {
     pub simulation_tasks: usize,
     pub handoff_total: usize,
 }
 
+/// Latency report for the simulation roundtrip harness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimulationRoundtripReport {
     pub candidate_count: usize,
@@ -61,12 +69,14 @@ pub struct SimulationRoundtripReport {
     pub latency: LatencySummary,
 }
 
+/// Outcome snapshot for one storage snapshot write/rehydration iteration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageSnapshotOutcome {
     pub snapshot_present: bool,
     pub replay_event_count: usize,
 }
 
+/// Latency report for the storage snapshot harness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageSnapshotReport {
     pub pending_count: usize,
@@ -84,6 +94,8 @@ pub struct StorageSnapshotReport {
     pub rehydrate_avg_us: u64,
 }
 
+/// Builds a deterministic batch of synthetic decoded transactions for perf
+/// harnesses.
 pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx<'static>> {
     let routers = [
         uniswap_v2_router(),
@@ -127,6 +139,8 @@ pub fn synthetic_batch(batch_size: usize) -> Vec<SearcherInputTx<'static>> {
         .collect()
 }
 
+/// Runs one end-to-end searcher ranking pass and returns the number of
+/// generated candidates.
 pub fn run_pipeline_once(batch: &[SearcherInputTx<'_>]) -> usize {
     let config = SearcherConfig {
         min_score: 7_500,
@@ -135,6 +149,7 @@ pub fn run_pipeline_once(batch: &[SearcherInputTx<'_>]) -> usize {
     rank_opportunity_batch(batch, config).candidates.len()
 }
 
+/// Measures end-to-end searcher pipeline latency over repeated iterations.
 pub fn measure_pipeline_latency(batch_size: usize, iterations: usize) -> PipelineLatencyReport {
     let iterations = iterations.max(5);
     let batch = synthetic_batch(batch_size.max(1));
@@ -157,12 +172,14 @@ pub fn measure_pipeline_latency(batch_size: usize, iterations: usize) -> Pipelin
     }
 }
 
+/// Runs one scheduler iteration over a deterministic synthetic batch.
 pub fn run_scheduler_pipeline_once(batch_size: usize) -> SchedulerPipelineOutcome {
     let runtime = build_tokio_runtime();
     let transactions = synthetic_validated_transactions(batch_size.max(1));
     runtime.block_on(async { scheduler_pipeline_iteration(&transactions).await })
 }
 
+/// Measures scheduler iteration latency over repeated runs.
 pub fn measure_scheduler_pipeline_latency(
     batch_size: usize,
     iterations: usize,
@@ -188,12 +205,14 @@ pub fn measure_scheduler_pipeline_latency(
     }
 }
 
+/// Runs one simulation roundtrip harness iteration.
 pub fn run_simulation_roundtrip_once(candidate_count: usize) -> SimulationRoundtripOutcome {
     let runtime = build_tokio_runtime();
     let transactions = synthetic_validated_transactions(candidate_count.max(1));
     runtime.block_on(async { simulation_roundtrip_iteration(&transactions).await })
 }
 
+/// Measures simulation roundtrip latency over repeated runs.
 pub fn measure_simulation_roundtrip_latency(
     candidate_count: usize,
     iterations: usize,
@@ -219,6 +238,7 @@ pub fn measure_simulation_roundtrip_latency(
     }
 }
 
+/// Runs one storage snapshot write plus rehydration iteration.
 pub fn run_storage_snapshot_once(
     pending_count: usize,
     tail_event_count: usize,
@@ -234,6 +254,7 @@ pub fn run_storage_snapshot_once(
     outcome
 }
 
+/// Measures storage snapshot write and rehydration latency over repeated runs.
 pub fn measure_storage_snapshot_latency(
     pending_count: usize,
     tail_event_count: usize,
@@ -277,6 +298,7 @@ pub fn measure_storage_snapshot_latency(
     }
 }
 
+/// Summarizes latency samples into percentile and average statistics.
 pub fn summarize_latency_samples(samples: &[u64]) -> LatencySummary {
     if samples.is_empty() {
         return LatencySummary::default();
