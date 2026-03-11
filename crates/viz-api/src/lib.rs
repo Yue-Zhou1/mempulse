@@ -2284,405 +2284,250 @@ async fn sim_by_id(
 fn render_prometheus_metrics(state: &AppState) -> String {
     let snapshot = state.provider.metric_snapshot();
     let dashboard_cache_metrics = state.provider.dashboard_cache_metrics();
+    let drop_metrics = (state.live_rpc_drop_metrics_provider)();
+    let scheduler_metrics = (state.scheduler_metrics_provider)();
+    let builder_metrics = (state.builder_metrics_provider)();
+    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
+    let replay_metrics = (state.replay_runtime_metrics_provider)();
+    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
     let relay = state.relay_dry_run_status.read().clone();
+
     let relay_success_rate = if relay.total_submissions == 0 {
         0.0
     } else {
         relay.total_accepted as f64 / relay.total_submissions as f64
     };
-
-    let mut out = String::new();
-    out.push_str("# TYPE mempulse_ingest_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_queue_depth {}\n",
-        snapshot.queue_depth_current
-    ));
-    out.push_str("# TYPE mempulse_ingest_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_queue_capacity {}\n",
-        snapshot.queue_depth_capacity
-    ));
-    out.push_str("# TYPE mempulse_ingest_decode_fail_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_decode_fail_total {}\n",
-        snapshot.tx_decode_fail_total
-    ));
-    out.push_str("# TYPE mempulse_ingest_decode_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_decode_total {}\n",
-        snapshot.tx_decode_total
-    ));
-    out.push_str("# TYPE mempulse_ingest_lag_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_lag_ms {}\n",
-        snapshot.ingest_lag_ms
-    ));
-    out.push_str("# TYPE mempulse_ingest_tx_per_sec_current gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_tx_per_sec_current {}\n",
-        snapshot.tx_per_sec_current
-    ));
-    out.push_str("# TYPE mempulse_ingest_tx_per_sec_baseline gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_tx_per_sec_baseline {}\n",
-        snapshot.tx_per_sec_baseline
-    ));
-    out.push_str("# TYPE mempulse_ingest_drops_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {}\n",
-        snapshot.tx_decode_fail_total
-    ));
-    let drop_metrics = (state.live_rpc_drop_metrics_provider)();
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {}\n",
-        drop_metrics.storage_queue_full
-    ));
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"storage_queue_closed\"}} {}\n",
-        drop_metrics.storage_queue_closed
-    ));
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {}\n",
-        drop_metrics.invalid_pending_hash
-    ));
-    let scheduler_metrics = (state.scheduler_metrics_provider)();
-    out.push_str("# TYPE mempulse_scheduler_admitted_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_admitted_total {}\n",
-        scheduler_metrics.admitted_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_duplicate_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_duplicate_total {}\n",
-        scheduler_metrics.duplicate_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_replacement_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_replacement_total {}\n",
-        scheduler_metrics.replacement_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_underpriced_replacement_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_underpriced_replacement_total {}\n",
-        scheduler_metrics.underpriced_replacement_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_sender_limit_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_sender_limit_drop_total {}\n",
-        scheduler_metrics.sender_limit_drop_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_full_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_full_drop_total {}\n",
-        scheduler_metrics.queue_full_drop_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_pending_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_pending_total {}\n",
-        scheduler_metrics.pending_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_ready_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_ready_total {}\n",
-        scheduler_metrics.ready_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_blocked_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_blocked_total {}\n",
-        scheduler_metrics.blocked_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_sender_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_sender_total {}\n",
-        scheduler_metrics.sender_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_depth {}\n",
-        scheduler_metrics.queue_depth
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_depth_peak gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_depth_peak {}\n",
-        scheduler_metrics.queue_depth_peak
-    ));
-    out.push_str("# TYPE mempulse_scheduler_handoff_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_handoff_queue_capacity {}\n",
-        scheduler_metrics.handoff_queue_capacity
-    ));
-    let builder_metrics = (state.builder_metrics_provider)();
-    out.push_str("# TYPE mempulse_builder_inserted_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_inserted_total {}\n",
-        builder_metrics.inserted_total
-    ));
-    out.push_str("# TYPE mempulse_builder_replaced_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_replaced_total {}\n",
-        builder_metrics.replaced_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rejected_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rejected_total {}\n",
-        builder_metrics.rejected_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rejected_reason_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {}\n",
-        builder_metrics.rejected_simulation_not_approved_total
-    ));
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {}\n",
-        builder_metrics.rejected_objective_not_improved_total
-    ));
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {}\n",
-        builder_metrics.rejected_gas_limit_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rollback_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rollback_total {}\n",
-        builder_metrics.rollback_total
-    ));
-    out.push_str("# TYPE mempulse_builder_active_candidate_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_active_candidate_total {}\n",
-        builder_metrics.active_candidate_total
-    ));
-    out.push_str("# TYPE mempulse_builder_total_priority_score gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_priority_score {}\n",
-        builder_metrics.total_priority_score
-    ));
-    out.push_str("# TYPE mempulse_builder_total_gas_used gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_gas_used {}\n",
-        builder_metrics.total_gas_used
-    ));
-    out.push_str("# TYPE mempulse_builder_last_decision_latency_ns gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_last_decision_latency_ns {}\n",
-        builder_metrics.last_decision_latency_ns
-    ));
-    out.push_str("# TYPE mempulse_builder_max_decision_latency_ns gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_max_decision_latency_ns {}\n",
-        builder_metrics.max_decision_latency_ns
-    ));
-    out.push_str("# TYPE mempulse_builder_total_decision_latency_ns counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_decision_latency_ns {}\n",
-        builder_metrics.total_decision_latency_ns
-    ));
-    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
-    out.push_str("# TYPE mempulse_searcher_executable_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_batches_total {}\n",
-        searcher_metrics.executable_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_candidates_total {}\n",
-        searcher_metrics.executable_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_bundle_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_bundle_candidates_total {}\n",
-        searcher_metrics.executable_bundle_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge\n");
-    out.push_str(&format!(
-        "mempulse_searcher_max_executable_candidates_in_batch {}\n",
-        searcher_metrics.max_executable_candidates_in_batch
-    ));
-    out.push_str("# TYPE mempulse_searcher_comparison_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_comparison_batches_total {}\n",
-        searcher_metrics.comparison_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_top_score_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_top_score_total {}\n",
-        searcher_metrics.executable_top_score_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_top_score_wins_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_top_score_wins_total {}\n",
-        searcher_metrics.executable_top_score_wins_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_top_score_ties_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_top_score_ties_total {}\n",
-        searcher_metrics.top_score_ties_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_overlapping_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_overlapping_candidates_total {}\n",
-        searcher_metrics.overlapping_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_only_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_only_candidates_total {}\n",
-        searcher_metrics.executable_only_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_refresh_total {}\n",
-        dashboard_cache_metrics.refresh_total
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_last_build_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_last_build_ms {:.3}\n",
-        dashboard_cache_metrics.last_build_duration_ns as f64 / 1_000_000.0
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_avg_build_ms gauge\n");
-    let avg_build_duration_ns = if dashboard_cache_metrics.refresh_total == 0 {
+    let avg_build_ms = if dashboard_cache_metrics.refresh_total == 0 {
         0.0
     } else {
         dashboard_cache_metrics.total_build_duration_ns as f64
             / dashboard_cache_metrics.refresh_total as f64
+            / 1_000_000.0
     };
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_avg_build_ms {:.3}\n",
-        avg_build_duration_ns / 1_000_000.0
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_estimated_bytes gauge\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_estimated_bytes {}\n",
-        dashboard_cache_metrics.estimated_bytes
-    ));
 
-    let replay_metrics = (state.replay_runtime_metrics_provider)();
-    out.push_str("# TYPE mempulse_replay_lag_events gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_lag_events {}\n",
-        replay_metrics.lag_events
-    ));
-    out.push_str("# TYPE mempulse_replay_checkpoint_duration_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_checkpoint_duration_ms {}\n",
-        replay_metrics.checkpoint_duration_ms
-    ));
-    out.push_str("# TYPE mempulse_replay_tail_reorged_tx_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_tail_reorged_tx_total {}\n",
-        replay_metrics.reorg_depth
-    ));
-    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
-    out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_enqueued_total {}\n",
-        sim_metrics.enqueued_total
-    ));
-    out.push_str("# TYPE mempulse_sim_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_queue_depth {}\n",
-        sim_metrics.queue_depth
-    ));
-    out.push_str("# TYPE mempulse_sim_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_queue_capacity {}\n",
-        sim_metrics.queue_capacity
-    ));
-    out.push_str("# TYPE mempulse_sim_inflight_current gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_inflight_current {}\n",
-        sim_metrics.inflight_current
-    ));
-    out.push_str("# TYPE mempulse_sim_worker_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_worker_total {}\n",
-        sim_metrics.worker_total
-    ));
-    out.push_str("# TYPE mempulse_sim_latency_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_latency_ms {}\n",
-        sim_metrics.last_latency_ms
-    ));
-    out.push_str("# TYPE mempulse_sim_completed_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"ok\"}} {}\n",
-        sim_metrics.ok_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"failed\"}} {}\n",
-        sim_metrics.failed_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"state_error\"}} {}\n",
-        sim_metrics.state_error_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"timeout\"}} {}\n",
-        sim_metrics.timeout_total
-    ));
-    out.push_str("# TYPE mempulse_sim_cache_hits_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_cache_hits_total {}\n",
-        sim_metrics.cache_hit_total
-    ));
-    out.push_str("# TYPE mempulse_sim_cache_misses_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_cache_misses_total {}\n",
-        sim_metrics.cache_miss_total
-    ));
-    out.push_str("# TYPE mempulse_sim_tx_total counter\n");
-    out.push_str(&format!("mempulse_sim_tx_total {}\n", sim_metrics.tx_total));
-    out.push_str("# TYPE mempulse_sim_fail_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"revert\"}} {}\n",
-        sim_metrics.revert_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"out_of_gas\"}} {}\n",
-        sim_metrics.out_of_gas_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {}\n",
-        sim_metrics.nonce_mismatch_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_mismatch\"}} {}\n",
-        sim_metrics.state_mismatch_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_rpc\"}} {}\n",
-        sim_metrics.state_rpc_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_timeout\"}} {}\n",
-        sim_metrics.state_timeout_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"unknown\"}} {}\n",
-        sim_metrics.unknown_fail_total
-    ));
-    out.push_str("# TYPE mempulse_sim_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_drop_total{{reason=\"queue_full\"}} {}\n",
-        sim_metrics.queue_full_drop_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_drop_total{{reason=\"stale\"}} {}\n",
-        sim_metrics.stale_drop_total
-    ));
-
-    out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
-    out.push_str(&format!(
-        "mempulse_relay_success_rate {relay_success_rate:.6}\n"
-    ));
-    out.push_str("# TYPE mempulse_relay_bundle_included_total counter\n");
-    out.push_str(&format!(
-        "mempulse_relay_bundle_included_total {}\n",
-        relay.total_accepted
-    ));
-    out.push_str("# TYPE mempulse_relay_bundle_filtered_total counter\n");
-    out.push_str(&format!(
-        "mempulse_relay_bundle_filtered_total{{reason=\"dry_run_failed\"}} {}\n",
-        relay.total_failed
-    ));
-    out
+    format!(
+        "\
+# TYPE mempulse_ingest_queue_depth gauge
+mempulse_ingest_queue_depth {ingest_queue_depth}
+# TYPE mempulse_ingest_queue_capacity gauge
+mempulse_ingest_queue_capacity {ingest_queue_capacity}
+# TYPE mempulse_ingest_decode_fail_total counter
+mempulse_ingest_decode_fail_total {ingest_decode_fail}
+# TYPE mempulse_ingest_decode_total counter
+mempulse_ingest_decode_total {ingest_decode_total}
+# TYPE mempulse_ingest_lag_ms gauge
+mempulse_ingest_lag_ms {ingest_lag_ms}
+# TYPE mempulse_ingest_tx_per_sec_current gauge
+mempulse_ingest_tx_per_sec_current {ingest_tps_current}
+# TYPE mempulse_ingest_tx_per_sec_baseline gauge
+mempulse_ingest_tx_per_sec_baseline {ingest_tps_baseline}
+# TYPE mempulse_ingest_drops_total counter
+mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {ingest_decode_fail}
+mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {drop_storage_full}
+mempulse_ingest_drops_total{{reason=\"storage_queue_closed\"}} {drop_storage_closed}
+mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {drop_invalid_hash}
+# TYPE mempulse_scheduler_admitted_total counter
+mempulse_scheduler_admitted_total {sched_admitted}
+# TYPE mempulse_scheduler_duplicate_total counter
+mempulse_scheduler_duplicate_total {sched_duplicate}
+# TYPE mempulse_scheduler_replacement_total counter
+mempulse_scheduler_replacement_total {sched_replacement}
+# TYPE mempulse_scheduler_underpriced_replacement_total counter
+mempulse_scheduler_underpriced_replacement_total {sched_underpriced}
+# TYPE mempulse_scheduler_sender_limit_drop_total counter
+mempulse_scheduler_sender_limit_drop_total {sched_sender_limit_drop}
+# TYPE mempulse_scheduler_queue_full_drop_total counter
+mempulse_scheduler_queue_full_drop_total {sched_queue_full_drop}
+# TYPE mempulse_scheduler_pending_total gauge
+mempulse_scheduler_pending_total {sched_pending}
+# TYPE mempulse_scheduler_ready_total gauge
+mempulse_scheduler_ready_total {sched_ready}
+# TYPE mempulse_scheduler_blocked_total gauge
+mempulse_scheduler_blocked_total {sched_blocked}
+# TYPE mempulse_scheduler_sender_total gauge
+mempulse_scheduler_sender_total {sched_sender}
+# TYPE mempulse_scheduler_queue_depth gauge
+mempulse_scheduler_queue_depth {sched_queue_depth}
+# TYPE mempulse_scheduler_queue_depth_peak gauge
+mempulse_scheduler_queue_depth_peak {sched_queue_depth_peak}
+# TYPE mempulse_scheduler_handoff_queue_capacity gauge
+mempulse_scheduler_handoff_queue_capacity {sched_handoff_capacity}
+# TYPE mempulse_builder_inserted_total counter
+mempulse_builder_inserted_total {builder_inserted}
+# TYPE mempulse_builder_replaced_total counter
+mempulse_builder_replaced_total {builder_replaced}
+# TYPE mempulse_builder_rejected_total counter
+mempulse_builder_rejected_total {builder_rejected}
+# TYPE mempulse_builder_rejected_reason_total counter
+mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {builder_rej_sim}
+mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {builder_rej_obj}
+mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {builder_rej_gas}
+# TYPE mempulse_builder_rollback_total counter
+mempulse_builder_rollback_total {builder_rollback}
+# TYPE mempulse_builder_active_candidate_total gauge
+mempulse_builder_active_candidate_total {builder_active_candidates}
+# TYPE mempulse_builder_total_priority_score gauge
+mempulse_builder_total_priority_score {builder_priority_score}
+# TYPE mempulse_builder_total_gas_used gauge
+mempulse_builder_total_gas_used {builder_gas_used}
+# TYPE mempulse_builder_last_decision_latency_ns gauge
+mempulse_builder_last_decision_latency_ns {builder_last_latency_ns}
+# TYPE mempulse_builder_max_decision_latency_ns gauge
+mempulse_builder_max_decision_latency_ns {builder_max_latency_ns}
+# TYPE mempulse_builder_total_decision_latency_ns counter
+mempulse_builder_total_decision_latency_ns {builder_total_latency_ns}
+# TYPE mempulse_searcher_executable_batches_total counter
+mempulse_searcher_executable_batches_total {srch_exec_batches}
+# TYPE mempulse_searcher_executable_candidates_total counter
+mempulse_searcher_executable_candidates_total {srch_exec_candidates}
+# TYPE mempulse_searcher_executable_bundle_candidates_total counter
+mempulse_searcher_executable_bundle_candidates_total {srch_exec_bundle_candidates}
+# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge
+mempulse_searcher_max_executable_candidates_in_batch {srch_max_exec_in_batch}
+# TYPE mempulse_searcher_comparison_batches_total counter
+mempulse_searcher_comparison_batches_total {srch_cmp_batches}
+# TYPE mempulse_searcher_executable_top_score_total counter
+mempulse_searcher_executable_top_score_total {srch_exec_top_score}
+# TYPE mempulse_searcher_executable_top_score_wins_total counter
+mempulse_searcher_executable_top_score_wins_total {srch_exec_top_score_wins}
+# TYPE mempulse_searcher_top_score_ties_total counter
+mempulse_searcher_top_score_ties_total {srch_top_score_ties}
+# TYPE mempulse_searcher_overlapping_candidates_total counter
+mempulse_searcher_overlapping_candidates_total {srch_overlapping}
+# TYPE mempulse_searcher_executable_only_candidates_total counter
+mempulse_searcher_executable_only_candidates_total {srch_exec_only}
+# TYPE mempulse_dashboard_cache_refresh_total counter
+mempulse_dashboard_cache_refresh_total {cache_refresh_total}
+# TYPE mempulse_dashboard_cache_last_build_ms gauge
+mempulse_dashboard_cache_last_build_ms {cache_last_build_ms:.3}
+# TYPE mempulse_dashboard_cache_avg_build_ms gauge
+mempulse_dashboard_cache_avg_build_ms {avg_build_ms:.3}
+# TYPE mempulse_dashboard_cache_estimated_bytes gauge
+mempulse_dashboard_cache_estimated_bytes {cache_estimated_bytes}
+# TYPE mempulse_replay_lag_events gauge
+mempulse_replay_lag_events {replay_lag_events}
+# TYPE mempulse_replay_checkpoint_duration_ms gauge
+mempulse_replay_checkpoint_duration_ms {replay_checkpoint_ms}
+# TYPE mempulse_replay_tail_reorged_tx_total gauge
+mempulse_replay_tail_reorged_tx_total {replay_reorg_depth}
+# TYPE mempulse_sim_enqueued_total counter
+mempulse_sim_enqueued_total {sim_enqueued}
+# TYPE mempulse_sim_queue_depth gauge
+mempulse_sim_queue_depth {sim_queue_depth}
+# TYPE mempulse_sim_queue_capacity gauge
+mempulse_sim_queue_capacity {sim_queue_capacity}
+# TYPE mempulse_sim_inflight_current gauge
+mempulse_sim_inflight_current {sim_inflight}
+# TYPE mempulse_sim_worker_total gauge
+mempulse_sim_worker_total {sim_workers}
+# TYPE mempulse_sim_latency_ms gauge
+mempulse_sim_latency_ms {sim_latency_ms}
+# TYPE mempulse_sim_completed_total counter
+mempulse_sim_completed_total{{status=\"ok\"}} {sim_ok}
+mempulse_sim_completed_total{{status=\"failed\"}} {sim_failed}
+mempulse_sim_completed_total{{status=\"state_error\"}} {sim_state_error}
+mempulse_sim_completed_total{{status=\"timeout\"}} {sim_timeout}
+# TYPE mempulse_sim_cache_hits_total counter
+mempulse_sim_cache_hits_total {sim_cache_hit}
+# TYPE mempulse_sim_cache_misses_total counter
+mempulse_sim_cache_misses_total {sim_cache_miss}
+# TYPE mempulse_sim_tx_total counter
+mempulse_sim_tx_total {sim_tx_total}
+# TYPE mempulse_sim_fail_total counter
+mempulse_sim_fail_total{{category=\"revert\"}} {sim_fail_revert}
+mempulse_sim_fail_total{{category=\"out_of_gas\"}} {sim_fail_oog}
+mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {sim_fail_nonce}
+mempulse_sim_fail_total{{category=\"state_mismatch\"}} {sim_fail_state_mismatch}
+mempulse_sim_fail_total{{category=\"state_rpc\"}} {sim_fail_state_rpc}
+mempulse_sim_fail_total{{category=\"state_timeout\"}} {sim_fail_state_timeout}
+mempulse_sim_fail_total{{category=\"unknown\"}} {sim_fail_unknown}
+# TYPE mempulse_sim_drop_total counter
+mempulse_sim_drop_total{{reason=\"queue_full\"}} {sim_drop_queue_full}
+mempulse_sim_drop_total{{reason=\"stale\"}} {sim_drop_stale}
+# TYPE mempulse_relay_success_rate gauge
+mempulse_relay_success_rate {relay_success_rate:.6}
+# TYPE mempulse_relay_bundle_included_total counter
+mempulse_relay_bundle_included_total {relay_accepted}
+# TYPE mempulse_relay_bundle_filtered_total counter
+mempulse_relay_bundle_filtered_total{{reason=\"dry_run_failed\"}} {relay_failed}
+",
+        ingest_queue_depth = snapshot.queue_depth_current,
+        ingest_queue_capacity = snapshot.queue_depth_capacity,
+        ingest_decode_fail = snapshot.tx_decode_fail_total,
+        ingest_decode_total = snapshot.tx_decode_total,
+        ingest_lag_ms = snapshot.ingest_lag_ms,
+        ingest_tps_current = snapshot.tx_per_sec_current,
+        ingest_tps_baseline = snapshot.tx_per_sec_baseline,
+        drop_storage_full = drop_metrics.storage_queue_full,
+        drop_storage_closed = drop_metrics.storage_queue_closed,
+        drop_invalid_hash = drop_metrics.invalid_pending_hash,
+        sched_admitted = scheduler_metrics.admitted_total,
+        sched_duplicate = scheduler_metrics.duplicate_total,
+        sched_replacement = scheduler_metrics.replacement_total,
+        sched_underpriced = scheduler_metrics.underpriced_replacement_total,
+        sched_sender_limit_drop = scheduler_metrics.sender_limit_drop_total,
+        sched_queue_full_drop = scheduler_metrics.queue_full_drop_total,
+        sched_pending = scheduler_metrics.pending_total,
+        sched_ready = scheduler_metrics.ready_total,
+        sched_blocked = scheduler_metrics.blocked_total,
+        sched_sender = scheduler_metrics.sender_total,
+        sched_queue_depth = scheduler_metrics.queue_depth,
+        sched_queue_depth_peak = scheduler_metrics.queue_depth_peak,
+        sched_handoff_capacity = scheduler_metrics.handoff_queue_capacity,
+        builder_inserted = builder_metrics.inserted_total,
+        builder_replaced = builder_metrics.replaced_total,
+        builder_rejected = builder_metrics.rejected_total,
+        builder_rej_sim = builder_metrics.rejected_simulation_not_approved_total,
+        builder_rej_obj = builder_metrics.rejected_objective_not_improved_total,
+        builder_rej_gas = builder_metrics.rejected_gas_limit_total,
+        builder_rollback = builder_metrics.rollback_total,
+        builder_active_candidates = builder_metrics.active_candidate_total,
+        builder_priority_score = builder_metrics.total_priority_score,
+        builder_gas_used = builder_metrics.total_gas_used,
+        builder_last_latency_ns = builder_metrics.last_decision_latency_ns,
+        builder_max_latency_ns = builder_metrics.max_decision_latency_ns,
+        builder_total_latency_ns = builder_metrics.total_decision_latency_ns,
+        srch_exec_batches = searcher_metrics.executable_batches_total,
+        srch_exec_candidates = searcher_metrics.executable_candidates_total,
+        srch_exec_bundle_candidates = searcher_metrics.executable_bundle_candidates_total,
+        srch_max_exec_in_batch = searcher_metrics.max_executable_candidates_in_batch,
+        srch_cmp_batches = searcher_metrics.comparison_batches_total,
+        srch_exec_top_score = searcher_metrics.executable_top_score_total,
+        srch_exec_top_score_wins = searcher_metrics.executable_top_score_wins_total,
+        srch_top_score_ties = searcher_metrics.top_score_ties_total,
+        srch_overlapping = searcher_metrics.overlapping_candidates_total,
+        srch_exec_only = searcher_metrics.executable_only_candidates_total,
+        cache_refresh_total = dashboard_cache_metrics.refresh_total,
+        cache_last_build_ms = dashboard_cache_metrics.last_build_duration_ns as f64 / 1_000_000.0,
+        cache_estimated_bytes = dashboard_cache_metrics.estimated_bytes,
+        replay_lag_events = replay_metrics.lag_events,
+        replay_checkpoint_ms = replay_metrics.checkpoint_duration_ms,
+        replay_reorg_depth = replay_metrics.reorg_depth,
+        sim_enqueued = sim_metrics.enqueued_total,
+        sim_queue_depth = sim_metrics.queue_depth,
+        sim_queue_capacity = sim_metrics.queue_capacity,
+        sim_inflight = sim_metrics.inflight_current,
+        sim_workers = sim_metrics.worker_total,
+        sim_latency_ms = sim_metrics.last_latency_ms,
+        sim_ok = sim_metrics.ok_total,
+        sim_failed = sim_metrics.failed_total,
+        sim_state_error = sim_metrics.state_error_total,
+        sim_timeout = sim_metrics.timeout_total,
+        sim_cache_hit = sim_metrics.cache_hit_total,
+        sim_cache_miss = sim_metrics.cache_miss_total,
+        sim_tx_total = sim_metrics.tx_total,
+        sim_fail_revert = sim_metrics.revert_fail_total,
+        sim_fail_oog = sim_metrics.out_of_gas_fail_total,
+        sim_fail_nonce = sim_metrics.nonce_mismatch_fail_total,
+        sim_fail_state_mismatch = sim_metrics.state_mismatch_fail_total,
+        sim_fail_state_rpc = sim_metrics.state_rpc_fail_total,
+        sim_fail_state_timeout = sim_metrics.state_timeout_fail_total,
+        sim_fail_unknown = sim_metrics.unknown_fail_total,
+        sim_drop_queue_full = sim_metrics.queue_full_drop_total,
+        sim_drop_stale = sim_metrics.stale_drop_total,
+        relay_accepted = relay.total_accepted,
+        relay_failed = relay.total_failed,
+    )
 }
 
 fn collect_events_up_to_seq(provider: &dyn VizDataProvider, to_seq_id: u64) -> Vec<EventEnvelope> {
