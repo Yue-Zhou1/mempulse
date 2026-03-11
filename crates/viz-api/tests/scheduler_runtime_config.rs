@@ -1,7 +1,8 @@
 use common::{Address, SourceId};
 use event_log::TxDecoded;
+use parking_lot::RwLock;
 use scheduler::{SchedulerAdmission, ValidatedTransaction};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use storage::InMemoryStorage;
 use tokio::time::{Duration, Instant, sleep};
 use viz_api::runtime_bootstrap_from_storage;

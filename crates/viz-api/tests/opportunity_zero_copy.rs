@@ -1,5 +1,5 @@
 use event_log::TxDecoded;
-use searcher::{SearcherConfig, SearcherInputTx, rank_opportunities};
+use searcher::{SearcherConfig, SearcherInputTx, rank_opportunity_batch};
 
 fn decoded_with_calldata_len(calldata_len: usize) -> TxDecoded {
     TxDecoded {
@@ -31,13 +31,14 @@ fn opportunity_zero_copy_accepts_borrowed_calldata_without_clone() {
         calldata: calldata.into(),
     }];
 
-    let ranked = rank_opportunities(
+    let ranked = rank_opportunity_batch(
         &batch,
         SearcherConfig {
             min_score: 0,
             max_candidates: 8,
         },
-    );
+    )
+    .candidates;
 
     let borrowed_ptr = batch[0].calldata.as_ptr() as usize;
     assert_eq!(borrowed_ptr, expected_ptr);

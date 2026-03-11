@@ -51,14 +51,6 @@ impl DashboardStreamBroadcaster {
         self.publish_event(event);
     }
 
-    pub fn publish_reset(&self, reason: &str, latest_seq_id: u64) {
-        let event = DashboardStreamBroadcastEvent::Reset {
-            reason: reason.to_owned(),
-            latest_seq_id,
-        };
-        self.publish_event(event);
-    }
-
     pub fn subscribe_from(
         &self,
         after_seq_id: u64,

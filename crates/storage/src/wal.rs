@@ -1,12 +1,11 @@
-use anyhow::{Context, Result};
+use crate::{Result, StorageError};
+use anyhow::Context;
 use event_log::EventEnvelope;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const HIGH_THROUGHPUT_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Clone, Debug)]
 pub struct StorageWal {
     path: PathBuf,
@@ -22,20 +21,13 @@ impl StorageWal {
         let path = path.into();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("create WAL parent directory {}", parent.display()))?;
+                .with_context(|| format!("create WAL parent directory {}", parent.display()))
+                .map_err(StorageError::wal_write)?;
         }
         Ok(Self {
             path,
             segment_max_bytes: segment_max_bytes.max(1),
         })
-    }
-
-    pub fn high_throughput(path: impl Into<PathBuf>) -> Result<Self> {
-        Self::with_segment_size(path, HIGH_THROUGHPUT_SEGMENT_MAX_BYTES)
-    }
-
-    pub fn segment_max_bytes(&self) -> u64 {
-        self.segment_max_bytes
     }
 
     pub fn append_event(&self, event: &EventEnvelope) -> Result<()> {
@@ -44,10 +36,14 @@ impl StorageWal {
             .create(true)
             .append(true)
             .open(&segment_path)
-            .with_context(|| format!("open WAL segment {} for append", segment_path.display()))?;
-        let encoded = serde_json::to_string(event).context("serialize WAL event")?;
+            .with_context(|| format!("open WAL segment {} for append", segment_path.display()))
+            .map_err(StorageError::wal_write)?;
+        let encoded = serde_json::to_string(event)
+            .context("serialize WAL event")
+            .map_err(StorageError::wal_write)?;
         writeln!(file, "{encoded}")
-            .with_context(|| format!("append WAL event to segment {}", segment_path.display()))?;
+            .with_context(|| format!("append WAL event to segment {}", segment_path.display()))
+            .map_err(StorageError::wal_write)?;
         Ok(())
     }
 
@@ -80,12 +76,14 @@ impl StorageWal {
         let segments = self.segment_paths()?;
         for (_, path) in segments {
             fs::remove_file(&path)
-                .with_context(|| format!("remove WAL segment {}", path.display()))?;
+                .with_context(|| format!("remove WAL segment {}", path.display()))
+                .map_err(StorageError::wal_write)?;
         }
 
         if self.path.exists() {
             fs::write(&self.path, b"")
-                .with_context(|| format!("clear WAL file {}", self.path.display()))?;
+                .with_context(|| format!("clear WAL file {}", self.path.display()))
+                .map_err(StorageError::wal_write)?;
         }
         Ok(())
     }
@@ -98,7 +96,8 @@ impl StorageWal {
         let segments = self.segment_paths()?;
         if let Some((id, path)) = segments.last() {
             let len = fs::metadata(path)
-                .with_context(|| format!("stat WAL segment {}", path.display()))?
+                .with_context(|| format!("stat WAL segment {}", path.display()))
+                .map_err(StorageError::wal_write)?
                 .len();
             if len < self.segment_max_bytes {
                 return Ok(path.clone());
@@ -119,10 +118,12 @@ impl StorageWal {
         let mut segments = Vec::new();
 
         for entry in fs::read_dir(&parent)
-            .with_context(|| format!("read WAL directory {}", parent.display()))?
+            .with_context(|| format!("read WAL directory {}", parent.display()))
+            .map_err(StorageError::wal_write)?
         {
-            let entry =
-                entry.with_context(|| format!("read WAL directory entry {}", parent.display()))?;
+            let entry = entry
+                .with_context(|| format!("read WAL directory entry {}", parent.display()))
+                .map_err(StorageError::wal_write)?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -169,15 +170,20 @@ fn read_events_from_path(path: &Path) -> Result<Vec<EventEnvelope>> {
     let file = OpenOptions::new()
         .read(true)
         .open(path)
-        .with_context(|| format!("open WAL file {} for recovery", path.display()))?;
+        .with_context(|| format!("open WAL file {} for recovery", path.display()))
+        .map_err(StorageError::wal_write)?;
     let reader = BufReader::new(file);
     let mut events = Vec::new();
     for line in reader.lines() {
-        let line = line.context("read WAL line")?;
+        let line = line
+            .context("read WAL line")
+            .map_err(StorageError::wal_write)?;
         if line.trim().is_empty() {
             continue;
         }
-        let event: EventEnvelope = serde_json::from_str(&line).context("decode WAL event line")?;
+        let event: EventEnvelope = serde_json::from_str(&line)
+            .context("decode WAL event line")
+            .map_err(StorageError::wal_write)?;
         events.push(event);
     }
     Ok(events)

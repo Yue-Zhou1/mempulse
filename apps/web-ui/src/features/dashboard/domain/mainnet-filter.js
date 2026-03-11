@@ -1,3 +1,5 @@
+import { normalizeToken } from './screen-mode.js';
+
 export const MAINNET_FILTER_ALL = 'all';
 
 const MAINNET_LABELS = Object.freeze([
@@ -15,10 +17,6 @@ export const MAINNET_FILTER_OPTIONS = Object.freeze([
 const MAINNET_LABEL_BY_NORMALIZED = new Map(
   MAINNET_LABELS.map((label) => [label.toLowerCase(), label]),
 );
-
-function normalizeToken(value) {
-  return String(value ?? '').trim().toLowerCase();
-}
 
 export function normalizeMainnetFilter(value) {
   const normalized = normalizeToken(value);

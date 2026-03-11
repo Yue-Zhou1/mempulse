@@ -78,16 +78,6 @@ pub enum DecodeError {
     JsonDecode(#[from] serde_json::Error),
 }
 
-pub fn decode_from_json_str(input: &str) -> Result<DecodedTx, DecodeError> {
-    let raw: RawTxInput = serde_json::from_str(input)?;
-    decode_from_raw(raw)
-}
-
-pub fn decode_from_json_bytes(input: &[u8]) -> Result<DecodedTx, DecodeError> {
-    let raw: RawTxInput = serde_json::from_slice(input)?;
-    decode_from_raw(raw)
-}
-
 pub fn decode_from_raw(input: RawTxInput) -> Result<DecodedTx, DecodeError> {
     let fees = normalize_fees(&input)?;
     let hash = parse_fixed_hex::<32>(&input.hash, "hash")?;
@@ -275,18 +265,5 @@ mod tests {
                 field: "max_fee_per_blob_gas"
             }
         ));
-    }
-
-    #[test]
-    fn decodes_from_json_bytes() {
-        let mut input = sample_raw(TxType::Eip2930);
-        input.max_fee_per_gas = None;
-        input.max_priority_fee_per_gas = None;
-        input.max_fee_per_blob_gas = None;
-        let encoded = serde_json::to_vec(&input).expect("encode json");
-
-        let decoded = decode_from_json_bytes(&encoded).expect("decode json bytes");
-        assert_eq!(decoded.tx_type, TxType::Eip2930);
-        assert_eq!(decoded.fees.gas_price, Some(55));
     }
 }

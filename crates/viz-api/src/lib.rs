@@ -1,9 +1,11 @@
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod live_rpc;
 pub mod stream_broadcast;
 
 use auth::{ApiAuthConfig, ApiRateLimiter};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use auto_impl::auto_impl;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
@@ -21,6 +23,7 @@ use live_rpc::{
     LiveRpcChainStatus, LiveRpcConfig, LiveRpcDropMetricsSnapshot, LiveRpcSearcherMetricsSnapshot,
     LiveRpcSimulationMetricsSnapshot, LiveRpcSimulationStatusSnapshot,
 };
+use parking_lot::RwLock;
 use replay::{
     ReplayMode, TxLifecycleStatus, current_lifecycle, replay_diff_summary, replay_frames,
     replay_from_checkpoint,
@@ -37,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, ClickHouseHttpSink, EventStore, InMemoryStorage, MarketStatsSnapshot,
@@ -185,9 +188,9 @@ pub struct RuntimeBootstrap {
     /// before relying on live ingest to converge pending state.
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
-    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    scheduler_snapshot_writer_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
-    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     pub ingest_mode: IngestSourceMode,
 }
 
@@ -196,9 +199,9 @@ pub struct RuntimeBootstrapStartup {
     pub live_rpc_config: LiveRpcConfig,
     pub rebuild_scheduler_from_rpc: bool,
     scheduler_snapshot_interval_ms: u64,
-    scheduler_snapshot_writer_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    scheduler_snapshot_writer_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
     replay_runtime_metrics_cache: ReplayRuntimeMetricsCache,
-    replay_runtime_metrics_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    replay_runtime_metrics_abort: Arc<OnceLock<tokio::task::AbortHandle>>,
 }
 
 impl RuntimeBootstrap {
@@ -376,14 +379,6 @@ pub struct HealthResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamV2Hello {
-    pub op: String,
-    pub heartbeat_interval_ms: u64,
-    pub session_id: String,
-    pub server_time_unix_ms: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamV2Patch {
     pub upsert: Vec<TransactionSummary>,
     pub remove: Vec<String>,
@@ -486,14 +481,12 @@ impl ReplayRuntimeMetricsCache {
     }
 
     fn snapshot(&self) -> ReplayRuntimeMetricsSnapshot {
-        self.snapshot.read().map(|guard| *guard).unwrap_or_default()
+        *self.snapshot.read()
     }
 
     fn refresh(&self) {
         let next = build_replay_runtime_metrics(&self.storage);
-        if let Ok(mut guard) = self.snapshot.write() {
-            *guard = next;
-        }
+        *self.snapshot.write() = next;
     }
 }
 
@@ -571,9 +564,11 @@ fn map_market_stats(snapshot: MarketStatsSnapshot) -> MarketStats {
     }
 }
 
+#[auto_impl(&, Box, Arc)]
 pub trait VizDataProvider: Send + Sync {
     fn events(&self, after_seq_id: u64, event_types: &[String], limit: usize)
     -> Vec<EventEnvelope>;
+    #[must_use = "callers should inspect the latest sequence id when serving incremental data"]
     fn latest_seq_id(&self) -> Option<u64>;
     fn replay_points(&self) -> Vec<ReplayPoint>;
     fn propagation_edges(&self) -> Vec<PropagationEdge>;
@@ -585,6 +580,7 @@ pub trait VizDataProvider: Send + Sync {
     fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail>;
     fn market_stats(&self) -> MarketStats;
     fn dashboard_cache_metrics(&self) -> DashboardCacheMetrics;
+    #[must_use]
     fn dashboard_snapshot_v2(
         &self,
         tx_limit: usize,
@@ -674,23 +670,14 @@ impl InMemoryVizProvider {
     }
 
     pub fn dashboard_cache_refreshes(&self) -> u64 {
-        self.dashboard_cache
-            .read()
-            .map(|cache| cache.refreshes)
-            .unwrap_or(0)
+        self.dashboard_cache.read().refreshes
     }
 
     fn dashboard_cache_snapshot(&self) -> DashboardReadCache {
-        let storage = match self.storage.read() {
-            Ok(storage) => storage,
-            Err(_) => return DashboardReadCache::default(),
-        };
+        let storage = self.storage.read();
         let revision = storage.read_model_revision();
 
-        let mut cache = match self.dashboard_cache.write() {
-            Ok(cache) => cache,
-            Err(_) => return DashboardReadCache::default(),
-        };
+        let mut cache = self.dashboard_cache.write();
         if cache.revision != Some(revision) {
             let build_started_at = Instant::now();
             cache.revision = Some(revision);
@@ -865,23 +852,18 @@ impl VizDataProvider for InMemoryVizProvider {
         event_types: &[String],
         limit: usize,
     ) -> Vec<EventEnvelope> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                storage
-                    .scan_events(after_seq_id, limit.saturating_mul(2).max(limit))
-                    .into_iter()
-                    .filter(|event| {
-                        event_types.is_empty()
-                            || event_types.iter().any(|kind| {
-                                event_payload_type(&event.payload).eq_ignore_ascii_case(kind)
-                            })
-                    })
-                    .take(limit)
-                    .collect()
+        let storage = self.storage.read();
+        storage
+            .scan_events(after_seq_id, limit.saturating_mul(2).max(limit))
+            .into_iter()
+            .filter(|event| {
+                event_types.is_empty()
+                    || event_types
+                        .iter()
+                        .any(|kind| event_payload_type(&event.payload).eq_ignore_ascii_case(kind))
             })
-            .unwrap_or_default()
+            .take(limit)
+            .collect()
     }
 
     fn replay_points(&self) -> Vec<ReplayPoint> {
@@ -889,10 +871,7 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn latest_seq_id(&self) -> Option<u64> {
-        self.storage
-            .read()
-            .ok()
-            .and_then(|storage| storage.latest_seq_id())
+        self.storage.read().latest_seq_id()
     }
 
     fn propagation_edges(&self) -> Vec<PropagationEdge> {
@@ -929,45 +908,33 @@ impl VizDataProvider for InMemoryVizProvider {
     }
 
     fn recent_transactions(&self, limit: usize) -> Vec<TransactionSummary> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                storage
-                    .recent_transactions(limit)
-                    .into_iter()
-                    .map(|tx| TransactionSummary {
-                        hash: format_bytes(&tx.hash),
-                        sender: format_bytes(&tx.sender),
-                        nonce: tx.nonce,
-                        tx_type: tx.tx_type,
-                        seen_unix_ms: tx.seen_unix_ms,
-                        source_id: tx.source_id,
-                    })
-                    .collect()
+        let storage = self.storage.read();
+        storage
+            .recent_transactions(limit)
+            .into_iter()
+            .map(|tx| TransactionSummary {
+                hash: format_bytes(&tx.hash),
+                sender: format_bytes(&tx.sender),
+                nonce: tx.nonce,
+                tx_type: tx.tx_type,
+                seen_unix_ms: tx.seen_unix_ms,
+                source_id: tx.source_id,
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn market_stats(&self) -> MarketStats {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| map_market_stats(storage.market_stats_snapshot()))
-            .unwrap_or_else(|| map_market_stats(MarketStatsSnapshot::default()))
+        map_market_stats(self.storage.read().market_stats_snapshot())
     }
 
     fn dashboard_cache_metrics(&self) -> DashboardCacheMetrics {
-        self.dashboard_cache
-            .read()
-            .ok()
-            .map(|cache| DashboardCacheMetrics {
-                refresh_total: cache.refreshes,
-                last_build_duration_ns: cache.last_build_duration_ns,
-                total_build_duration_ns: cache.total_build_duration_ns,
-                estimated_bytes: cache.estimated_bytes,
-            })
-            .unwrap_or_default()
+        let cache = self.dashboard_cache.read();
+        DashboardCacheMetrics {
+            refresh_total: cache.refreshes,
+            last_build_duration_ns: cache.last_build_duration_ns,
+            total_build_duration_ns: cache.total_build_duration_ns,
+            estimated_bytes: cache.estimated_bytes,
+        }
     }
 
     fn dashboard_snapshot_v2(
@@ -987,178 +954,90 @@ impl VizDataProvider for InMemoryVizProvider {
         let opp_scan_limit = chain_filter_scan_limit(opp_limit, chain_id);
         let tx_scan_limit = chain_filter_scan_limit(tx_limit, chain_id);
 
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let feature_summary = build_feature_summary(&storage)
-                    .into_iter()
-                    .take(summary_limit)
-                    .collect::<Vec<_>>();
+        let storage = self.storage.read();
+        let feature_summary = build_feature_summary(&storage)
+            .into_iter()
+            .take(summary_limit)
+            .collect::<Vec<_>>();
 
-                let feature_details = build_feature_details(&storage)
-                    .into_iter()
-                    .take(feature_scan_limit)
-                    .filter(|row| chain_matches_filter(row.chain_id, chain_id))
-                    .take(feature_limit)
-                    .collect::<Vec<_>>();
+        let feature_details = build_feature_details(&storage)
+            .into_iter()
+            .take(feature_scan_limit)
+            .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+            .take(feature_limit)
+            .collect::<Vec<_>>();
 
-                let opportunities = build_opportunities(&storage)
-                    .into_iter()
-                    .filter(|row| row.score >= min_score)
-                    .take(opp_scan_limit)
-                    .filter(|row| chain_matches_filter(row.chain_id, chain_id))
-                    .take(opp_limit)
-                    .collect::<Vec<_>>();
+        let opportunities = build_opportunities(&storage)
+            .into_iter()
+            .filter(|row| row.score >= min_score)
+            .take(opp_scan_limit)
+            .filter(|row| chain_matches_filter(row.chain_id, chain_id))
+            .take(opp_limit)
+            .collect::<Vec<_>>();
 
-                let mut chain_id_by_hash = HashMap::new();
-                for row in storage.tx_full() {
-                    chain_id_by_hash.insert(row.hash, row.chain_id);
-                }
+        let mut chain_id_by_hash = HashMap::new();
+        for row in storage.tx_full() {
+            chain_id_by_hash.insert(row.hash, row.chain_id);
+        }
 
-                let mut transactions = Vec::with_capacity(tx_limit);
-                for row in storage.recent_transactions(tx_scan_limit) {
-                    let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
-                    if !chain_matches_filter(row_chain_id, chain_id) {
-                        continue;
-                    }
+        let mut transactions = Vec::with_capacity(tx_limit);
+        for row in storage.recent_transactions(tx_scan_limit) {
+            let row_chain_id = chain_id_by_hash.get(&row.hash).copied().flatten();
+            if !chain_matches_filter(row_chain_id, chain_id) {
+                continue;
+            }
 
-                    transactions.push(TransactionSummary {
-                        hash: format_bytes(&row.hash),
-                        sender: format_bytes(&row.sender),
-                        nonce: row.nonce,
-                        tx_type: row.tx_type,
-                        seen_unix_ms: row.seen_unix_ms,
-                        source_id: row.source_id,
-                    });
-                    if transactions.len() >= tx_limit {
-                        break;
-                    }
-                }
+            transactions.push(TransactionSummary {
+                hash: format_bytes(&row.hash),
+                sender: format_bytes(&row.sender),
+                nonce: row.nonce,
+                tx_type: row.tx_type,
+                seen_unix_ms: row.seen_unix_ms,
+                source_id: row.source_id,
+            });
+            if transactions.len() >= tx_limit {
+                break;
+            }
+        }
 
-                DashboardSnapshotV2 {
-                    revision: storage.read_model_revision(),
-                    latest_seq_id: storage.latest_seq_id().unwrap_or(0),
-                    opportunities,
-                    feature_summary,
-                    feature_details,
-                    transactions,
-                    chain_ingest_status: Vec::new(),
-                    market_stats: map_market_stats(storage.market_stats_snapshot()),
-                }
-            })
-            .unwrap_or_else(|| DashboardSnapshotV2 {
-                revision: 0,
-                latest_seq_id: 0,
-                opportunities: Vec::new(),
-                feature_summary: Vec::new(),
-                feature_details: Vec::new(),
-                transactions: Vec::new(),
-                chain_ingest_status: Vec::new(),
-                market_stats: map_market_stats(MarketStatsSnapshot::default()),
-            })
+        DashboardSnapshotV2 {
+            revision: storage.read_model_revision(),
+            latest_seq_id: storage.latest_seq_id().unwrap_or(0),
+            opportunities,
+            feature_summary,
+            feature_details,
+            transactions,
+            chain_ingest_status: Vec::new(),
+            market_stats: map_market_stats(storage.market_stats_snapshot()),
+        }
     }
 
     fn transaction_details(&self, limit: usize) -> Vec<TransactionDetail> {
-        self.storage
-            .read()
-            .ok()
-            .map(|storage| {
-                let mut full_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_full() {
-                    full_by_hash.insert(row.hash, row);
-                }
-                let mut feature_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_features() {
-                    feature_by_hash.insert(row.hash, row);
-                }
-                let mut lifecycle_by_hash = std::collections::HashMap::new();
-                for row in storage.tx_lifecycle() {
-                    lifecycle_by_hash.insert(row.hash, row);
-                }
+        let storage = self.storage.read();
+        let mut full_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_full() {
+            full_by_hash.insert(row.hash, row);
+        }
+        let mut feature_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_features() {
+            feature_by_hash.insert(row.hash, row);
+        }
+        let mut lifecycle_by_hash = std::collections::HashMap::new();
+        for row in storage.tx_lifecycle() {
+            lifecycle_by_hash.insert(row.hash, row);
+        }
 
-                let mut emitted = std::collections::HashSet::new();
-                let mut out = Vec::new();
+        let mut emitted = std::collections::HashSet::new();
+        let mut out = Vec::new();
 
-                for seen in storage.tx_seen().iter().rev() {
-                    if !emitted.insert(seen.hash) {
-                        continue;
-                    }
-                    let full = full_by_hash.get(&seen.hash).copied();
-                    let feature = feature_by_hash.get(&seen.hash).copied();
-                    let lifecycle = lifecycle_by_hash.get(&seen.hash).copied();
-                    out.push(TransactionDetail {
-                        hash: format_bytes(&seen.hash),
-                        peer: seen.peer.clone(),
-                        first_seen_unix_ms: seen.first_seen_unix_ms,
-                        seen_count: seen.seen_count,
-                        tx_type: full.map(|row| row.tx_type),
-                        sender: full.map(|row| format_bytes(&row.sender)),
-                        to: full.and_then(|row| row.to.as_ref().map(|to| format_bytes(to))),
-                        chain_id: full.and_then(|row| row.chain_id),
-                        nonce: full.map(|row| row.nonce),
-                        value_wei: full.and_then(|row| row.value_wei),
-                        gas_limit: full.and_then(|row| row.gas_limit),
-                        gas_price_wei: full.and_then(|row| row.gas_price_wei),
-                        max_fee_per_gas_wei: full.and_then(|row| row.max_fee_per_gas_wei),
-                        max_priority_fee_per_gas_wei: full
-                            .and_then(|row| row.max_priority_fee_per_gas_wei),
-                        max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
-                        calldata_len: full.and_then(|row| row.calldata_len),
-                        raw_tx_len: full.map(|row| row.raw_tx.len()),
-                        lifecycle_status: lifecycle.map(|row| row.status.clone()),
-                        lifecycle_reason: lifecycle.and_then(|row| row.reason.clone()),
-                        lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
-                        protocol: feature.map(|row| row.protocol.clone()),
-                        category: feature.map(|row| row.category.clone()),
-                        mev_score: feature.map(|row| row.mev_score),
-                        urgency_score: feature.map(|row| row.urgency_score),
-                        feature_engine_version: feature
-                            .map(|row| row.feature_engine_version.clone()),
-                    });
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
-
-                out
-            })
-            .unwrap_or_default()
-    }
-
-    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
-        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
-        self.storage.read().ok().and_then(|storage| {
-            let seen = storage
-                .tx_seen()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash)?;
-            let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
-            let feature = storage
-                .tx_features()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
-            let lifecycle = storage
-                .tx_lifecycle()
-                .iter()
-                .rev()
-                .find(|row| row.hash == hash);
-            let fallback_lifecycle = lifecycle
-                .is_none()
-                .then(|| current_lifecycle(&storage.list_events(), hash));
-            let (lifecycle_status, lifecycle_reason) = lifecycle
-                .map(|row| (Some(row.status.clone()), row.reason.clone()))
-                .unwrap_or_else(|| {
-                    fallback_lifecycle
-                        .flatten()
-                        .as_ref()
-                        .map(map_lifecycle_status)
-                        .map(|(status, reason)| (Some(status), reason))
-                        .unwrap_or((None, None))
-                });
-            Some(TransactionDetail {
+        for seen in storage.tx_seen().iter().rev() {
+            if !emitted.insert(seen.hash) {
+                continue;
+            }
+            let full = full_by_hash.get(&seen.hash).copied();
+            let feature = feature_by_hash.get(&seen.hash).copied();
+            let lifecycle = lifecycle_by_hash.get(&seen.hash).copied();
+            out.push(TransactionDetail {
                 hash: format_bytes(&seen.hash),
                 peer: seen.peer.clone(),
                 first_seen_unix_ms: seen.first_seen_unix_ms,
@@ -1176,30 +1055,88 @@ impl VizDataProvider for InMemoryVizProvider {
                 max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
                 calldata_len: full.and_then(|row| row.calldata_len),
                 raw_tx_len: full.map(|row| row.raw_tx.len()),
-                lifecycle_status,
-                lifecycle_reason,
+                lifecycle_status: lifecycle.map(|row| row.status.clone()),
+                lifecycle_reason: lifecycle.and_then(|row| row.reason.clone()),
                 lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
                 protocol: feature.map(|row| row.protocol.clone()),
                 category: feature.map(|row| row.category.clone()),
                 mev_score: feature.map(|row| row.mev_score),
                 urgency_score: feature.map(|row| row.urgency_score),
                 feature_engine_version: feature.map(|row| row.feature_engine_version.clone()),
-            })
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        out
+    }
+
+    fn transaction_detail_by_hash(&self, hash: &str) -> Option<TransactionDetail> {
+        let hash = live_rpc::parse_fixed_hex::<32>(hash)?;
+        let storage = self.storage.read();
+        let seen = storage
+            .tx_seen()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash)?;
+        let full = storage.tx_full().iter().rev().find(|row| row.hash == hash);
+        let feature = storage
+            .tx_features()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash);
+        let lifecycle = storage
+            .tx_lifecycle()
+            .iter()
+            .rev()
+            .find(|row| row.hash == hash);
+        let fallback_lifecycle = lifecycle
+            .is_none()
+            .then(|| current_lifecycle(&storage.list_events(), hash));
+        let (lifecycle_status, lifecycle_reason) = lifecycle
+            .map(|row| (Some(row.status.clone()), row.reason.clone()))
+            .unwrap_or_else(|| {
+                fallback_lifecycle
+                    .flatten()
+                    .as_ref()
+                    .map(map_lifecycle_status)
+                    .map(|(status, reason)| (Some(status), reason))
+                    .unwrap_or((None, None))
+            });
+        Some(TransactionDetail {
+            hash: format_bytes(&seen.hash),
+            peer: seen.peer.clone(),
+            first_seen_unix_ms: seen.first_seen_unix_ms,
+            seen_count: seen.seen_count,
+            tx_type: full.map(|row| row.tx_type),
+            sender: full.map(|row| format_bytes(&row.sender)),
+            to: full.and_then(|row| row.to.as_ref().map(|to| format_bytes(to))),
+            chain_id: full.and_then(|row| row.chain_id),
+            nonce: full.map(|row| row.nonce),
+            value_wei: full.and_then(|row| row.value_wei),
+            gas_limit: full.and_then(|row| row.gas_limit),
+            gas_price_wei: full.and_then(|row| row.gas_price_wei),
+            max_fee_per_gas_wei: full.and_then(|row| row.max_fee_per_gas_wei),
+            max_priority_fee_per_gas_wei: full.and_then(|row| row.max_priority_fee_per_gas_wei),
+            max_fee_per_blob_gas_wei: full.and_then(|row| row.max_fee_per_blob_gas_wei),
+            calldata_len: full.and_then(|row| row.calldata_len),
+            raw_tx_len: full.map(|row| row.raw_tx.len()),
+            lifecycle_status,
+            lifecycle_reason,
+            lifecycle_updated_unix_ms: lifecycle.map(|row| row.updated_unix_ms),
+            protocol: feature.map(|row| row.protocol.clone()),
+            category: feature.map(|row| row.category.clone()),
+            mev_score: feature.map(|row| row.mev_score),
+            urgency_score: feature.map(|row| row.urgency_score),
+            feature_engine_version: feature.map(|row| row.feature_engine_version.clone()),
         })
     }
 
     fn metric_snapshot(&self) -> MetricSnapshot {
-        let (tx_seen_len, tx_full_len) = self
-            .storage
-            .read()
-            .ok()
-            .map(|storage| {
-                (
-                    storage.tx_seen().len() as u64,
-                    storage.tx_full().len() as u64,
-                )
-            })
-            .unwrap_or((0, 0));
+        let storage = self.storage.read();
+        let tx_seen_len = storage.tx_seen().len() as u64;
+        let tx_full_len = storage.tx_full().len() as u64;
         let queue_depth_capacity = 10_000_u64;
 
         MetricSnapshot {
@@ -1330,18 +1267,6 @@ pub fn app_state_from_runtime_bootstrap(
     )
 }
 
-pub fn app_state_from_runtime_core(
-    runtime_core: &RuntimeCoreHandle,
-    runtime_views: RuntimeCoreViewProviders,
-) -> AppState {
-    let cache = ReplayRuntimeMetricsCache::new(runtime_core.storage().clone());
-    build_app_state(
-        runtime_core.storage().clone(),
-        runtime_views,
-        replay_runtime_metrics_provider(cache),
-    )
-}
-
 fn build_app_state(
     storage: Arc<RwLock<InMemoryStorage>>,
     runtime_views: RuntimeCoreViewProviders,
@@ -1409,9 +1334,7 @@ fn start_runtime_core_for_bootstrap(bootstrap: &RuntimeBootstrap) -> RuntimeCore
 fn build_replay_runtime_metrics(
     storage: &Arc<RwLock<InMemoryStorage>>,
 ) -> ReplayRuntimeMetricsSnapshot {
-    let Ok(storage) = storage.read() else {
-        return ReplayRuntimeMetricsSnapshot::default();
-    };
+    let storage = storage.read();
 
     let latest_seq_id = storage.latest_seq_id().unwrap_or(0);
     let checkpoint_seq_id = storage
@@ -1467,24 +1390,19 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
     let writer = spawn_single_writer(storage.clone(), sink, StorageWriterConfig::default());
     let rehydration_plan = storage
         .read()
-        .ok()
-        .map(|guard| guard.scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms))
-        .unwrap_or_default();
+        .scheduler_rehydration_plan(rehydration.snapshot_max_finality_age_ms);
     let mut rebuild_scheduler_from_rpc = rehydration_plan.requires_rpc_rebuild;
     let replay_events = rehydration_plan.replay_events;
     let sanitized_snapshot = rehydration_plan
         .snapshot
         .map(|snapshot| sanitize_scheduler_snapshot_for_rehydration(snapshot, &replay_events));
-    let replay_transactions = storage
-        .read()
-        .ok()
-        .map(|guard| {
-            replay_events
-                .iter()
-                .filter_map(|event| validated_transaction_from_event(event, &guard))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let replay_transactions = {
+        let guard = storage.read();
+        replay_events
+            .iter()
+            .filter_map(|event| validated_transaction_from_event(event, &guard))
+            .collect::<Vec<_>>()
+    };
     let scheduler_config = resolve_scheduler_config();
     let scheduler = match spawn_scheduler_with_rehydration(
         scheduler_config,
@@ -1516,9 +1434,9 @@ fn runtime_bootstrap_from_storage_and_rehydration_impl(
         live_rpc_config,
         rebuild_scheduler_from_rpc,
         scheduler_snapshot_interval_ms: rehydration.snapshot_interval_ms,
-        scheduler_snapshot_writer_abort: Arc::new(Mutex::new(None)),
+        scheduler_snapshot_writer_abort: Arc::new(OnceLock::new()),
         replay_runtime_metrics_cache,
-        replay_runtime_metrics_abort: Arc::new(Mutex::new(None)),
+        replay_runtime_metrics_abort: Arc::new(OnceLock::new()),
         ingest_mode,
     }
 }
@@ -1542,11 +1460,7 @@ pub fn spawn_scheduler_snapshot_writer(
             ticker.tick().await;
             match writer.try_reserve() {
                 Ok(permit) => {
-                    let event_seq_hi = storage
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.latest_seq_id())
-                        .unwrap_or(0);
+                    let event_seq_hi = storage.read().latest_seq_id().unwrap_or(0);
                     let mut snapshot =
                         scheduler.persisted_snapshot(current_unix_ms(), runtime_core.mono_ns());
                     snapshot.event_seq_hi = event_seq_hi;
@@ -1569,26 +1483,22 @@ pub fn spawn_scheduler_snapshot_writer(
 }
 
 fn start_scheduler_snapshot_writer_once(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
     interval_ms: u64,
     runtime_core: RuntimeCoreHandle,
 ) {
-    let mut guard = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if guard.is_some() {
+    if abort_slot.get().is_some() {
         return;
     }
 
     let task = spawn_scheduler_snapshot_writer(runtime_core, interval_ms);
-    *guard = Some(task.abort_handle());
+    if abort_slot.set(task.abort_handle()).is_err() {
+        task.abort();
+    }
 }
 
-fn abort_scheduler_snapshot_writer(abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>) {
-    let handle = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
+fn abort_scheduler_snapshot_writer(abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>) {
+    let handle = abort_slot.get();
     if let Some(handle) = handle {
         handle.abort();
     }
@@ -1610,28 +1520,22 @@ fn spawn_replay_runtime_metrics_refresher(
 }
 
 fn start_replay_runtime_metrics_refresher_once(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>,
     interval_ms: u64,
     cache: ReplayRuntimeMetricsCache,
 ) {
-    let mut guard = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if guard.is_some() {
+    if abort_slot.get().is_some() {
         return;
     }
 
     let task = spawn_replay_runtime_metrics_refresher(cache, interval_ms);
-    *guard = Some(task.abort_handle());
+    if abort_slot.set(task.abort_handle()).is_err() {
+        task.abort();
+    }
 }
 
-fn abort_replay_runtime_metrics_refresher(
-    abort_slot: &Arc<Mutex<Option<tokio::task::AbortHandle>>>,
-) {
-    let handle = abort_slot
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .take();
+fn abort_replay_runtime_metrics_refresher(abort_slot: &Arc<OnceLock<tokio::task::AbortHandle>>) {
+    let handle = abort_slot.get();
     if let Some(handle) = handle {
         handle.abort();
     }
@@ -2301,11 +2205,7 @@ async fn transaction_by_hash(
 }
 
 async fn relay_dry_run_status(State(state): State<AppState>) -> Json<RelayDryRunStatus> {
-    let status = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let status = state.relay_dry_run_status.read().clone();
     Json(status)
 }
 
@@ -2313,11 +2213,7 @@ async fn bundle_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<BundleDetail>, StatusCode> {
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let relay = state.relay_dry_run_status.read().clone();
     let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
     let bundle_id = bundle_id_for_result(&latest);
     if id != "latest" && id != bundle_id {
@@ -2353,11 +2249,7 @@ async fn sim_by_id(
         }));
     }
 
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let relay = state.relay_dry_run_status.read().clone();
     let latest = relay.latest.ok_or(StatusCode::NOT_FOUND)?;
 
     let bundle_id = bundle_id_for_result(&latest);
@@ -2390,449 +2282,250 @@ async fn sim_by_id(
 fn render_prometheus_metrics(state: &AppState) -> String {
     let snapshot = state.provider.metric_snapshot();
     let dashboard_cache_metrics = state.provider.dashboard_cache_metrics();
-    let relay = state
-        .relay_dry_run_status
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let drop_metrics = (state.live_rpc_drop_metrics_provider)();
+    let scheduler_metrics = (state.scheduler_metrics_provider)();
+    let builder_metrics = (state.builder_metrics_provider)();
+    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
+    let replay_metrics = (state.replay_runtime_metrics_provider)();
+    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
+    let relay = state.relay_dry_run_status.read().clone();
+
     let relay_success_rate = if relay.total_submissions == 0 {
         0.0
     } else {
         relay.total_accepted as f64 / relay.total_submissions as f64
     };
-
-    let mut out = String::new();
-    out.push_str("# TYPE mempulse_ingest_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_queue_depth {}\n",
-        snapshot.queue_depth_current
-    ));
-    out.push_str("# TYPE mempulse_ingest_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_queue_capacity {}\n",
-        snapshot.queue_depth_capacity
-    ));
-    out.push_str("# TYPE mempulse_ingest_decode_fail_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_decode_fail_total {}\n",
-        snapshot.tx_decode_fail_total
-    ));
-    out.push_str("# TYPE mempulse_ingest_decode_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_decode_total {}\n",
-        snapshot.tx_decode_total
-    ));
-    out.push_str("# TYPE mempulse_ingest_lag_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_lag_ms {}\n",
-        snapshot.ingest_lag_ms
-    ));
-    out.push_str("# TYPE mempulse_ingest_tx_per_sec_current gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_tx_per_sec_current {}\n",
-        snapshot.tx_per_sec_current
-    ));
-    out.push_str("# TYPE mempulse_ingest_tx_per_sec_baseline gauge\n");
-    out.push_str(&format!(
-        "mempulse_ingest_tx_per_sec_baseline {}\n",
-        snapshot.tx_per_sec_baseline
-    ));
-    out.push_str("# TYPE mempulse_ingest_drops_total counter\n");
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {}\n",
-        snapshot.tx_decode_fail_total
-    ));
-    let drop_metrics = (state.live_rpc_drop_metrics_provider)();
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {}\n",
-        drop_metrics.storage_queue_full
-    ));
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"storage_queue_closed\"}} {}\n",
-        drop_metrics.storage_queue_closed
-    ));
-    out.push_str(&format!(
-        "mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {}\n",
-        drop_metrics.invalid_pending_hash
-    ));
-    let scheduler_metrics = (state.scheduler_metrics_provider)();
-    out.push_str("# TYPE mempulse_scheduler_admitted_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_admitted_total {}\n",
-        scheduler_metrics.admitted_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_duplicate_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_duplicate_total {}\n",
-        scheduler_metrics.duplicate_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_replacement_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_replacement_total {}\n",
-        scheduler_metrics.replacement_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_underpriced_replacement_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_underpriced_replacement_total {}\n",
-        scheduler_metrics.underpriced_replacement_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_sender_limit_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_sender_limit_drop_total {}\n",
-        scheduler_metrics.sender_limit_drop_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_full_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_full_drop_total {}\n",
-        scheduler_metrics.queue_full_drop_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_pending_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_pending_total {}\n",
-        scheduler_metrics.pending_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_ready_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_ready_total {}\n",
-        scheduler_metrics.ready_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_blocked_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_blocked_total {}\n",
-        scheduler_metrics.blocked_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_sender_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_sender_total {}\n",
-        scheduler_metrics.sender_total
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_depth {}\n",
-        scheduler_metrics.queue_depth
-    ));
-    out.push_str("# TYPE mempulse_scheduler_queue_depth_peak gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_queue_depth_peak {}\n",
-        scheduler_metrics.queue_depth_peak
-    ));
-    out.push_str("# TYPE mempulse_scheduler_handoff_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_scheduler_handoff_queue_capacity {}\n",
-        scheduler_metrics.handoff_queue_capacity
-    ));
-    let builder_metrics = (state.builder_metrics_provider)();
-    out.push_str("# TYPE mempulse_builder_inserted_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_inserted_total {}\n",
-        builder_metrics.inserted_total
-    ));
-    out.push_str("# TYPE mempulse_builder_replaced_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_replaced_total {}\n",
-        builder_metrics.replaced_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rejected_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rejected_total {}\n",
-        builder_metrics.rejected_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rejected_reason_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {}\n",
-        builder_metrics.rejected_simulation_not_approved_total
-    ));
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {}\n",
-        builder_metrics.rejected_objective_not_improved_total
-    ));
-    out.push_str(&format!(
-        "mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {}\n",
-        builder_metrics.rejected_gas_limit_total
-    ));
-    out.push_str("# TYPE mempulse_builder_rollback_total counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_rollback_total {}\n",
-        builder_metrics.rollback_total
-    ));
-    out.push_str("# TYPE mempulse_builder_active_candidate_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_active_candidate_total {}\n",
-        builder_metrics.active_candidate_total
-    ));
-    out.push_str("# TYPE mempulse_builder_total_priority_score gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_priority_score {}\n",
-        builder_metrics.total_priority_score
-    ));
-    out.push_str("# TYPE mempulse_builder_total_gas_used gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_gas_used {}\n",
-        builder_metrics.total_gas_used
-    ));
-    out.push_str("# TYPE mempulse_builder_last_decision_latency_ns gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_last_decision_latency_ns {}\n",
-        builder_metrics.last_decision_latency_ns
-    ));
-    out.push_str("# TYPE mempulse_builder_max_decision_latency_ns gauge\n");
-    out.push_str(&format!(
-        "mempulse_builder_max_decision_latency_ns {}\n",
-        builder_metrics.max_decision_latency_ns
-    ));
-    out.push_str("# TYPE mempulse_builder_total_decision_latency_ns counter\n");
-    out.push_str(&format!(
-        "mempulse_builder_total_decision_latency_ns {}\n",
-        builder_metrics.total_decision_latency_ns
-    ));
-    let searcher_metrics = (state.live_rpc_searcher_metrics_provider)();
-    out.push_str("# TYPE mempulse_searcher_executable_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_batches_total {}\n",
-        searcher_metrics.executable_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_candidates_total {}\n",
-        searcher_metrics.executable_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_bundle_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_bundle_candidates_total {}\n",
-        searcher_metrics.executable_bundle_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge\n");
-    out.push_str(&format!(
-        "mempulse_searcher_max_executable_candidates_in_batch {}\n",
-        searcher_metrics.max_executable_candidates_in_batch
-    ));
-    // Compatibility-only legacy series retained for existing dashboards after the legacy shadow
-    // path was retired. They stay at zero in the current runtime path.
-    out.push_str("# TYPE mempulse_searcher_legacy_shadow_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_shadow_batches_total {}\n",
-        searcher_metrics.legacy_shadow_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_shadow_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_shadow_candidates_total {}\n",
-        searcher_metrics.legacy_shadow_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_max_legacy_shadow_candidates_in_batch gauge\n");
-    out.push_str(&format!(
-        "mempulse_searcher_max_legacy_shadow_candidates_in_batch {}\n",
-        searcher_metrics.max_legacy_shadow_candidates_in_batch
-    ));
-    out.push_str("# TYPE mempulse_searcher_comparison_batches_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_comparison_batches_total {}\n",
-        searcher_metrics.comparison_batches_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_top_score_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_top_score_total {}\n",
-        searcher_metrics.executable_top_score_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_top_score_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_top_score_total {}\n",
-        searcher_metrics.legacy_top_score_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_top_score_wins_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_top_score_wins_total {}\n",
-        searcher_metrics.executable_top_score_wins_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_top_score_wins_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_top_score_wins_total {}\n",
-        searcher_metrics.legacy_top_score_wins_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_top_score_ties_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_top_score_ties_total {}\n",
-        searcher_metrics.top_score_ties_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_overlapping_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_overlapping_candidates_total {}\n",
-        searcher_metrics.overlapping_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_executable_only_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_executable_only_candidates_total {}\n",
-        searcher_metrics.executable_only_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_searcher_legacy_only_candidates_total counter\n");
-    out.push_str(&format!(
-        "mempulse_searcher_legacy_only_candidates_total {}\n",
-        searcher_metrics.legacy_only_candidates_total
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_refresh_total counter\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_refresh_total {}\n",
-        dashboard_cache_metrics.refresh_total
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_last_build_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_last_build_ms {:.3}\n",
-        dashboard_cache_metrics.last_build_duration_ns as f64 / 1_000_000.0
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_avg_build_ms gauge\n");
-    let avg_build_duration_ns = if dashboard_cache_metrics.refresh_total == 0 {
+    let avg_build_ms = if dashboard_cache_metrics.refresh_total == 0 {
         0.0
     } else {
         dashboard_cache_metrics.total_build_duration_ns as f64
             / dashboard_cache_metrics.refresh_total as f64
+            / 1_000_000.0
     };
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_avg_build_ms {:.3}\n",
-        avg_build_duration_ns / 1_000_000.0
-    ));
-    out.push_str("# TYPE mempulse_dashboard_cache_estimated_bytes gauge\n");
-    out.push_str(&format!(
-        "mempulse_dashboard_cache_estimated_bytes {}\n",
-        dashboard_cache_metrics.estimated_bytes
-    ));
 
-    let replay_metrics = (state.replay_runtime_metrics_provider)();
-    out.push_str("# TYPE mempulse_replay_lag_events gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_lag_events {}\n",
-        replay_metrics.lag_events
-    ));
-    out.push_str("# TYPE mempulse_replay_checkpoint_duration_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_checkpoint_duration_ms {}\n",
-        replay_metrics.checkpoint_duration_ms
-    ));
-    out.push_str("# TYPE mempulse_replay_tail_reorged_tx_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_tail_reorged_tx_total {}\n",
-        replay_metrics.reorg_depth
-    ));
-    // Deprecated alias kept for compatibility; this counts replay-tail TxReorged events, not
-    // reorganized block depth.
-    out.push_str("# TYPE mempulse_replay_reorg_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_replay_reorg_depth {}\n",
-        replay_metrics.reorg_depth
-    ));
-
-    let sim_metrics = (state.live_rpc_simulation_metrics_provider)();
-    out.push_str("# TYPE mempulse_sim_enqueued_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_enqueued_total {}\n",
-        sim_metrics.enqueued_total
-    ));
-    out.push_str("# TYPE mempulse_sim_queue_depth gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_queue_depth {}\n",
-        sim_metrics.queue_depth
-    ));
-    out.push_str("# TYPE mempulse_sim_queue_capacity gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_queue_capacity {}\n",
-        sim_metrics.queue_capacity
-    ));
-    out.push_str("# TYPE mempulse_sim_inflight_current gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_inflight_current {}\n",
-        sim_metrics.inflight_current
-    ));
-    out.push_str("# TYPE mempulse_sim_worker_total gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_worker_total {}\n",
-        sim_metrics.worker_total
-    ));
-    out.push_str("# TYPE mempulse_sim_latency_ms gauge\n");
-    out.push_str(&format!(
-        "mempulse_sim_latency_ms {}\n",
-        sim_metrics.last_latency_ms
-    ));
-    out.push_str("# TYPE mempulse_sim_completed_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"ok\"}} {}\n",
-        sim_metrics.ok_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"failed\"}} {}\n",
-        sim_metrics.failed_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"state_error\"}} {}\n",
-        sim_metrics.state_error_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_completed_total{{status=\"timeout\"}} {}\n",
-        sim_metrics.timeout_total
-    ));
-    out.push_str("# TYPE mempulse_sim_cache_hits_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_cache_hits_total {}\n",
-        sim_metrics.cache_hit_total
-    ));
-    out.push_str("# TYPE mempulse_sim_cache_misses_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_cache_misses_total {}\n",
-        sim_metrics.cache_miss_total
-    ));
-    out.push_str("# TYPE mempulse_sim_tx_total counter\n");
-    out.push_str(&format!("mempulse_sim_tx_total {}\n", sim_metrics.tx_total));
-    out.push_str("# TYPE mempulse_sim_fail_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"revert\"}} {}\n",
-        sim_metrics.revert_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"out_of_gas\"}} {}\n",
-        sim_metrics.out_of_gas_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {}\n",
-        sim_metrics.nonce_mismatch_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_mismatch\"}} {}\n",
-        sim_metrics.state_mismatch_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_rpc\"}} {}\n",
-        sim_metrics.state_rpc_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"state_timeout\"}} {}\n",
-        sim_metrics.state_timeout_fail_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_fail_total{{category=\"unknown\"}} {}\n",
-        sim_metrics.unknown_fail_total
-    ));
-    out.push_str("# TYPE mempulse_sim_drop_total counter\n");
-    out.push_str(&format!(
-        "mempulse_sim_drop_total{{reason=\"queue_full\"}} {}\n",
-        sim_metrics.queue_full_drop_total
-    ));
-    out.push_str(&format!(
-        "mempulse_sim_drop_total{{reason=\"stale\"}} {}\n",
-        sim_metrics.stale_drop_total
-    ));
-
-    out.push_str("# TYPE mempulse_relay_success_rate gauge\n");
-    out.push_str(&format!(
-        "mempulse_relay_success_rate {relay_success_rate:.6}\n"
-    ));
-    out.push_str("# TYPE mempulse_relay_bundle_included_total counter\n");
-    out.push_str(&format!(
-        "mempulse_relay_bundle_included_total {}\n",
-        relay.total_accepted
-    ));
-    out.push_str("# TYPE mempulse_relay_bundle_filtered_total counter\n");
-    out.push_str(&format!(
-        "mempulse_relay_bundle_filtered_total{{reason=\"dry_run_failed\"}} {}\n",
-        relay.total_failed
-    ));
-    out
+    format!(
+        "\
+# TYPE mempulse_ingest_queue_depth gauge
+mempulse_ingest_queue_depth {ingest_queue_depth}
+# TYPE mempulse_ingest_queue_capacity gauge
+mempulse_ingest_queue_capacity {ingest_queue_capacity}
+# TYPE mempulse_ingest_decode_fail_total counter
+mempulse_ingest_decode_fail_total {ingest_decode_fail}
+# TYPE mempulse_ingest_decode_total counter
+mempulse_ingest_decode_total {ingest_decode_total}
+# TYPE mempulse_ingest_lag_ms gauge
+mempulse_ingest_lag_ms {ingest_lag_ms}
+# TYPE mempulse_ingest_tx_per_sec_current gauge
+mempulse_ingest_tx_per_sec_current {ingest_tps_current}
+# TYPE mempulse_ingest_tx_per_sec_baseline gauge
+mempulse_ingest_tx_per_sec_baseline {ingest_tps_baseline}
+# TYPE mempulse_ingest_drops_total counter
+mempulse_ingest_drops_total{{reason=\"decode_fail\"}} {ingest_decode_fail}
+mempulse_ingest_drops_total{{reason=\"storage_queue_full\"}} {drop_storage_full}
+mempulse_ingest_drops_total{{reason=\"storage_queue_closed\"}} {drop_storage_closed}
+mempulse_ingest_drops_total{{reason=\"invalid_pending_hash\"}} {drop_invalid_hash}
+# TYPE mempulse_scheduler_admitted_total counter
+mempulse_scheduler_admitted_total {sched_admitted}
+# TYPE mempulse_scheduler_duplicate_total counter
+mempulse_scheduler_duplicate_total {sched_duplicate}
+# TYPE mempulse_scheduler_replacement_total counter
+mempulse_scheduler_replacement_total {sched_replacement}
+# TYPE mempulse_scheduler_underpriced_replacement_total counter
+mempulse_scheduler_underpriced_replacement_total {sched_underpriced}
+# TYPE mempulse_scheduler_sender_limit_drop_total counter
+mempulse_scheduler_sender_limit_drop_total {sched_sender_limit_drop}
+# TYPE mempulse_scheduler_queue_full_drop_total counter
+mempulse_scheduler_queue_full_drop_total {sched_queue_full_drop}
+# TYPE mempulse_scheduler_pending_total gauge
+mempulse_scheduler_pending_total {sched_pending}
+# TYPE mempulse_scheduler_ready_total gauge
+mempulse_scheduler_ready_total {sched_ready}
+# TYPE mempulse_scheduler_blocked_total gauge
+mempulse_scheduler_blocked_total {sched_blocked}
+# TYPE mempulse_scheduler_sender_total gauge
+mempulse_scheduler_sender_total {sched_sender}
+# TYPE mempulse_scheduler_queue_depth gauge
+mempulse_scheduler_queue_depth {sched_queue_depth}
+# TYPE mempulse_scheduler_queue_depth_peak gauge
+mempulse_scheduler_queue_depth_peak {sched_queue_depth_peak}
+# TYPE mempulse_scheduler_handoff_queue_capacity gauge
+mempulse_scheduler_handoff_queue_capacity {sched_handoff_capacity}
+# TYPE mempulse_builder_inserted_total counter
+mempulse_builder_inserted_total {builder_inserted}
+# TYPE mempulse_builder_replaced_total counter
+mempulse_builder_replaced_total {builder_replaced}
+# TYPE mempulse_builder_rejected_total counter
+mempulse_builder_rejected_total {builder_rejected}
+# TYPE mempulse_builder_rejected_reason_total counter
+mempulse_builder_rejected_reason_total{{reason=\"simulation_not_approved\"}} {builder_rej_sim}
+mempulse_builder_rejected_reason_total{{reason=\"objective_not_improved\"}} {builder_rej_obj}
+mempulse_builder_rejected_reason_total{{reason=\"block_gas_limit_exceeded\"}} {builder_rej_gas}
+# TYPE mempulse_builder_rollback_total counter
+mempulse_builder_rollback_total {builder_rollback}
+# TYPE mempulse_builder_active_candidate_total gauge
+mempulse_builder_active_candidate_total {builder_active_candidates}
+# TYPE mempulse_builder_total_priority_score gauge
+mempulse_builder_total_priority_score {builder_priority_score}
+# TYPE mempulse_builder_total_gas_used gauge
+mempulse_builder_total_gas_used {builder_gas_used}
+# TYPE mempulse_builder_last_decision_latency_ns gauge
+mempulse_builder_last_decision_latency_ns {builder_last_latency_ns}
+# TYPE mempulse_builder_max_decision_latency_ns gauge
+mempulse_builder_max_decision_latency_ns {builder_max_latency_ns}
+# TYPE mempulse_builder_total_decision_latency_ns counter
+mempulse_builder_total_decision_latency_ns {builder_total_latency_ns}
+# TYPE mempulse_searcher_executable_batches_total counter
+mempulse_searcher_executable_batches_total {srch_exec_batches}
+# TYPE mempulse_searcher_executable_candidates_total counter
+mempulse_searcher_executable_candidates_total {srch_exec_candidates}
+# TYPE mempulse_searcher_executable_bundle_candidates_total counter
+mempulse_searcher_executable_bundle_candidates_total {srch_exec_bundle_candidates}
+# TYPE mempulse_searcher_max_executable_candidates_in_batch gauge
+mempulse_searcher_max_executable_candidates_in_batch {srch_max_exec_in_batch}
+# TYPE mempulse_searcher_comparison_batches_total counter
+mempulse_searcher_comparison_batches_total {srch_cmp_batches}
+# TYPE mempulse_searcher_executable_top_score_total counter
+mempulse_searcher_executable_top_score_total {srch_exec_top_score}
+# TYPE mempulse_searcher_executable_top_score_wins_total counter
+mempulse_searcher_executable_top_score_wins_total {srch_exec_top_score_wins}
+# TYPE mempulse_searcher_top_score_ties_total counter
+mempulse_searcher_top_score_ties_total {srch_top_score_ties}
+# TYPE mempulse_searcher_overlapping_candidates_total counter
+mempulse_searcher_overlapping_candidates_total {srch_overlapping}
+# TYPE mempulse_searcher_executable_only_candidates_total counter
+mempulse_searcher_executable_only_candidates_total {srch_exec_only}
+# TYPE mempulse_dashboard_cache_refresh_total counter
+mempulse_dashboard_cache_refresh_total {cache_refresh_total}
+# TYPE mempulse_dashboard_cache_last_build_ms gauge
+mempulse_dashboard_cache_last_build_ms {cache_last_build_ms:.3}
+# TYPE mempulse_dashboard_cache_avg_build_ms gauge
+mempulse_dashboard_cache_avg_build_ms {avg_build_ms:.3}
+# TYPE mempulse_dashboard_cache_estimated_bytes gauge
+mempulse_dashboard_cache_estimated_bytes {cache_estimated_bytes}
+# TYPE mempulse_replay_lag_events gauge
+mempulse_replay_lag_events {replay_lag_events}
+# TYPE mempulse_replay_checkpoint_duration_ms gauge
+mempulse_replay_checkpoint_duration_ms {replay_checkpoint_ms}
+# TYPE mempulse_replay_tail_reorged_tx_total gauge
+mempulse_replay_tail_reorged_tx_total {replay_reorg_depth}
+# TYPE mempulse_sim_enqueued_total counter
+mempulse_sim_enqueued_total {sim_enqueued}
+# TYPE mempulse_sim_queue_depth gauge
+mempulse_sim_queue_depth {sim_queue_depth}
+# TYPE mempulse_sim_queue_capacity gauge
+mempulse_sim_queue_capacity {sim_queue_capacity}
+# TYPE mempulse_sim_inflight_current gauge
+mempulse_sim_inflight_current {sim_inflight}
+# TYPE mempulse_sim_worker_total gauge
+mempulse_sim_worker_total {sim_workers}
+# TYPE mempulse_sim_latency_ms gauge
+mempulse_sim_latency_ms {sim_latency_ms}
+# TYPE mempulse_sim_completed_total counter
+mempulse_sim_completed_total{{status=\"ok\"}} {sim_ok}
+mempulse_sim_completed_total{{status=\"failed\"}} {sim_failed}
+mempulse_sim_completed_total{{status=\"state_error\"}} {sim_state_error}
+mempulse_sim_completed_total{{status=\"timeout\"}} {sim_timeout}
+# TYPE mempulse_sim_cache_hits_total counter
+mempulse_sim_cache_hits_total {sim_cache_hit}
+# TYPE mempulse_sim_cache_misses_total counter
+mempulse_sim_cache_misses_total {sim_cache_miss}
+# TYPE mempulse_sim_tx_total counter
+mempulse_sim_tx_total {sim_tx_total}
+# TYPE mempulse_sim_fail_total counter
+mempulse_sim_fail_total{{category=\"revert\"}} {sim_fail_revert}
+mempulse_sim_fail_total{{category=\"out_of_gas\"}} {sim_fail_oog}
+mempulse_sim_fail_total{{category=\"nonce_mismatch\"}} {sim_fail_nonce}
+mempulse_sim_fail_total{{category=\"state_mismatch\"}} {sim_fail_state_mismatch}
+mempulse_sim_fail_total{{category=\"state_rpc\"}} {sim_fail_state_rpc}
+mempulse_sim_fail_total{{category=\"state_timeout\"}} {sim_fail_state_timeout}
+mempulse_sim_fail_total{{category=\"unknown\"}} {sim_fail_unknown}
+# TYPE mempulse_sim_drop_total counter
+mempulse_sim_drop_total{{reason=\"queue_full\"}} {sim_drop_queue_full}
+mempulse_sim_drop_total{{reason=\"stale\"}} {sim_drop_stale}
+# TYPE mempulse_relay_success_rate gauge
+mempulse_relay_success_rate {relay_success_rate:.6}
+# TYPE mempulse_relay_bundle_included_total counter
+mempulse_relay_bundle_included_total {relay_accepted}
+# TYPE mempulse_relay_bundle_filtered_total counter
+mempulse_relay_bundle_filtered_total{{reason=\"dry_run_failed\"}} {relay_failed}
+",
+        ingest_queue_depth = snapshot.queue_depth_current,
+        ingest_queue_capacity = snapshot.queue_depth_capacity,
+        ingest_decode_fail = snapshot.tx_decode_fail_total,
+        ingest_decode_total = snapshot.tx_decode_total,
+        ingest_lag_ms = snapshot.ingest_lag_ms,
+        ingest_tps_current = snapshot.tx_per_sec_current,
+        ingest_tps_baseline = snapshot.tx_per_sec_baseline,
+        drop_storage_full = drop_metrics.storage_queue_full,
+        drop_storage_closed = drop_metrics.storage_queue_closed,
+        drop_invalid_hash = drop_metrics.invalid_pending_hash,
+        sched_admitted = scheduler_metrics.admitted_total,
+        sched_duplicate = scheduler_metrics.duplicate_total,
+        sched_replacement = scheduler_metrics.replacement_total,
+        sched_underpriced = scheduler_metrics.underpriced_replacement_total,
+        sched_sender_limit_drop = scheduler_metrics.sender_limit_drop_total,
+        sched_queue_full_drop = scheduler_metrics.queue_full_drop_total,
+        sched_pending = scheduler_metrics.pending_total,
+        sched_ready = scheduler_metrics.ready_total,
+        sched_blocked = scheduler_metrics.blocked_total,
+        sched_sender = scheduler_metrics.sender_total,
+        sched_queue_depth = scheduler_metrics.queue_depth,
+        sched_queue_depth_peak = scheduler_metrics.queue_depth_peak,
+        sched_handoff_capacity = scheduler_metrics.handoff_queue_capacity,
+        builder_inserted = builder_metrics.inserted_total,
+        builder_replaced = builder_metrics.replaced_total,
+        builder_rejected = builder_metrics.rejected_total,
+        builder_rej_sim = builder_metrics.rejected_simulation_not_approved_total,
+        builder_rej_obj = builder_metrics.rejected_objective_not_improved_total,
+        builder_rej_gas = builder_metrics.rejected_gas_limit_total,
+        builder_rollback = builder_metrics.rollback_total,
+        builder_active_candidates = builder_metrics.active_candidate_total,
+        builder_priority_score = builder_metrics.total_priority_score,
+        builder_gas_used = builder_metrics.total_gas_used,
+        builder_last_latency_ns = builder_metrics.last_decision_latency_ns,
+        builder_max_latency_ns = builder_metrics.max_decision_latency_ns,
+        builder_total_latency_ns = builder_metrics.total_decision_latency_ns,
+        srch_exec_batches = searcher_metrics.executable_batches_total,
+        srch_exec_candidates = searcher_metrics.executable_candidates_total,
+        srch_exec_bundle_candidates = searcher_metrics.executable_bundle_candidates_total,
+        srch_max_exec_in_batch = searcher_metrics.max_executable_candidates_in_batch,
+        srch_cmp_batches = searcher_metrics.comparison_batches_total,
+        srch_exec_top_score = searcher_metrics.executable_top_score_total,
+        srch_exec_top_score_wins = searcher_metrics.executable_top_score_wins_total,
+        srch_top_score_ties = searcher_metrics.top_score_ties_total,
+        srch_overlapping = searcher_metrics.overlapping_candidates_total,
+        srch_exec_only = searcher_metrics.executable_only_candidates_total,
+        cache_refresh_total = dashboard_cache_metrics.refresh_total,
+        cache_last_build_ms = dashboard_cache_metrics.last_build_duration_ns as f64 / 1_000_000.0,
+        cache_estimated_bytes = dashboard_cache_metrics.estimated_bytes,
+        replay_lag_events = replay_metrics.lag_events,
+        replay_checkpoint_ms = replay_metrics.checkpoint_duration_ms,
+        replay_reorg_depth = replay_metrics.reorg_depth,
+        sim_enqueued = sim_metrics.enqueued_total,
+        sim_queue_depth = sim_metrics.queue_depth,
+        sim_queue_capacity = sim_metrics.queue_capacity,
+        sim_inflight = sim_metrics.inflight_current,
+        sim_workers = sim_metrics.worker_total,
+        sim_latency_ms = sim_metrics.last_latency_ms,
+        sim_ok = sim_metrics.ok_total,
+        sim_failed = sim_metrics.failed_total,
+        sim_state_error = sim_metrics.state_error_total,
+        sim_timeout = sim_metrics.timeout_total,
+        sim_cache_hit = sim_metrics.cache_hit_total,
+        sim_cache_miss = sim_metrics.cache_miss_total,
+        sim_tx_total = sim_metrics.tx_total,
+        sim_fail_revert = sim_metrics.revert_fail_total,
+        sim_fail_oog = sim_metrics.out_of_gas_fail_total,
+        sim_fail_nonce = sim_metrics.nonce_mismatch_fail_total,
+        sim_fail_state_mismatch = sim_metrics.state_mismatch_fail_total,
+        sim_fail_state_rpc = sim_metrics.state_rpc_fail_total,
+        sim_fail_state_timeout = sim_metrics.state_timeout_fail_total,
+        sim_fail_unknown = sim_metrics.unknown_fail_total,
+        sim_drop_queue_full = sim_metrics.queue_full_drop_total,
+        sim_drop_stale = sim_metrics.stale_drop_total,
+        relay_accepted = relay.total_accepted,
+        relay_failed = relay.total_failed,
+    )
 }
 
 fn collect_events_up_to_seq(provider: &dyn VizDataProvider, to_seq_id: u64) -> Vec<EventEnvelope> {
@@ -2890,22 +2583,9 @@ fn sim_id_for_result(result: &RelayDryRunResult) -> String {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[allow(dead_code)]
 struct StreamQuery {
     after: Option<u64>,
-    limit: Option<usize>,
     interval_ms: Option<u64>,
-    initial_credit: Option<u32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[allow(dead_code)]
-struct StreamV2ClientMessage {
-    op: String,
-    amount: Option<u32>,
-    channel_credit: Option<HashMap<String, u32>>,
-    snapshot_seq: Option<u64>,
-    last_seq: Option<u64>,
 }
 
 const DASHBOARD_STREAM_BROADCAST_REPLAY_CAPACITY: usize = 256;
@@ -2955,37 +2635,6 @@ fn spawn_dashboard_stream_broadcaster_producer(
             after_seq_id = after_seq_id.max(latest_seq_id);
         }
     });
-}
-
-#[allow(dead_code)]
-async fn stream_v2(
-    State(state): State<AppState>,
-    Query(query): Query<StreamQuery>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    let after_seq_id = query.after.unwrap_or(0);
-    let batch_limit = query.limit.unwrap_or(20).clamp(1, 200);
-    let interval_ms = query.interval_ms.unwrap_or(1_000).clamp(50, 5_000);
-    let initial_credit = query.initial_credit.unwrap_or(0).min(256);
-    let provider = state.provider.clone();
-
-    let hello = StreamV2Hello {
-        op: "HELLO".to_owned(),
-        heartbeat_interval_ms: 15_000,
-        session_id: format!("sess_{}", now_unix_ms()),
-        server_time_unix_ms: now_unix_ms(),
-    };
-    ws.on_upgrade(move |socket| {
-        handle_socket_v2(
-            socket,
-            hello,
-            provider,
-            after_seq_id,
-            batch_limit,
-            interval_ms,
-            initial_credit,
-        )
-    })
 }
 
 async fn events_v1(
@@ -3138,14 +2787,6 @@ fn dashboard_events_v1_frame_to_event(frame: DashboardEventsV1Frame) -> SseEvent
         .id(frame.id)
         .event(frame.event)
         .data(frame.data)
-}
-
-#[allow(dead_code)]
-fn now_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn transaction_summary_from_event(event: &EventEnvelope) -> Option<TransactionSummary> {
@@ -3338,175 +2979,6 @@ fn build_dashboard_events_v1_dispatch(
         },
         market_stats: provider.market_stats(),
     })
-}
-
-#[allow(dead_code)]
-fn resolve_stream_v2_credit(message: &StreamV2ClientMessage) -> u32 {
-    if let Some(amount) = message.amount {
-        return amount.clamp(1, 256);
-    }
-    if let Some(channel_credit) = message.channel_credit.as_ref() {
-        if let Some(amount) = channel_credit.get("tx.main") {
-            return (*amount).clamp(1, 256);
-        }
-    }
-    1
-}
-
-#[allow(dead_code)]
-async fn handle_socket_v2(
-    mut socket: WebSocket,
-    hello: StreamV2Hello,
-    provider: Arc<dyn VizDataProvider>,
-    mut after_seq_id: u64,
-    batch_limit: usize,
-    interval_ms: u64,
-    initial_credit: u32,
-) {
-    if let Ok(payload) = serde_json::to_string(&hello)
-        && socket.send(Message::Text(payload.into())).await.is_err()
-    {
-        return;
-    }
-
-    let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut credits = initial_credit;
-    let page_limit = batch_limit.max(1);
-    let max_scan_events_per_tick = page_limit.saturating_mul(64).max(64);
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                if credits == 0 {
-                    continue;
-                }
-                let events = provider.events(after_seq_id, &[], max_scan_events_per_tick);
-                if events.is_empty() {
-                    continue;
-                }
-
-                let mut seq_start = 0_u64;
-                let mut seq_end = after_seq_id;
-                let mut has_gap = false;
-                let mut transactions = Vec::new();
-                let mut feature_upsert = Vec::new();
-                let mut opportunity_upsert = Vec::new();
-
-                for event in events {
-                    if event.seq_id <= after_seq_id {
-                        continue;
-                    }
-                    if seq_start == 0 {
-                        seq_start = event.seq_id;
-                        if after_seq_id > 0 && seq_start > after_seq_id.saturating_add(1) {
-                            has_gap = true;
-                        }
-                    }
-                    after_seq_id = event.seq_id;
-                    seq_end = event.seq_id;
-                    if let Some(summary) = transaction_summary_from_event(&event) {
-                        let hash = summary.hash.clone();
-                        let dropped = push_stream_summary_with_cap(
-                            &mut transactions,
-                            summary,
-                            page_limit,
-                        );
-                        has_gap = has_gap || dropped;
-                        if let Some(feature) = feature_detail_for_hash(provider.as_ref(), &hash) {
-                            let dropped = push_stream_feature_with_cap(
-                                &mut feature_upsert,
-                                feature,
-                                page_limit,
-                            );
-                            has_gap = has_gap || dropped;
-                        }
-                    }
-                    if let Some(opportunity) = opportunity_detail_from_event(provider.as_ref(), &event)
-                    {
-                        let dropped = push_stream_opportunity_with_cap(
-                            &mut opportunity_upsert,
-                            opportunity,
-                            page_limit,
-                        );
-                        has_gap = has_gap || dropped;
-                    }
-                }
-
-                if seq_start == 0
-                    || (transactions.is_empty()
-                        && feature_upsert.is_empty()
-                        && opportunity_upsert.is_empty())
-                {
-                    continue;
-                }
-
-                let payload = match serde_json::to_string(&StreamV2Dispatch {
-                    op: "DISPATCH".to_owned(),
-                    event_type: "DELTA_BATCH".to_owned(),
-                    seq: seq_end,
-                    channel: "tx.main".to_owned(),
-                    has_gap,
-                    patch: StreamV2Patch {
-                        upsert: transactions,
-                        remove: Vec::new(),
-                        feature_upsert,
-                        opportunity_upsert,
-                    },
-                    watermark: StreamV2Watermark {
-                        latest_ingest_seq: seq_end,
-                    },
-                    market_stats: provider.market_stats(),
-                }) {
-                    Ok(payload) => payload,
-                    Err(_) => continue,
-                };
-
-                if socket.send(Message::Text(payload.into())).await.is_err() {
-                    return;
-                }
-                credits = credits.saturating_sub(1);
-            }
-            maybe_message = socket.recv() => match maybe_message {
-                None => break,
-                Some(Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Text(text))) => {
-                    let Ok(message) = serde_json::from_str::<StreamV2ClientMessage>(&text) else {
-                        continue;
-                    };
-                    if message.op.eq_ignore_ascii_case("IDENTIFY") {
-                        if let Some(snapshot_seq) = message.snapshot_seq {
-                            after_seq_id = after_seq_id.max(snapshot_seq);
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("RESUME") {
-                        if let Some(last_seq) = message.last_seq {
-                            after_seq_id = after_seq_id.max(last_seq);
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("HEARTBEAT") {
-                        let ack = serde_json::json!({ "op": "HEARTBEAT_ACK" });
-                        if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    if message.op.eq_ignore_ascii_case("CREDIT") {
-                        credits = credits.saturating_add(resolve_stream_v2_credit(&message));
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    if socket.send(Message::Pong(data)).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(_)) => break,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4225,18 +3697,12 @@ mod tests {
                 executable_candidates_total: 22,
                 executable_bundle_candidates_total: 3,
                 max_executable_candidates_in_batch: 6,
-                legacy_shadow_batches_total: 10,
-                legacy_shadow_candidates_total: 20,
-                max_legacy_shadow_candidates_in_batch: 5,
                 comparison_batches_total: 9,
                 executable_top_score_total: 90_000,
-                legacy_top_score_total: 80_000,
                 executable_top_score_wins_total: 7,
-                legacy_top_score_wins_total: 1,
                 top_score_ties_total: 1,
                 overlapping_candidates_total: 12,
                 executable_only_candidates_total: 8,
-                legacy_only_candidates_total: 4,
             }),
             live_rpc_simulation_metrics_provider: Arc::new(
                 LiveRpcSimulationMetricsSnapshot::default,
@@ -4268,7 +3734,6 @@ mod tests {
         assert!(payload.contains("mempulse_searcher_max_executable_candidates_in_batch 6"));
         assert!(payload.contains("mempulse_searcher_comparison_batches_total 9"));
         assert!(payload.contains("mempulse_searcher_executable_top_score_wins_total 7"));
-        assert!(payload.contains("mempulse_searcher_legacy_only_candidates_total 4"));
     }
 
     #[tokio::test]
@@ -4783,7 +4248,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_snapshot_route_returns_scheduler_state() {
-        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, runtime) =
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x51, 7))
@@ -4823,7 +4289,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_metrics_route_returns_scheduler_metrics() {
-        let (scheduler, runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, runtime) =
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let runtime_task = tokio::spawn(runtime.run());
         scheduler
             .admit(sample_scheduler_tx(0x61, 9))
@@ -5027,7 +4494,8 @@ mod tests {
 
     #[tokio::test]
     async fn sim_route_reads_runtime_core_status_provider_when_injected() {
-        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, _runtime) =
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(8);
         let handle = RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -5137,11 +4605,32 @@ mod tests {
         bootstrap.abort_background_tasks();
     }
 
+    #[tokio::test]
+    async fn scheduler_snapshot_abort_slot_is_write_once_and_aborts_registered_task() {
+        let abort_slot = Arc::new(std::sync::OnceLock::new());
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let extra_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(abort_slot.set(task.abort_handle()).is_ok());
+        assert!(abort_slot.set(extra_task.abort_handle()).is_err());
+
+        abort_scheduler_snapshot_writer(&abort_slot);
+
+        let join_err = task.await.expect_err("registered task should be aborted");
+        assert!(join_err.is_cancelled());
+
+        extra_task.abort();
+    }
+
     #[test]
     fn in_memory_provider_recent_transactions_are_latest_first_and_deduped() {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.append_event(seed_decoded_event(1, 1, 1));
             guard.append_event(seed_decoded_event(2, 2, 2));
             // Same hash as seq 1, newer nonce should replace previous recent-tx record.
@@ -5157,10 +4646,22 @@ mod tests {
     }
 
     #[test]
+    fn viz_data_provider_auto_impl_supports_arc_wrappers() {
+        fn latest_seq_id_of<P: VizDataProvider>(provider: &P) -> Option<u64> {
+            provider.latest_seq_id()
+        }
+
+        let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
+        let provider = Arc::new(InMemoryVizProvider::new(storage, Arc::new(Vec::new()), 1));
+
+        assert_eq!(latest_seq_id_of(&provider), None);
+    }
+
+    #[test]
     fn in_memory_provider_feature_summary_is_aggregated_and_sorted() {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             for (seq, protocol, category) in [
                 (11_u64, "uniswap-v3", "swap"),
                 (22_u64, "aave-v3", "borrow"),
@@ -5248,7 +4749,7 @@ mod tests {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         let hash = hash_from_seq(99);
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.upsert_tx_seen(storage::TxSeenRecord {
                 hash,
                 peer: "rpc-ws".to_owned(),
@@ -5311,7 +4812,7 @@ mod tests {
         let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
         let hash = hash_from_seq(77);
         {
-            let mut guard = storage.write().expect("write lock");
+            let mut guard = storage.write();
             guard.append_event(EventEnvelope {
                 seq_id: 1,
                 ingest_ts_unix_ms: 1_700_000_000_000,

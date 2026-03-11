@@ -60,7 +60,8 @@ fn scheduler_handoff_queue_drops_new_transactions_when_full() {
         handoff_queue_capacity: 1,
         max_pending_per_sender: 64,
         replacement_fee_bump_bps: 1_000,
-    });
+    })
+    .expect("valid scheduler config");
 
     handle
         .try_admit(sample_validated_tx(
@@ -101,7 +102,8 @@ async fn scheduler_metrics_preserve_peak_queue_depth_after_runtime_drains_burst(
         handoff_queue_capacity: 4,
         max_pending_per_sender: 64,
         replacement_fee_bump_bps: 1_000,
-    });
+    })
+    .expect("valid scheduler config");
 
     handle
         .try_admit(sample_validated_tx(
@@ -163,7 +165,8 @@ async fn scheduler_handoff_queue_saturation_tracks_peak_and_drop_metrics() {
         handoff_queue_capacity: capacity,
         max_pending_per_sender: 64,
         replacement_fee_bump_bps: 1_000,
-    });
+    })
+    .expect("valid scheduler config");
     let barrier = std::sync::Arc::new(Barrier::new(producer_total));
     let mut tasks = Vec::new();
 
@@ -209,7 +212,8 @@ async fn scheduler_handoff_queue_saturation_tracks_peak_and_drop_metrics() {
 
 #[tokio::test]
 async fn scheduler_runtime_admits_unique_transactions_and_deduplicates_by_hash() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let tx = sample_validated_tx(9, sender(9), 17, 101, "rpc-mainnet", 1_700_000_123_456, 999);
@@ -263,7 +267,8 @@ async fn scheduler_runtime_admits_unique_transactions_and_deduplicates_by_hash()
 
 #[tokio::test]
 async fn scheduler_admit_reports_duplicate_result_to_callers() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let tx = sample_validated_tx(
@@ -290,7 +295,8 @@ async fn scheduler_admit_reports_duplicate_result_to_callers() {
 
 #[tokio::test]
 async fn scheduler_admit_reports_replaced_hash_to_callers() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender = sender(0xfa);
@@ -320,7 +326,8 @@ async fn scheduler_admit_reports_replaced_hash_to_callers() {
 
 #[tokio::test]
 async fn scheduler_marks_sender_nonce_gaps_as_blocked_until_gap_is_filled() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender_a = sender(0xa1);
@@ -363,7 +370,8 @@ async fn scheduler_marks_sender_nonce_gaps_as_blocked_until_gap_is_filled() {
 
 #[tokio::test]
 async fn scheduler_replaces_same_nonce_transaction_when_fee_bump_meets_policy() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender = sender(0xcd);
@@ -396,7 +404,8 @@ async fn scheduler_replaces_same_nonce_transaction_when_fee_bump_meets_policy() 
 
 #[tokio::test]
 async fn scheduler_rejects_underpriced_same_nonce_replacement_and_keeps_incumbent() {
-    let (handle, runtime) = scheduler_channel(SchedulerConfig::default());
+    let (handle, runtime) =
+        scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender = sender(0xee);
@@ -432,7 +441,8 @@ async fn scheduler_drops_new_nonce_when_sender_queue_capacity_is_exceeded() {
         handoff_queue_capacity: 64,
         max_pending_per_sender: 2,
         replacement_fee_bump_bps: 1_000,
-    });
+    })
+    .expect("valid scheduler config");
     let runtime_task = tokio::spawn(runtime.run());
 
     let sender = sender(0xfa);

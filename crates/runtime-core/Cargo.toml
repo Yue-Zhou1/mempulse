@@ -12,6 +12,7 @@ event-log = { path = "../event-log" }
 feature-engine = { path = "../feature-engine" }
 futures = { workspace = true }
 hashbrown = { workspace = true }
+parking_lot = { workspace = true }
 reqwest = { workspace = true }
 scheduler = { path = "../scheduler" }
 searcher = { path = "../searcher" }

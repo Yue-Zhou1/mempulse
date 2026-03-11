@@ -4,7 +4,7 @@ export const screenIds = Object.freeze([defaultScreenId, 'opps']);
 
 const SCREEN_ID_SET = new Set(screenIds);
 
-function normalizeToken(value) {
+export function normalizeToken(value) {
   return String(value ?? '').trim().toLowerCase();
 }
 

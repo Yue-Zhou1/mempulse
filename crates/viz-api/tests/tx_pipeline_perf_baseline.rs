@@ -3,11 +3,12 @@ use axum::http::{Request, StatusCode};
 use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::{AlertThresholdConfig, SourceId};
 use event_log::{EventEnvelope, EventPayload, TxDecoded, TxFetched, TxSeen};
+use parking_lot::RwLock;
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 use storage::{EventStore, InMemoryStorage, TxFeaturesRecord, TxFullRecord, TxSeenRecord};
 use tower::util::ServiceExt;
@@ -130,7 +131,7 @@ async fn tx_pipeline_perf_baseline_emits_metrics_artifact() {
 fn build_seeded_state(seeded_transactions: usize) -> (AppState, SeedSummary) {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
     let seed_summary = {
-        let mut guard = storage.write().expect("lock storage for perf seed");
+        let mut guard = storage.write();
         seed_storage(&mut guard, seeded_transactions)
     };
     let provider = Arc::new(InMemoryVizProvider::new(

@@ -2,8 +2,9 @@ use axum::{body::Body, http::Request, http::StatusCode};
 use builder::{AssemblyMetrics, AssemblySnapshot, RelayDryRunStatus};
 use common::AlertThresholdConfig;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
+use parking_lot::RwLock;
 use scheduler::{SchedulerMetrics, SchedulerSnapshot};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use storage::{
     EventStore, InMemoryStorage, OpportunityRecord, TxFeaturesRecord, TxFullRecord, TxSeenRecord,
 };
@@ -52,7 +53,7 @@ fn decoded_event(seq_id: u64, hash_seed: u8, chain_id: u64) -> EventEnvelope {
 
 fn seed_storage() -> Arc<RwLock<InMemoryStorage>> {
     let storage = Arc::new(RwLock::new(InMemoryStorage::default()));
-    let mut guard = storage.write().expect("lock storage");
+    let mut guard = storage.write();
 
     guard.append_event(decoded_event(1, 1, 1));
     guard.append_event(decoded_event(2, 2, 8453));

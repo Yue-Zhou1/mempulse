@@ -1,8 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use common::SourceId;
 use event_log::{EventEnvelope, EventPayload, TxDecoded};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::{
     ClickHouseBatchSink, EventStore, InMemoryStorage, StorageWal, StorageWriteOp,
@@ -52,24 +52,13 @@ struct RecordingSink {
 
 #[async_trait]
 impl ClickHouseBatchSink for RecordingSink {
-    async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()> {
-        self.flush_sizes
-            .write()
-            .expect("lock flush sizes")
-            .push(events.len());
+    async fn flush_event_batch(
+        &self,
+        events: Vec<EventEnvelope>,
+    ) -> std::result::Result<(), storage::StorageError> {
+        self.flush_sizes.write().push(events.len());
         Ok(())
     }
-}
-
-#[test]
-fn wal_flush_throughput_exposes_high_volume_tuning_presets() {
-    let writer = StorageWriterConfig::high_throughput_defaults();
-    assert!(writer.flush_batch_size > StorageWriterConfig::default().flush_batch_size);
-    assert!(writer.flush_interval_ms < StorageWriterConfig::default().flush_interval_ms);
-
-    let wal =
-        StorageWal::high_throughput(temp_wal_path("preset")).expect("create high throughput wal");
-    assert!(wal.segment_max_bytes() > 64 * 1024 * 1024);
 }
 
 #[tokio::test]
@@ -80,13 +69,15 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
         flush_sizes: flush_sizes.clone(),
     });
     let wal_path = temp_wal_path("high-rate");
-    let wal = StorageWal::high_throughput(&wal_path).expect("create throughput wal");
+    let wal =
+        StorageWal::with_segment_size(&wal_path, 256 * 1024 * 1024).expect("create throughput wal");
 
-    let mut writer_config = StorageWriterConfig::high_throughput_defaults();
-    writer_config.flush_batch_size = 64;
-    writer_config.flush_interval_ms = 20;
-    writer_config.queue_capacity = 2_048;
-    writer_config.wal_path = Some(wal_path.clone());
+    let writer_config = StorageWriterConfig {
+        queue_capacity: 2_048,
+        flush_batch_size: 64,
+        flush_interval_ms: 20,
+        wal_path: Some(wal_path.clone()),
+    };
     let handle = spawn_single_writer(storage.clone(), sink, writer_config);
 
     for seq in 1..=256_u64 {
@@ -101,12 +92,7 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let sizes = flush_sizes
-        .read()
-        .expect("lock flush sizes")
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    let sizes = flush_sizes.read().iter().copied().collect::<Vec<_>>();
     assert!(!sizes.is_empty());
     assert!(sizes.iter().copied().max().unwrap_or(0) >= 64);
 
@@ -116,7 +102,7 @@ async fn wal_flush_throughput_keeps_large_batches_and_clears_wal_under_high_rate
         "wal should be cleared after successful flush"
     );
 
-    let events = storage.read().expect("lock storage").list_events();
+    let events = storage.read().list_events();
     assert_eq!(events.len(), 256);
 
     let _ = std::fs::remove_file(wal_path);

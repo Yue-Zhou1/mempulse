@@ -1,6 +1,7 @@
 use common::{SourceId, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxSeen};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use storage::{BackfillConfig, BackfillSummary, BackfillWriter, EventStore, InMemoryStorage};
 
 fn hash(v: u8) -> TxHash {
@@ -45,7 +46,7 @@ fn backfill_is_idempotent_for_duplicate_event_windows() {
     assert_eq!(first.skipped_duplicates, 0);
     assert_eq!(second.inserted, 0);
     assert_eq!(second.skipped_duplicates, 3);
-    assert_eq!(storage.read().unwrap().list_events().len(), 3);
+    assert_eq!(storage.read().list_events().len(), 3);
 }
 
 #[test]
@@ -65,7 +66,7 @@ fn backfill_prunes_events_outside_retention_window() {
     ];
 
     let summary = writer.apply_events(&window, now);
-    let events = storage.read().unwrap().list_events();
+    let events = storage.read().list_events();
 
     assert_eq!(summary.inserted, 2);
     assert_eq!(summary.pruned_by_retention, 1);

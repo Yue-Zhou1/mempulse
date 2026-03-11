@@ -4,13 +4,14 @@ pub mod live_rpc;
 
 use anyhow::Result;
 use builder::{AssemblyEngine, AssemblyMetrics, AssemblySnapshot};
-use common::{Address, TxHash};
+use common::Address;
+use parking_lot::RwLock;
 use scheduler::{SchedulerHandle, SchedulerMetrics, SchedulerSnapshot};
 use serde::{Deserialize, Serialize};
 use sim_engine::AccountSeed;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use storage::{InMemoryStorage, OpportunityRecord, StorageWriteHandle};
 
@@ -61,19 +62,12 @@ pub struct LiveRpcSearcherMetricsSnapshot {
     pub executable_candidates_total: u64,
     pub executable_bundle_candidates_total: u64,
     pub max_executable_candidates_in_batch: u64,
-    // Compatibility fields retained for existing dashboards after the legacy shadow path removal.
-    pub legacy_shadow_batches_total: u64,
-    pub legacy_shadow_candidates_total: u64,
-    pub max_legacy_shadow_candidates_in_batch: u64,
     pub comparison_batches_total: u64,
     pub executable_top_score_total: u64,
-    pub legacy_top_score_total: u64,
     pub executable_top_score_wins_total: u64,
-    pub legacy_top_score_wins_total: u64,
     pub top_score_ties_total: u64,
     pub overlapping_candidates_total: u64,
     pub executable_only_candidates_total: u64,
-    pub legacy_only_candidates_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,13 +158,6 @@ struct RemoteStateCache {
     account_seeds: HashMap<(String, Address), CachedAccountSeed>,
 }
 
-#[derive(Default)]
-struct SimulationTaskStore {
-    task_generations: HashMap<String, u64>,
-    task_members: HashMap<String, Vec<TxHash>>,
-    tasks_by_member: HashMap<TxHash, HashSet<String>>,
-}
-
 pub struct RuntimeCore {
     deps: RuntimeCoreDeps,
     config: RuntimeCoreConfig,
@@ -180,7 +167,6 @@ pub struct RuntimeCore {
     simulation_metrics: Arc<RwLock<LiveRpcSimulationMetricsSnapshot>>,
     simulation_status: Arc<RwLock<SimulationStatusStore>>,
     chain_status: Arc<RwLock<BTreeMap<String, LiveRpcChainStatus>>>,
-    simulation_task_store: Arc<RwLock<SimulationTaskStore>>,
     simulation_cache: Arc<RwLock<RemoteStateCache>>,
     simulation_http_client: reqwest::Client,
     live_rpc_feed_start_count: AtomicU64,
@@ -208,7 +194,6 @@ impl RuntimeCore {
                 )),
                 simulation_status: Arc::new(RwLock::new(SimulationStatusStore::default())),
                 chain_status: Arc::new(RwLock::new(BTreeMap::new())),
-                simulation_task_store: Arc::new(RwLock::new(SimulationTaskStore::default())),
                 simulation_cache: Arc::new(RwLock::new(RemoteStateCache::default())),
                 simulation_http_client: reqwest::Client::new(),
                 live_rpc_feed_start_count: AtomicU64::new(0),
@@ -244,47 +229,27 @@ impl RuntimeCoreHandle {
     }
 
     pub fn builder_snapshot(&self) -> AssemblySnapshot {
-        self.inner
-            .builder_engine
-            .read()
-            .map(|guard| guard.snapshot())
-            .unwrap_or_default()
+        self.inner.builder_engine.read().snapshot()
     }
 
     pub fn builder_metrics(&self) -> AssemblyMetrics {
-        self.inner
-            .builder_engine
-            .read()
-            .map(|guard| guard.metrics())
-            .unwrap_or_default()
+        self.inner.builder_engine.read().metrics()
     }
 
     pub fn drop_metrics(&self) -> LiveRpcDropMetricsSnapshot {
-        self.inner
-            .drop_metrics
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        *self.inner.drop_metrics.read()
     }
 
     pub fn searcher_metrics(&self) -> LiveRpcSearcherMetricsSnapshot {
-        self.inner
-            .searcher_metrics
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        *self.inner.searcher_metrics.read()
     }
 
     pub fn simulation_metrics(&self) -> LiveRpcSimulationMetricsSnapshot {
-        self.inner
-            .simulation_metrics
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        *self.inner.simulation_metrics.read()
     }
 
     pub fn simulation_status(&self, id: &str) -> Option<LiveRpcSimulationStatusSnapshot> {
-        let store = self.inner.simulation_status.read().ok()?;
+        let store = self.inner.simulation_status.read();
         if id == "latest" {
             return store.latest.clone();
         }
@@ -308,19 +273,16 @@ impl RuntimeCoreHandle {
         self.inner
             .chain_status
             .read()
-            .map(|rows| {
-                rows.values()
-                    .cloned()
-                    .map(|mut status| {
-                        status.silent_for_ms = status.last_pending_unix_ms.and_then(|last_seen| {
-                            let elapsed_ms = now_unix_ms.saturating_sub(last_seen);
-                            u64::try_from(elapsed_ms).ok()
-                        });
-                        status
-                    })
-                    .collect::<Vec<_>>()
+            .values()
+            .cloned()
+            .map(|mut status| {
+                status.silent_for_ms = status.last_pending_unix_ms.and_then(|last_seen| {
+                    let elapsed_ms = now_unix_ms.saturating_sub(last_seen);
+                    u64::try_from(elapsed_ms).ok()
+                });
+                status
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn live_rpc_feed_start_count(&self) -> u64 {
@@ -333,124 +295,96 @@ impl RuntimeCoreHandle {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn reset_live_rpc_feed_start_count(&self) {
-        self.inner
-            .live_rpc_feed_start_count
-            .store(0, Ordering::Relaxed);
-    }
-
     pub fn reset_drop_metrics(&self) {
-        self.replace_drop_metrics(LiveRpcDropMetricsSnapshot::default());
+        *self.inner.drop_metrics.write() = LiveRpcDropMetricsSnapshot::default();
     }
 
     pub fn observe_drop_reason(&self, reason: LiveRpcDropReason) {
-        if let Ok(mut guard) = self.inner.drop_metrics.write() {
-            match reason {
-                LiveRpcDropReason::StorageQueueFull => {
-                    guard.storage_queue_full = guard.storage_queue_full.saturating_add(1);
-                }
-                LiveRpcDropReason::StorageQueueClosed => {
-                    guard.storage_queue_closed = guard.storage_queue_closed.saturating_add(1);
-                }
-                LiveRpcDropReason::InvalidPendingHash => {
-                    guard.invalid_pending_hash = guard.invalid_pending_hash.saturating_add(1);
-                }
+        let mut guard = self.inner.drop_metrics.write();
+        match reason {
+            LiveRpcDropReason::StorageQueueFull => {
+                guard.storage_queue_full = guard.storage_queue_full.saturating_add(1);
+            }
+            LiveRpcDropReason::StorageQueueClosed => {
+                guard.storage_queue_closed = guard.storage_queue_closed.saturating_add(1);
+            }
+            LiveRpcDropReason::InvalidPendingHash => {
+                guard.invalid_pending_hash = guard.invalid_pending_hash.saturating_add(1);
             }
         }
     }
 
-    pub fn replace_drop_metrics(&self, snapshot: LiveRpcDropMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.drop_metrics.write() {
-            *guard = snapshot;
-        }
-    }
-
     pub fn observe_searcher_batch(&self, executable: &[OpportunityRecord]) {
-        if let Ok(mut guard) = self.inner.searcher_metrics.write() {
-            let executable_count = executable.len() as u64;
+        let mut guard = self.inner.searcher_metrics.write();
+        let executable_count = executable.len() as u64;
 
-            guard.executable_batches_total = guard.executable_batches_total.saturating_add(1);
-            guard.executable_candidates_total = guard
-                .executable_candidates_total
-                .saturating_add(executable_count);
-            guard.executable_bundle_candidates_total =
-                guard.executable_bundle_candidates_total.saturating_add(
-                    executable
-                        .iter()
-                        .filter(|candidate| candidate.strategy == "BundleCandidate")
-                        .count() as u64,
-                );
-            guard.max_executable_candidates_in_batch = guard
-                .max_executable_candidates_in_batch
-                .max(executable_count);
+        guard.executable_batches_total = guard.executable_batches_total.saturating_add(1);
+        guard.executable_candidates_total = guard
+            .executable_candidates_total
+            .saturating_add(executable_count);
+        guard.executable_bundle_candidates_total =
+            guard.executable_bundle_candidates_total.saturating_add(
+                executable
+                    .iter()
+                    .filter(|candidate| candidate.strategy == "BundleCandidate")
+                    .count() as u64,
+            );
+        guard.max_executable_candidates_in_batch = guard
+            .max_executable_candidates_in_batch
+            .max(executable_count);
 
-            let executable_top_score = executable
-                .first()
-                .map_or(0, |candidate| candidate.score as u64);
-            guard.executable_top_score_total = guard
-                .executable_top_score_total
-                .saturating_add(executable_top_score);
-            guard.executable_only_candidates_total = guard
-                .executable_only_candidates_total
-                .saturating_add(executable_count);
-        }
-    }
-
-    pub fn replace_searcher_metrics(&self, snapshot: LiveRpcSearcherMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.searcher_metrics.write() {
-            *guard = snapshot;
-        }
+        let executable_top_score = executable
+            .first()
+            .map_or(0, |candidate| candidate.score as u64);
+        guard.executable_top_score_total = guard
+            .executable_top_score_total
+            .saturating_add(executable_top_score);
+        guard.executable_only_candidates_total = guard
+            .executable_only_candidates_total
+            .saturating_add(executable_count);
     }
 
     pub fn configure_simulation_queue(&self, queue_capacity: usize, worker_total: usize) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.queue_capacity = queue_capacity as u64;
-            guard.worker_total = worker_total as u64;
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.queue_capacity = queue_capacity as u64;
+        guard.worker_total = worker_total as u64;
     }
 
     pub fn observe_simulation_enqueue(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.enqueued_total = guard.enqueued_total.saturating_add(1);
-            guard.queue_depth = guard.queue_depth.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.enqueued_total = guard.enqueued_total.saturating_add(1);
+        guard.queue_depth = guard.queue_depth.saturating_add(1);
     }
 
     pub fn observe_simulation_dequeue(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.queue_depth = guard.queue_depth.saturating_sub(1);
-            guard.inflight_current = guard.inflight_current.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.queue_depth = guard.queue_depth.saturating_sub(1);
+        guard.inflight_current = guard.inflight_current.saturating_add(1);
     }
 
     pub fn observe_simulation_finish(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.inflight_current = guard.inflight_current.saturating_sub(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.inflight_current = guard.inflight_current.saturating_sub(1);
     }
 
     pub fn observe_simulation_queue_full_drop(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.queue_full_drop_total = guard.queue_full_drop_total.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.queue_full_drop_total = guard.queue_full_drop_total.saturating_add(1);
     }
 
     pub fn observe_simulation_stale_drop(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.stale_drop_total = guard.stale_drop_total.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.stale_drop_total = guard.stale_drop_total.saturating_add(1);
     }
 
     pub fn observe_simulation_cache_hit(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.cache_hit_total = guard.cache_hit_total.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.cache_hit_total = guard.cache_hit_total.saturating_add(1);
     }
 
     pub fn observe_simulation_cache_miss(&self) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.cache_miss_total = guard.cache_miss_total.saturating_add(1);
-        }
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.cache_miss_total = guard.cache_miss_total.saturating_add(1);
     }
 
     pub fn observe_simulation_result(
@@ -460,78 +394,63 @@ impl RuntimeCoreHandle {
         tx_count: usize,
         fail_category: Option<&str>,
     ) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            guard.completed_total = guard.completed_total.saturating_add(1);
-            guard.tx_total = guard.tx_total.saturating_add(tx_count as u64);
-            guard.last_latency_ms = latency_ms;
-            guard.max_latency_ms = guard.max_latency_ms.max(latency_ms);
-            guard.total_latency_ms = guard.total_latency_ms.saturating_add(latency_ms);
+        let mut guard = self.inner.simulation_metrics.write();
+        guard.completed_total = guard.completed_total.saturating_add(1);
+        guard.tx_total = guard.tx_total.saturating_add(tx_count as u64);
+        guard.last_latency_ms = latency_ms;
+        guard.max_latency_ms = guard.max_latency_ms.max(latency_ms);
+        guard.total_latency_ms = guard.total_latency_ms.saturating_add(latency_ms);
 
-            match status {
-                "ok" => {
-                    guard.ok_total = guard.ok_total.saturating_add(1);
-                }
-                "failed" => {
-                    guard.failed_total = guard.failed_total.saturating_add(1);
-                }
-                "state_error" => {
-                    guard.state_error_total = guard.state_error_total.saturating_add(1);
-                }
-                "timeout" => {
-                    guard.timeout_total = guard.timeout_total.saturating_add(1);
-                }
-                _ => {}
+        match status {
+            "ok" => {
+                guard.ok_total = guard.ok_total.saturating_add(1);
             }
-
-            if let Some(category) = fail_category {
-                match category {
-                    "revert" => {
-                        guard.revert_fail_total = guard.revert_fail_total.saturating_add(1);
-                    }
-                    "out_of_gas" => {
-                        guard.out_of_gas_fail_total = guard.out_of_gas_fail_total.saturating_add(1);
-                    }
-                    "nonce_mismatch" => {
-                        guard.nonce_mismatch_fail_total =
-                            guard.nonce_mismatch_fail_total.saturating_add(1);
-                    }
-                    "state_mismatch" => {
-                        guard.state_mismatch_fail_total =
-                            guard.state_mismatch_fail_total.saturating_add(1);
-                    }
-                    "state_rpc" => {
-                        guard.state_rpc_fail_total = guard.state_rpc_fail_total.saturating_add(1);
-                    }
-                    "state_timeout" => {
-                        guard.state_timeout_fail_total =
-                            guard.state_timeout_fail_total.saturating_add(1);
-                    }
-                    _ => {
-                        guard.unknown_fail_total = guard.unknown_fail_total.saturating_add(1);
-                    }
-                }
+            "failed" => {
+                guard.failed_total = guard.failed_total.saturating_add(1);
             }
+            "state_error" => {
+                guard.state_error_total = guard.state_error_total.saturating_add(1);
+            }
+            "timeout" => {
+                guard.timeout_total = guard.timeout_total.saturating_add(1);
+            }
+            _ => {}
         }
-    }
 
-    pub fn replace_simulation_metrics(&self, snapshot: LiveRpcSimulationMetricsSnapshot) {
-        if let Ok(mut guard) = self.inner.simulation_metrics.write() {
-            *guard = snapshot;
+        if let Some(category) = fail_category {
+            match category {
+                "revert" => {
+                    guard.revert_fail_total = guard.revert_fail_total.saturating_add(1);
+                }
+                "out_of_gas" => {
+                    guard.out_of_gas_fail_total = guard.out_of_gas_fail_total.saturating_add(1);
+                }
+                "nonce_mismatch" => {
+                    guard.nonce_mismatch_fail_total =
+                        guard.nonce_mismatch_fail_total.saturating_add(1);
+                }
+                "state_mismatch" => {
+                    guard.state_mismatch_fail_total =
+                        guard.state_mismatch_fail_total.saturating_add(1);
+                }
+                "state_rpc" => {
+                    guard.state_rpc_fail_total = guard.state_rpc_fail_total.saturating_add(1);
+                }
+                "state_timeout" => {
+                    guard.state_timeout_fail_total =
+                        guard.state_timeout_fail_total.saturating_add(1);
+                }
+                _ => {
+                    guard.unknown_fail_total = guard.unknown_fail_total.saturating_add(1);
+                }
+            }
         }
     }
 
     pub fn record_simulation_status(&self, snapshot: LiveRpcSimulationStatusSnapshot) {
-        if let Ok(mut guard) = self.inner.simulation_status.write() {
-            guard.latest = Some(snapshot.clone());
-            guard.by_id.insert(snapshot.id.clone(), snapshot);
-        }
-    }
-
-    pub fn clear_simulation_status(&self) {
-        if let Ok(mut guard) = self.inner.simulation_status.write() {
-            guard.latest = None;
-            guard.by_id.clear();
-        }
+        let mut guard = self.inner.simulation_status.write();
+        guard.latest = Some(snapshot.clone());
+        guard.by_id.insert(snapshot.id.clone(), snapshot);
     }
 
     pub fn cached_account_seed(
@@ -542,7 +461,7 @@ impl RuntimeCoreHandle {
         now_unix_ms: i64,
         ttl_ms: i64,
     ) -> Option<AccountSeed> {
-        let cache = self.inner.simulation_cache.read().ok()?;
+        let cache = self.inner.simulation_cache.read();
         let entry = cache
             .account_seeds
             .get(&(http_url.to_owned(), address))
@@ -564,99 +483,31 @@ impl RuntimeCoreHandle {
         cached_at_unix_ms: i64,
         seed: AccountSeed,
     ) {
-        if let Ok(mut cache) = self.inner.simulation_cache.write() {
-            cache.account_seeds.insert(
-                (http_url.to_owned(), address),
-                CachedAccountSeed {
-                    seed,
-                    block_number,
-                    cached_at_unix_ms,
-                },
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub fn clear_simulation_cache(&self) {
-        if let Ok(mut cache) = self.inner.simulation_cache.write() {
-            cache.account_seeds.clear();
-        }
-    }
-
-    pub fn replace_chain_status(&self, statuses: Vec<LiveRpcChainStatus>) {
-        if let Ok(mut guard) = self.inner.chain_status.write() {
-            guard.clear();
-            for status in statuses {
-                guard.insert(status.chain_key.clone(), status);
-            }
-        }
+        let mut cache = self.inner.simulation_cache.write();
+        cache.account_seeds.insert(
+            (http_url.to_owned(), address),
+            CachedAccountSeed {
+                seed,
+                block_number,
+                cached_at_unix_ms,
+            },
+        );
     }
 
     pub fn reset_chain_status(&self) {
-        if let Ok(mut guard) = self.inner.chain_status.write() {
-            guard.clear();
-        }
+        self.inner.chain_status.write().clear();
     }
 
     pub fn upsert_chain_status(&self, status: LiveRpcChainStatus) {
-        if let Ok(mut guard) = self.inner.chain_status.write() {
-            guard.insert(status.chain_key.clone(), status);
-        }
-    }
-
-    pub fn next_simulation_generation(&self, task_key: &str) -> u64 {
         self.inner
-            .simulation_task_store
-            .read()
-            .map(|store| store.current_generation(task_key).saturating_add(1).max(1))
-            .unwrap_or(1)
-    }
-
-    pub fn commit_simulation_enqueue(&self, task_key: &str, generation: u64, members: &[TxHash]) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.commit_enqueue(task_key, generation, members);
-        }
-    }
-
-    pub fn is_current_simulation_task(&self, task_key: &str, generation: u64) -> bool {
-        self.inner
-            .simulation_task_store
-            .read()
-            .map(|store| store.is_current(task_key, generation))
-            .unwrap_or(false)
-    }
-
-    pub fn invalidate_simulation_hash(&self, hash: TxHash) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.invalidate_hash(hash);
-        }
-    }
-
-    pub fn complete_simulation_task(&self, task_key: &str, generation: u64) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.complete_current(task_key, generation);
-        }
-    }
-
-    pub fn reset_simulation_task_state(&self) {
-        if let Ok(mut store) = self.inner.simulation_task_store.write() {
-            store.clear();
-        }
+            .chain_status
+            .write()
+            .insert(status.chain_key.clone(), status);
     }
 
     pub fn with_builder_engine_mut<R>(&self, f: impl FnOnce(&mut AssemblyEngine) -> R) -> R {
-        let mut guard = self
-            .inner
-            .builder_engine
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut guard = self.inner.builder_engine.write();
         f(&mut guard)
-    }
-
-    pub fn reset_builder_state(&self) {
-        if let Ok(mut guard) = self.inner.builder_engine.write() {
-            *guard = AssemblyEngine::new(builder::AssemblyConfig::default());
-        }
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -668,96 +519,6 @@ impl RuntimeCoreHandle {
 struct SimulationStatusStore {
     latest: Option<LiveRpcSimulationStatusSnapshot>,
     by_id: HashMap<String, LiveRpcSimulationStatusSnapshot>,
-}
-
-impl SimulationTaskStore {
-    fn current_generation(&self, task_key: &str) -> u64 {
-        self.task_generations.get(task_key).copied().unwrap_or(0)
-    }
-
-    fn replace_membership(&mut self, task_key: &str, members: &[TxHash]) {
-        if let Some(previous) = self
-            .task_members
-            .insert(task_key.to_owned(), members.to_vec())
-        {
-            for member in previous {
-                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                    keys.remove(task_key);
-                    if keys.is_empty() {
-                        self.tasks_by_member.remove(&member);
-                    }
-                }
-            }
-        }
-
-        for member in members {
-            self.tasks_by_member
-                .entry(*member)
-                .or_default()
-                .insert(task_key.to_owned());
-        }
-    }
-
-    fn commit_enqueue(&mut self, task_key: &str, generation: u64, members: &[TxHash]) {
-        self.task_generations
-            .insert(task_key.to_owned(), generation);
-        self.replace_membership(task_key, members);
-    }
-
-    fn is_current(&self, task_key: &str, generation: u64) -> bool {
-        self.current_generation(task_key) == generation
-    }
-
-    fn invalidate_hash(&mut self, hash: TxHash) {
-        let Some(task_keys) = self.tasks_by_member.remove(&hash) else {
-            return;
-        };
-
-        for task_key in task_keys {
-            let next_generation = self.current_generation(&task_key).saturating_add(1).max(1);
-            self.task_generations
-                .insert(task_key.clone(), next_generation);
-
-            if let Some(previous_members) = self.task_members.remove(&task_key) {
-                for member in previous_members {
-                    if member == hash {
-                        continue;
-                    }
-
-                    if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                        keys.remove(&task_key);
-                        if keys.is_empty() {
-                            self.tasks_by_member.remove(&member);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn complete_current(&mut self, task_key: &str, generation: u64) {
-        if !self.is_current(task_key, generation) {
-            return;
-        }
-
-        self.task_generations.remove(task_key);
-        if let Some(previous_members) = self.task_members.remove(task_key) {
-            for member in previous_members {
-                if let Some(keys) = self.tasks_by_member.get_mut(&member) {
-                    keys.remove(task_key);
-                    if keys.is_empty() {
-                        self.tasks_by_member.remove(&member);
-                    }
-                }
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.task_generations.clear();
-        self.task_members.clear();
-        self.tasks_by_member.clear();
-    }
 }
 
 fn current_unix_ms() -> i64 {
@@ -773,15 +534,17 @@ mod tests {
         RuntimeCore, RuntimeCoreConfig, RuntimeCoreDeps, RuntimeCoreStartArgs, RuntimeIngestMode,
     };
     use common::Address;
+    use parking_lot::RwLock;
     use scheduler::{SchedulerConfig, scheduler_channel};
     use sim_engine::AccountSeed;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use storage::{InMemoryStorage, StorageWriteHandle, StorageWriteOp};
     use tokio::sync::mpsc;
 
     #[test]
     fn runtime_core_starts_with_default_views() {
-        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, _runtime) =
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = mpsc::channel::<StorageWriteOp>(8);
         let args = RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {
@@ -853,7 +616,8 @@ mod tests {
     }
 
     fn make_runtime_core() -> super::RuntimeCoreHandle {
-        let (scheduler, _runtime) = scheduler_channel(SchedulerConfig::default());
+        let (scheduler, _runtime) =
+            scheduler_channel(SchedulerConfig::default()).expect("valid scheduler config");
         let (storage_tx, _storage_rx) = mpsc::channel::<StorageWriteOp>(8);
         RuntimeCore::start(RuntimeCoreStartArgs {
             deps: RuntimeCoreDeps {

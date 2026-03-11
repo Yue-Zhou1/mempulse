@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{Context, Result, anyhow};
 use event_log::EventEnvelope;
 use replay::{ReplayMode, replay_frames};

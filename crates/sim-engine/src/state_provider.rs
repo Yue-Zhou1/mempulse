@@ -1,4 +1,5 @@
-use anyhow::Result;
+use crate::Result;
+use auto_impl::auto_impl;
 use common::Address;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7,6 +8,7 @@ pub struct AccountSeed {
     pub nonce: u64,
 }
 
+#[auto_impl(&, Box, Arc)]
 pub trait StateProvider: Send + Sync {
     fn account_seed(&self, address: Address) -> Result<Option<AccountSeed>>;
 }

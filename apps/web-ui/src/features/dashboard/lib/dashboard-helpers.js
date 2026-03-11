@@ -442,6 +442,13 @@ export function paginationWindow(currentPage, totalPages, maxButtons = 5) {
   return pages;
 }
 
+export function resolvePerfNow() {
+  if (typeof globalThis?.performance?.now === 'function') {
+    return globalThis.performance.now();
+  }
+  return Date.now();
+}
+
 export function appendBoundedRows(targetRows, incomingRows, maxItems) {
   if (!Array.isArray(targetRows)) {
     return 0;

@@ -1,10 +1,16 @@
+#![forbid(unsafe_code)]
+
 mod mempool_state;
 
 use common::TxHash;
-use event_log::{EventEnvelope, EventPayload, sort_deterministic};
+#[cfg(test)]
+use event_log::EventPayload;
+use event_log::{EventEnvelope, sort_deterministic};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
+use std::sync::Arc;
 
 pub use mempool_state::{
     CandidateLifecycleEntry, CandidateLifecycleSnapshot, CandidateLifecycleState, MempoolState,
@@ -14,6 +20,20 @@ pub use mempool_state::{
 pub use sim_engine::{
     ChainContext as SimulationChainContext, SimulationBatchResult, TxSimulationResult,
 };
+
+type SharedError = Arc<dyn StdError + Send + Sync>;
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ReplayError {
+    #[error("checkpoint mismatch at seq {seq}: expected {expected:?}, got {actual:?}")]
+    CheckpointMismatch {
+        seq: u64,
+        expected: Box<[u8; 32]>,
+        actual: Box<[u8; 32]>,
+    },
+    #[error(transparent)]
+    Other(SharedError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayMode {
@@ -104,24 +124,7 @@ pub fn lifecycle_snapshot(
         .next()
 }
 
-pub fn candidate_lifecycle_snapshot(
-    events: &[EventEnvelope],
-    checkpoint_seq_id: u64,
-) -> Option<CandidateLifecycleSnapshot> {
-    let mut sorted = events.to_vec();
-    sort_deterministic(&mut sorted);
-
-    let mut state = CandidateLifecycleState::default();
-    for event in sorted {
-        state.apply_event(&event);
-        if event.seq_id == checkpoint_seq_id {
-            return Some(state.snapshot(event.seq_id));
-        }
-    }
-
-    None
-}
-
+#[must_use]
 pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     let mut pending_hashes = checkpoint.pending_hashes.clone();
     pending_hashes.sort_unstable();
@@ -139,6 +142,21 @@ pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     out
 }
 
+pub fn verify_lifecycle_checkpoint_hash(
+    checkpoint: &LifecycleCheckpoint,
+    expected: [u8; 32],
+) -> std::result::Result<[u8; 32], ReplayError> {
+    let actual = lifecycle_checkpoint_hash(checkpoint);
+    if actual != expected {
+        return Err(ReplayError::CheckpointMismatch {
+            seq: checkpoint.seq_id,
+            expected: Box::new(expected),
+            actual: Box::new(actual),
+        });
+    }
+    Ok(actual)
+}
+
 pub fn replay_from_checkpoint(
     events: &[EventEnvelope],
     checkpoint: &LifecycleCheckpoint,
@@ -147,6 +165,7 @@ pub fn replay_from_checkpoint(
     replay_deterministic_from_checkpoint(events, checkpoint, stride.max(1))
 }
 
+#[must_use = "diff summaries must be inspected by callers"]
 pub fn replay_diff_summary(
     events: &[EventEnvelope],
     from_seq_id: u64,
@@ -367,24 +386,6 @@ fn hash_sender_queues(hasher: &mut Sha256, sender_queues: &[ReplaySenderQueue]) 
             }
         }
     }
-}
-
-pub fn simulate_deterministic_window(
-    events: &[EventEnvelope],
-    chain_context: &SimulationChainContext,
-) -> anyhow::Result<SimulationBatchResult> {
-    let mut sorted = events.to_vec();
-    sort_deterministic(&mut sorted);
-
-    let decoded_txs = sorted
-        .into_iter()
-        .filter_map(|event| match event.payload {
-            EventPayload::TxDecoded(decoded) => Some(decoded),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    sim_engine::simulate_deterministic(chain_context, &decoded_txs)
 }
 
 pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLifecycleStatus> {
@@ -621,6 +622,31 @@ mod tests {
         assert_eq!(summary.added_pending, vec![hash(3)]);
         assert_eq!(summary.removed_pending, vec![hash(1)]);
         assert_ne!(summary.from_checkpoint_hash, summary.to_checkpoint_hash);
+    }
+
+    #[test]
+    fn verify_lifecycle_checkpoint_hash_returns_typed_mismatch_error() {
+        let checkpoint = LifecycleCheckpoint {
+            seq_id: 7,
+            pending_hashes: vec![hash(1), hash(2)],
+            sender_queues: Vec::new(),
+        };
+
+        let err = verify_lifecycle_checkpoint_hash(&checkpoint, [0_u8; 32])
+            .expect_err("checkpoint hash should mismatch");
+
+        match err {
+            ReplayError::CheckpointMismatch {
+                seq,
+                expected,
+                actual,
+            } => {
+                assert_eq!(seq, 7);
+                assert_eq!(*expected, [0_u8; 32]);
+                assert_eq!(*actual, lifecycle_checkpoint_hash(&checkpoint));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

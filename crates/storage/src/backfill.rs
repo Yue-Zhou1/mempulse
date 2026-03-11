@@ -1,7 +1,8 @@
 use crate::{EventStore, InMemoryStorage};
 use event_log::{EventEnvelope, sort_deterministic};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackfillConfig {
@@ -56,10 +57,8 @@ impl BackfillWriter {
                 continue;
             }
 
-            if let Ok(mut storage) = self.storage.write() {
-                storage.append_event(event);
-                summary.inserted = summary.inserted.saturating_add(1);
-            }
+            self.storage.write().append_event(event);
+            summary.inserted = summary.inserted.saturating_add(1);
         }
         summary
     }

@@ -1,5 +1,8 @@
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::ops::Deref;
 
 pub type TxHash = [u8; 32];
 pub type BlockHash = [u8; 32];
@@ -10,14 +13,131 @@ pub type PeerId = String;
 pub struct SourceId(pub String);
 
 impl SourceId {
+    #[inline]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl Display for SourceId {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CandidateId(pub String);
+
+impl CandidateId {
+    #[inline]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for CandidateId {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for CandidateId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for CandidateId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<CandidateId> for String {
+    fn from(value: CandidateId) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<str> for CandidateId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for CandidateId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StrategyId(pub String);
+
+impl StrategyId {
+    #[inline]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for StrategyId {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for StrategyId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for StrategyId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<StrategyId> for String {
+    fn from(value: StrategyId) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<str> for StrategyId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for StrategyId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 
@@ -71,6 +191,7 @@ pub struct AlertDecisions {
     pub queue_saturation: bool,
 }
 
+#[must_use]
 pub fn evaluate_alerts(
     snapshot: &MetricSnapshot,
     thresholds: &AlertThresholdConfig,
