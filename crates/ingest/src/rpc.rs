@@ -1,3 +1,5 @@
+//! RPC-backed pending transaction ingestion.
+
 use crate::IngestError;
 use ahash::RandomState;
 use auto_impl::auto_impl;
@@ -11,9 +13,13 @@ type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<T> = HashSet<T, RandomState>;
 type Result<T> = std::result::Result<T, IngestError>;
 
+/// Tuning knobs for the RPC pending-hash ingest loop.
 #[derive(Clone, Debug)]
 pub struct RpcIngestConfig {
+    /// Maximum number of hashes retained in the dedup cache across polls.
     pub max_seen_hashes: usize,
+    /// Maximum number of hashes accepted from a single pending-hash poll before
+    /// the remainder are dropped as backpressure.
     pub pending_batch_capacity: usize,
 }
 
@@ -26,6 +32,7 @@ impl Default for RpcIngestConfig {
     }
 }
 
+/// Raw transaction bytes fetched from the upstream RPC provider.
 #[derive(Clone, Debug)]
 pub struct RawTransaction {
     pub hash: TxHash,
@@ -33,18 +40,29 @@ pub struct RawTransaction {
     pub raw: Vec<u8>,
 }
 
+/// Source of pending hashes and optional full-transaction fetches.
+///
+/// The ingest service polls this trait to turn provider-specific behavior into
+/// canonical `TxSeen`, `TxFetched`, and `TxDecoded` events.
 #[auto_impl(&mut, Box)]
 pub trait PendingTxProvider {
+    /// Returns the next batch of pending hashes observed by the provider.
     fn pending_hashes(&mut self) -> Result<Vec<TxHash>>;
+    /// Optionally fetches the full transaction for one pending hash.
     fn fetch_transaction(&mut self, hash: TxHash) -> Result<Option<RawTransaction>>;
 }
 
+/// Clock abstraction used to stamp ingest events in a deterministic way during
+/// tests.
 #[auto_impl(&mut, Box)]
 pub trait IngestClock {
+    /// Returns the wall-clock timestamp used for event payloads.
     fn now_unix_ms(&mut self) -> i64;
+    /// Returns a monotonic timestamp used to preserve ingest ordering.
     fn now_mono_ns(&mut self) -> u64;
 }
 
+/// System clock implementation used by the real RPC ingest service.
 #[derive(Default)]
 pub struct SystemClock {
     monotonic_ns: u64,
@@ -65,6 +83,8 @@ impl IngestClock for SystemClock {
     }
 }
 
+/// Ingest service that polls an RPC source for pending hashes and emits
+/// canonical event-log envelopes.
 pub struct RpcIngestService<P, C> {
     provider: P,
     clock: C,
@@ -80,10 +100,12 @@ where
     P: PendingTxProvider,
     C: IngestClock,
 {
+    /// Creates a service with the default batch and dedup settings.
     pub fn new(provider: P, source_id: SourceId, clock: C) -> Self {
         Self::with_config(provider, source_id, clock, RpcIngestConfig::default())
     }
 
+    /// Creates a service with explicit ingest limits.
     pub fn with_config(
         provider: P,
         source_id: SourceId,
@@ -104,6 +126,8 @@ where
         }
     }
 
+    /// Processes one provider poll and returns ordered ingest events for the
+    /// accepted hashes.
     pub fn process_pending_batch(&mut self) -> Result<Vec<EventEnvelope>> {
         let mut events = Vec::new();
         let hashes = self
@@ -113,6 +137,9 @@ where
         let depth_current = hashes.len();
 
         for (idx, hash) in hashes.into_iter().enumerate() {
+            // Batch capacity is enforced on the raw poll result so a single
+            // oversized provider response cannot trigger unbounded downstream
+            // fetch work.
             if idx >= self.config.pending_batch_capacity {
                 events.push(self.new_event(EventPayload::TxDropped(TxDropped {
                     hash,
@@ -126,6 +153,8 @@ where
                 continue;
             }
 
+            // Dedup spans both the current batch and prior polls so repeated
+            // hashes do not refetch already-seen transactions.
             if !self.remember_hash(hash) {
                 events.push(self.new_event(EventPayload::TxDropped(TxDropped {
                     hash,
@@ -198,6 +227,7 @@ where
         }
         self.seen_order.push_back(hash);
 
+        // Keep dedup memory bounded by evicting the oldest accepted hashes.
         while self.seen_order.len() > self.config.max_seen_hashes {
             if let Some(oldest) = self.seen_order.pop_front() {
                 self.seen_hashes.remove(&oldest);
@@ -220,12 +250,15 @@ where
     }
 }
 
+/// In-memory provider used by tests and deterministic fixtures.
 pub struct InMemoryPendingTxProvider {
     batches: VecDeque<Vec<TxHash>>,
     tx_by_hash: FastMap<TxHash, RawTransaction>,
 }
 
 impl InMemoryPendingTxProvider {
+    /// Creates a provider from pre-seeded pending-hash batches and optional
+    /// full transactions keyed by hash.
     pub fn new(batches: Vec<Vec<TxHash>>, transactions: Vec<RawTransaction>) -> Self {
         let tx_by_hash = transactions.into_iter().map(|tx| (tx.hash, tx)).collect();
         Self {

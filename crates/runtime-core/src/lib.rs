@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Shared runtime state and metrics used by the live ingest pipeline and dashboard APIs.
+
 pub mod live_rpc;
 
 use anyhow::Result;
@@ -16,6 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use storage::{InMemoryStorage, OpportunityRecord, StorageWriteHandle};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Active ingest transport used by the runtime.
 pub enum RuntimeIngestMode {
     Rpc,
     P2p,
@@ -23,6 +26,7 @@ pub enum RuntimeIngestMode {
 }
 
 impl RuntimeIngestMode {
+    /// Returns the stable string label used by config and diagnostics.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rpc => "rpc",
@@ -33,6 +37,7 @@ impl RuntimeIngestMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Reasons a live-rpc transaction observation was dropped before durable persistence.
 pub enum LiveRpcDropReason {
     StorageQueueFull,
     StorageQueueClosed,
@@ -40,6 +45,7 @@ pub enum LiveRpcDropReason {
 }
 
 impl LiveRpcDropReason {
+    /// Returns the metric label for this drop reason.
     pub fn as_label(self) -> &'static str {
         match self {
             Self::StorageQueueFull => "storage_queue_full",
@@ -50,6 +56,7 @@ impl LiveRpcDropReason {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Aggregated drop counters for live-rpc ingest.
 pub struct LiveRpcDropMetricsSnapshot {
     pub storage_queue_full: u64,
     pub storage_queue_closed: u64,
@@ -57,6 +64,7 @@ pub struct LiveRpcDropMetricsSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Searcher-stage counters collected from executable opportunity batches.
 pub struct LiveRpcSearcherMetricsSnapshot {
     pub executable_batches_total: u64,
     pub executable_candidates_total: u64,
@@ -71,6 +79,7 @@ pub struct LiveRpcSearcherMetricsSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Queueing, execution, and failure counters for remote simulation work.
 pub struct LiveRpcSimulationMetricsSnapshot {
     pub enqueued_total: u64,
     pub completed_total: u64,
@@ -100,6 +109,7 @@ pub struct LiveRpcSimulationMetricsSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Latest per-simulation status view exposed to APIs and dashboards.
 pub struct LiveRpcSimulationStatusSnapshot {
     pub id: String,
     pub bundle_id: String,
@@ -113,6 +123,7 @@ pub struct LiveRpcSimulationStatusSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Health snapshot for one configured live-rpc chain.
 pub struct LiveRpcChainStatus {
     pub chain_key: String,
     pub chain_id: Option<u64>,
@@ -129,6 +140,7 @@ pub struct LiveRpcChainStatus {
     pub rotation_count: u64,
 }
 
+/// Core runtime dependencies supplied by the embedding application.
 pub struct RuntimeCoreDeps {
     pub storage: Arc<RwLock<InMemoryStorage>>,
     pub writer: StorageWriteHandle,
@@ -136,11 +148,13 @@ pub struct RuntimeCoreDeps {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Runtime-core feature toggles selected at startup.
 pub struct RuntimeCoreConfig {
     pub ingest_mode: RuntimeIngestMode,
     pub rebuild_scheduler_from_rpc: bool,
 }
 
+/// Startup arguments used to construct a `RuntimeCoreHandle`.
 pub struct RuntimeCoreStartArgs {
     pub deps: RuntimeCoreDeps,
     pub config: RuntimeCoreConfig,
@@ -158,6 +172,7 @@ struct RemoteStateCache {
     account_seeds: HashMap<(String, Address), CachedAccountSeed>,
 }
 
+/// Shared runtime state backing live ingest, simulation, and builder views.
 pub struct RuntimeCore {
     deps: RuntimeCoreDeps,
     config: RuntimeCoreConfig,
@@ -174,11 +189,13 @@ pub struct RuntimeCore {
 }
 
 #[derive(Clone)]
+/// Cloneable handle for accessing runtime-core state from tasks and APIs.
 pub struct RuntimeCoreHandle {
     inner: Arc<RuntimeCore>,
 }
 
 impl RuntimeCore {
+    /// Starts runtime-core with isolated state and returns a cloneable handle.
     pub fn start(args: RuntimeCoreStartArgs) -> Result<RuntimeCoreHandle> {
         Ok(RuntimeCoreHandle {
             inner: Arc::new(Self {
@@ -204,50 +221,62 @@ impl RuntimeCore {
 }
 
 impl RuntimeCoreHandle {
+    /// Returns the startup config currently in effect.
     pub fn config(&self) -> RuntimeCoreConfig {
         self.inner.config
     }
 
+    /// Returns the shared in-memory storage view.
     pub fn storage(&self) -> &Arc<RwLock<InMemoryStorage>> {
         &self.inner.deps.storage
     }
 
+    /// Returns the storage writer used for async persistence.
     pub fn writer(&self) -> &StorageWriteHandle {
         &self.inner.deps.writer
     }
 
+    /// Returns the scheduler handle owned by runtime-core.
     pub fn scheduler(&self) -> &SchedulerHandle {
         &self.inner.deps.scheduler
     }
 
+    /// Returns a snapshot of scheduler state.
     pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
         self.inner.deps.scheduler.snapshot()
     }
 
+    /// Returns scheduler metrics.
     pub fn scheduler_metrics(&self) -> SchedulerMetrics {
         self.inner.deps.scheduler.metrics()
     }
 
+    /// Returns the current builder candidate snapshot.
     pub fn builder_snapshot(&self) -> AssemblySnapshot {
         self.inner.builder_engine.read().snapshot()
     }
 
+    /// Returns builder metrics.
     pub fn builder_metrics(&self) -> AssemblyMetrics {
         self.inner.builder_engine.read().metrics()
     }
 
+    /// Returns live-rpc drop metrics.
     pub fn drop_metrics(&self) -> LiveRpcDropMetricsSnapshot {
         *self.inner.drop_metrics.read()
     }
 
+    /// Returns searcher metrics gathered during live-rpc processing.
     pub fn searcher_metrics(&self) -> LiveRpcSearcherMetricsSnapshot {
         *self.inner.searcher_metrics.read()
     }
 
+    /// Returns remote simulation metrics.
     pub fn simulation_metrics(&self) -> LiveRpcSimulationMetricsSnapshot {
         *self.inner.simulation_metrics.read()
     }
 
+    /// Returns a simulation status snapshot by id, or the latest one for `"latest"`.
     pub fn simulation_status(&self, id: &str) -> Option<LiveRpcSimulationStatusSnapshot> {
         let store = self.inner.simulation_status.read();
         if id == "latest" {
@@ -256,10 +285,12 @@ impl RuntimeCoreHandle {
         store.by_id.get(id).cloned()
     }
 
+    /// Returns the HTTP client shared by remote state and simulation helpers.
     pub fn simulation_http_client(&self) -> &reqwest::Client {
         &self.inner.simulation_http_client
     }
 
+    /// Returns monotonic nanoseconds since runtime-core startup.
     pub fn mono_ns(&self) -> u64 {
         self.inner
             .mono_epoch
@@ -268,6 +299,7 @@ impl RuntimeCoreHandle {
             .min(u64::MAX as u128) as u64
     }
 
+    /// Returns chain health snapshots with `silent_for_ms` populated relative to now.
     pub fn chain_status(&self) -> Vec<LiveRpcChainStatus> {
         let now_unix_ms = current_unix_ms();
         self.inner
@@ -285,20 +317,24 @@ impl RuntimeCoreHandle {
             .collect()
     }
 
+    /// Returns how many times the live-rpc feed has been started for this runtime instance.
     pub fn live_rpc_feed_start_count(&self) -> u64 {
         self.inner.live_rpc_feed_start_count.load(Ordering::Relaxed)
     }
 
+    /// Increments the live-rpc feed start counter.
     pub fn record_live_rpc_feed_start(&self) {
         self.inner
             .live_rpc_feed_start_count
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Resets all live-rpc drop counters.
     pub fn reset_drop_metrics(&self) {
         *self.inner.drop_metrics.write() = LiveRpcDropMetricsSnapshot::default();
     }
 
+    /// Records one live-rpc drop reason.
     pub fn observe_drop_reason(&self, reason: LiveRpcDropReason) {
         let mut guard = self.inner.drop_metrics.write();
         match reason {
@@ -314,6 +350,7 @@ impl RuntimeCoreHandle {
         }
     }
 
+    /// Records searcher-stage metrics for one executable batch.
     pub fn observe_searcher_batch(&self, executable: &[OpportunityRecord]) {
         let mut guard = self.inner.searcher_metrics.write();
         let executable_count = executable.len() as u64;
@@ -344,49 +381,58 @@ impl RuntimeCoreHandle {
             .saturating_add(executable_count);
     }
 
+    /// Updates the configured simulation queue size and worker count.
     pub fn configure_simulation_queue(&self, queue_capacity: usize, worker_total: usize) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.queue_capacity = queue_capacity as u64;
         guard.worker_total = worker_total as u64;
     }
 
+    /// Records that a simulation task was enqueued.
     pub fn observe_simulation_enqueue(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.enqueued_total = guard.enqueued_total.saturating_add(1);
         guard.queue_depth = guard.queue_depth.saturating_add(1);
     }
 
+    /// Records that a worker started processing one queued simulation task.
     pub fn observe_simulation_dequeue(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.queue_depth = guard.queue_depth.saturating_sub(1);
         guard.inflight_current = guard.inflight_current.saturating_add(1);
     }
 
+    /// Records that a simulation task finished executing.
     pub fn observe_simulation_finish(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.inflight_current = guard.inflight_current.saturating_sub(1);
     }
 
+    /// Records a simulation drop caused by a full queue.
     pub fn observe_simulation_queue_full_drop(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.queue_full_drop_total = guard.queue_full_drop_total.saturating_add(1);
     }
 
+    /// Records that a stale simulation result was discarded.
     pub fn observe_simulation_stale_drop(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.stale_drop_total = guard.stale_drop_total.saturating_add(1);
     }
 
+    /// Records one simulation cache hit.
     pub fn observe_simulation_cache_hit(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.cache_hit_total = guard.cache_hit_total.saturating_add(1);
     }
 
+    /// Records one simulation cache miss.
     pub fn observe_simulation_cache_miss(&self) {
         let mut guard = self.inner.simulation_metrics.write();
         guard.cache_miss_total = guard.cache_miss_total.saturating_add(1);
     }
 
+    /// Records the result and latency of one completed simulation batch.
     pub fn observe_simulation_result(
         &self,
         status: &str,
@@ -447,12 +493,14 @@ impl RuntimeCoreHandle {
         }
     }
 
+    /// Stores the latest simulation status snapshot and indexes it by id.
     pub fn record_simulation_status(&self, snapshot: LiveRpcSimulationStatusSnapshot) {
         let mut guard = self.inner.simulation_status.write();
         guard.latest = Some(snapshot.clone());
         guard.by_id.insert(snapshot.id.clone(), snapshot);
     }
 
+    /// Returns a cached account seed if it matches the requested block and TTL window.
     pub fn cached_account_seed(
         &self,
         http_url: &str,
@@ -475,6 +523,7 @@ impl RuntimeCoreHandle {
         Some(entry.seed)
     }
 
+    /// Stores an account seed for later simulation reuse.
     pub fn cache_account_seed(
         &self,
         http_url: &str,
@@ -494,10 +543,12 @@ impl RuntimeCoreHandle {
         );
     }
 
+    /// Clears all recorded chain health snapshots.
     pub fn reset_chain_status(&self) {
         self.inner.chain_status.write().clear();
     }
 
+    /// Inserts or replaces one chain health snapshot by chain key.
     pub fn upsert_chain_status(&self, status: LiveRpcChainStatus) {
         self.inner
             .chain_status
@@ -505,11 +556,13 @@ impl RuntimeCoreHandle {
             .insert(status.chain_key.clone(), status);
     }
 
+    /// Mutates the builder engine under the runtime-core lock.
     pub fn with_builder_engine_mut<R>(&self, f: impl FnOnce(&mut AssemblyEngine) -> R) -> R {
         let mut guard = self.inner.builder_engine.write();
         f(&mut guard)
     }
 
+    /// Shuts down runtime-core owned resources.
     pub async fn shutdown(self) -> Result<()> {
         Ok(())
     }

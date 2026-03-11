@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Production HTTP entrypoint for the `viz-api` server.
+
 use anyhow::Result;
 use node_runtime::{IngestMode, NodeRuntimeBuilder};
 use runtime_core::RuntimeIngestMode;

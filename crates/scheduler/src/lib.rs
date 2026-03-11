@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Sender-aware admission and simulation handoff queue for pending transactions.
+
 use common::{Address, CandidateId, SourceId, StrategyId, TxHash};
 use event_log::TxDecoded;
 use parking_lot::RwLock;
@@ -10,6 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Decoded transaction accepted by the scheduler admission pipeline.
 pub struct ValidatedTransaction {
     pub source_id: SourceId,
     pub observed_at_unix_ms: i64,
@@ -20,12 +23,14 @@ pub struct ValidatedTransaction {
 }
 
 impl ValidatedTransaction {
+    /// Returns the canonical transaction hash.
     pub fn hash(&self) -> TxHash {
         self.decoded.hash
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Admission and sender-queue limits enforced by the scheduler.
 pub struct SchedulerConfig {
     pub handoff_queue_capacity: usize,
     pub max_pending_per_sender: usize,
@@ -34,6 +39,7 @@ pub struct SchedulerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+/// Validation errors for scheduler configuration.
 pub enum SchedulerConfigError {
     #[error("handoff_queue_capacity must be >= 1, got 0")]
     HandoffQueueCapacityZero,
@@ -42,6 +48,7 @@ pub enum SchedulerConfigError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+/// Errors that can occur when constructing a scheduler from config and snapshots.
 pub enum SchedulerInitError {
     #[error(transparent)]
     Config(#[from] SchedulerConfigError),
@@ -60,6 +67,7 @@ impl Default for SchedulerConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Searcher candidate registered with the scheduler for simulation dispatch.
 pub struct SchedulerCandidate {
     pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
@@ -71,6 +79,7 @@ pub struct SchedulerCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Simulation job emitted for one candidate and target block generation.
 pub struct SimulationTaskSpec {
     pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
@@ -81,11 +90,13 @@ pub struct SimulationTaskSpec {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Result of registering candidates, including any simulation work to schedule.
 pub struct SchedulerCandidateDispatch {
     pub simulation_tasks: Vec<SimulationTaskSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Simulation result returned to the scheduler for candidate approval.
 pub struct SchedulerSimulationResult {
     pub candidate_id: CandidateId,
     pub tx_hash: TxHash,
@@ -97,36 +108,42 @@ pub struct SchedulerSimulationResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Candidate approved for handoff to the builder stage.
 pub struct SchedulerBuilderHandoff {
     pub candidate: SchedulerCandidate,
     pub block_number: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Outcome of applying one simulation result to scheduler state.
 pub struct SchedulerSimulationApplyOutcome {
     pub builder_handoffs: Vec<SchedulerBuilderHandoff>,
     pub stale_result_drop_total: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Human-readable view of a sender queue in the live scheduler snapshot.
 pub struct SenderQueueSnapshot {
     pub sender: Address,
     pub queued: Vec<ValidatedTransaction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Persisted sender queue entry used to rehydrate scheduler ordering.
 pub struct PersistedSenderQueueEntry {
     pub nonce: u64,
     pub hash: TxHash,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Persisted sender queue for one address.
 pub struct PersistedSenderQueueSnapshot {
     pub sender: Address,
     pub queued: Vec<PersistedSenderQueueEntry>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Snapshot payload used to rehydrate scheduler state after restart.
 pub struct PersistedSchedulerSnapshot {
     pub captured_at_unix_ms: i64,
     pub captured_at_mono_ns: u64,
@@ -140,6 +157,7 @@ pub struct PersistedSchedulerSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Live scheduler snapshot with pending, ready, blocked, and candidate views.
 pub struct SchedulerSnapshot {
     pub pending: Vec<ValidatedTransaction>,
     pub ready: Vec<ValidatedTransaction>,
@@ -149,6 +167,7 @@ pub struct SchedulerSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Runtime counters for scheduler admission, queueing, and simulation freshness.
 pub struct SchedulerMetrics {
     pub admitted_total: u64,
     pub duplicate_total: u64,
@@ -167,6 +186,7 @@ pub struct SchedulerMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Admission decision for one incoming transaction.
 pub enum SchedulerAdmission {
     Admitted,
     Duplicate,
@@ -176,18 +196,21 @@ pub enum SchedulerAdmission {
 }
 
 impl SchedulerAdmission {
+    /// Returns whether the transaction remained admitted after applying replacement logic.
     pub fn is_admitted(self) -> bool {
         matches!(self, Self::Admitted | Self::Replaced { .. })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Ready/blocked state for a transaction inside a sender queue.
 pub enum SchedulerQueueState {
     Ready,
     Blocked { expected_nonce: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Queue state transition emitted while admitting or replacing a transaction.
 pub struct SchedulerQueueTransition {
     pub hash: TxHash,
     pub sender: Address,
@@ -196,6 +219,7 @@ pub struct SchedulerQueueTransition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Admission outcome including the decision and any queue transitions.
 pub struct SchedulerAdmissionOutcome {
     pub admission: SchedulerAdmission,
     pub queue_transitions: Vec<SchedulerQueueTransition>,
@@ -226,12 +250,14 @@ enum SchedulerCommand {
 }
 
 #[derive(Clone, Debug)]
+/// Cloneable handle used by runtime tasks to interact with the scheduler actor.
 pub struct SchedulerHandle {
     ingress_tx: mpsc::Sender<SchedulerCommand>,
     shared: Arc<SharedState>,
 }
 
 impl SchedulerHandle {
+    /// Attempts to admit a transaction and returns both the decision and queue transitions.
     #[must_use = "scheduler admission outcomes must be handled to observe enqueue failures"]
     #[inline]
     pub async fn admit_outcome(
@@ -245,6 +271,7 @@ impl SchedulerHandle {
         .await
     }
 
+    /// Attempts to admit a transaction and returns only the admission decision.
     #[must_use = "scheduler admission results must be handled to observe enqueue failures"]
     #[inline]
     pub async fn admit(
@@ -256,6 +283,7 @@ impl SchedulerHandle {
             .map(|outcome| outcome.admission)
     }
 
+    /// Enqueues an admission command without waiting for the resulting decision.
     #[inline]
     pub fn try_admit(&self, tx: ValidatedTransaction) -> Result<(), SchedulerEnqueueError> {
         self.try_send_command(SchedulerCommand::Admit {
@@ -264,6 +292,7 @@ impl SchedulerHandle {
         })
     }
 
+    /// Registers candidates and returns the simulation tasks that should be scheduled.
     #[must_use = "candidate registration results must be handled to observe enqueue failures"]
     #[inline]
     pub async fn register_candidates(
@@ -277,6 +306,7 @@ impl SchedulerHandle {
         .await
     }
 
+    /// Applies a simulation result and returns any builder handoffs that became eligible.
     #[must_use = "simulation application results must be handled to observe enqueue failures"]
     #[inline]
     pub async fn apply_simulation_result(
@@ -290,6 +320,7 @@ impl SchedulerHandle {
         .await
     }
 
+    /// Invalidates any candidate tied to the provided transaction hash.
     #[must_use = "candidate invalidation results must be handled to observe enqueue failures"]
     #[inline]
     pub async fn invalidate_candidate_hash(
@@ -303,6 +334,7 @@ impl SchedulerHandle {
         .await
     }
 
+    /// Advances the scheduler head block and drops stale candidate generations.
     #[must_use = "head advancement results must be handled to observe enqueue failures"]
     #[inline]
     pub async fn advance_head(&self, block_number: u64) -> Result<(), SchedulerEnqueueError> {
@@ -350,16 +382,19 @@ impl SchedulerHandle {
     }
 
     #[must_use]
+    /// Returns a snapshot of the current scheduler state.
     pub fn snapshot(&self) -> SchedulerSnapshot {
         let state = self.shared.state.read();
         state.snapshot()
     }
 
+    /// Returns pending transactions matching the provided hashes.
     pub fn get_pending_transactions(&self, hashes: &[TxHash]) -> Vec<ValidatedTransaction> {
         let state = self.shared.state.read();
         state.pending_transactions(hashes)
     }
 
+    /// Captures a persisted snapshot suitable for restart-time rehydration.
     pub fn persisted_snapshot(
         &self,
         captured_at_unix_ms: i64,
@@ -371,6 +406,7 @@ impl SchedulerHandle {
         state.persisted_snapshot(captured_at_unix_ms, captured_at_mono_ns)
     }
 
+    /// Returns live scheduler metrics including ingress queue depth.
     pub fn metrics(&self) -> SchedulerMetrics {
         let state = self.shared.state.read();
         let handoff_queue_capacity = self.ingress_tx.max_capacity();
@@ -396,12 +432,14 @@ impl SchedulerHandle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Failure to enqueue a command onto the scheduler actor.
 pub enum SchedulerEnqueueError {
     QueueFull,
     QueueClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+/// Validation errors when reconstructing scheduler state from a persisted snapshot.
 pub enum SchedulerSnapshotError {
     #[error("duplicate pending transaction hash in snapshot: {hash:?}")]
     DuplicatePendingHash { hash: TxHash },
@@ -416,12 +454,14 @@ pub enum SchedulerSnapshotError {
 }
 
 #[derive(Debug)]
+/// Actor runtime that owns mutable scheduler state and processes ingress commands.
 pub struct SchedulerRuntime {
     ingress_rx: mpsc::Receiver<SchedulerCommand>,
     shared: Arc<SharedState>,
 }
 
 impl SchedulerRuntime {
+    /// Runs the scheduler actor loop until all senders are dropped.
     pub async fn run(mut self) {
         while let Some(command) = self.ingress_rx.recv().await {
             match command {
@@ -456,6 +496,7 @@ impl SchedulerRuntime {
     }
 }
 
+/// Creates a fresh scheduler actor and handle from validated config.
 pub fn scheduler_channel(
     config: SchedulerConfig,
 ) -> Result<(SchedulerHandle, SchedulerRuntime), SchedulerConfigError> {
@@ -466,6 +507,7 @@ pub fn scheduler_channel(
     ))
 }
 
+/// Rehydrates scheduler state from a persisted snapshot plus replay transactions.
 pub fn scheduler_channel_with_rehydration(
     config: SchedulerConfig,
     snapshot: Option<PersistedSchedulerSnapshot>,
@@ -477,6 +519,8 @@ pub fn scheduler_channel_with_rehydration(
         None => SchedulerState::default(),
     };
     for tx in replay_transactions {
+        // Replay transactions are re-admitted through the normal path so sender queues and
+        // replacement accounting are rebuilt exactly as they are during live ingest.
         let _ = state.admit(tx, config);
     }
     Ok(scheduler_channel_with_state(config, state))
@@ -503,6 +547,7 @@ fn scheduler_channel_with_state(
     )
 }
 
+/// Spawns the scheduler actor on the current Tokio runtime and returns the handle.
 pub fn spawn_scheduler_with_rehydration(
     config: SchedulerConfig,
     snapshot: Option<PersistedSchedulerSnapshot>,

@@ -1,6 +1,9 @@
+//! ClickHouse DDL helpers for the event storage schema.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Retention settings used when rendering ClickHouse schema DDL.
 pub struct ClickHouseSchemaConfig {
     pub retention_days: u16,
 }
@@ -11,6 +14,7 @@ impl Default for ClickHouseSchemaConfig {
     }
 }
 
+/// Returns the full ClickHouse DDL required by this crate.
 pub fn clickhouse_schema_ddl(config: ClickHouseSchemaConfig) -> Vec<String> {
     vec![
         "CREATE DATABASE IF NOT EXISTS mev_v2".to_owned(),
@@ -18,6 +22,7 @@ pub fn clickhouse_schema_ddl(config: ClickHouseSchemaConfig) -> Vec<String> {
     ]
 }
 
+/// Returns the ClickHouse DDL for the append-only events table.
 pub fn clickhouse_event_table_ddl(config: ClickHouseSchemaConfig) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS mev_v2.events (

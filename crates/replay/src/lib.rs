@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Deterministic replay and checkpoint helpers for persisted event streams.
+
 mod mempool_state;
 
 use common::TxHash;
@@ -24,6 +26,7 @@ pub use sim_engine::{
 type SharedError = Arc<dyn StdError + Send + Sync>;
 
 #[derive(Clone, Debug, thiserror::Error)]
+/// Errors produced while validating or replaying lifecycle checkpoints.
 pub enum ReplayError {
     #[error("checkpoint mismatch at seq {seq}: expected {expected:?}, got {actual:?}")]
     CheckpointMismatch {
@@ -36,12 +39,14 @@ pub enum ReplayError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Replay strategy used when deriving frames from an event stream.
 pub enum ReplayMode {
     DeterministicEventReplay,
     SnapshotReplay,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Materialized replay frame for one point in the event stream.
 pub struct ReplayFrame {
     pub seq_hi: u64,
     pub timestamp_unix_ms: i64,
@@ -51,6 +56,7 @@ pub struct ReplayFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Deterministic checkpoint of the pending set at a particular sequence id.
 pub struct LifecycleCheckpoint {
     pub seq_id: u64,
     pub pending_hashes: Vec<TxHash>,
@@ -59,6 +65,7 @@ pub struct LifecycleCheckpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Hash summary for a replay checkpoint.
 pub struct CheckpointHash {
     pub seq_id: u64,
     pub pending_count: usize,
@@ -66,6 +73,7 @@ pub struct CheckpointHash {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Diff between two lifecycle checkpoints.
 pub struct ReplayDiffSummary {
     pub from_seq_id: u64,
     pub to_seq_id: u64,
@@ -77,6 +85,7 @@ pub struct ReplayDiffSummary {
     pub removed_pending: Vec<TxHash>,
 }
 
+/// Replays an event stream into frames using the requested mode and stride.
 pub fn replay_frames(
     events: &[EventEnvelope],
     mode: ReplayMode,
@@ -88,6 +97,7 @@ pub fn replay_frames(
     }
 }
 
+/// Builds checkpoints for the requested sequence ids from a sorted event stream.
 pub fn lifecycle_checkpoints(
     events: &[EventEnvelope],
     checkpoint_seq_ids: &[u64],
@@ -115,6 +125,7 @@ pub fn lifecycle_checkpoints(
     out
 }
 
+/// Returns a single checkpoint snapshot for the requested sequence id.
 pub fn lifecycle_snapshot(
     events: &[EventEnvelope],
     checkpoint_seq_id: u64,
@@ -125,6 +136,7 @@ pub fn lifecycle_snapshot(
 }
 
 #[must_use]
+/// Computes a deterministic hash for a lifecycle checkpoint.
 pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     let mut pending_hashes = checkpoint.pending_hashes.clone();
     pending_hashes.sort_unstable();
@@ -142,6 +154,7 @@ pub fn lifecycle_checkpoint_hash(checkpoint: &LifecycleCheckpoint) -> [u8; 32] {
     out
 }
 
+/// Verifies that a checkpoint hashes to the expected value.
 pub fn verify_lifecycle_checkpoint_hash(
     checkpoint: &LifecycleCheckpoint,
     expected: [u8; 32],
@@ -157,6 +170,7 @@ pub fn verify_lifecycle_checkpoint_hash(
     Ok(actual)
 }
 
+/// Continues deterministic replay from a previously captured checkpoint.
 pub fn replay_from_checkpoint(
     events: &[EventEnvelope],
     checkpoint: &LifecycleCheckpoint,
@@ -166,6 +180,7 @@ pub fn replay_from_checkpoint(
 }
 
 #[must_use = "diff summaries must be inspected by callers"]
+/// Computes a pending-set diff between two sequence ids.
 pub fn replay_diff_summary(
     events: &[EventEnvelope],
     from_seq_id: u64,
@@ -289,6 +304,7 @@ fn replay_snapshot(events: &[EventEnvelope], stride: usize) -> Vec<ReplayFrame> 
     frames
 }
 
+/// Compares checkpoint parity between replayed frames and direct lifecycle reconstruction.
 pub fn lifecycle_parity(
     events: &[EventEnvelope],
     checkpoint_seq_ids: &[u64],
@@ -312,6 +328,7 @@ pub fn lifecycle_parity(
         .collect()
 }
 
+/// Emits deterministic checkpoint hashes at the given replay stride.
 pub fn deterministic_checkpoint_hashes(
     events: &[EventEnvelope],
     stride: usize,
@@ -326,6 +343,7 @@ pub fn deterministic_checkpoint_hashes(
         .collect()
 }
 
+/// Returns the percentage of matching checkpoint hashes between two event streams.
 pub fn checkpoint_hash_parity_percent(
     reference_events: &[EventEnvelope],
     candidate_events: &[EventEnvelope],
@@ -388,6 +406,7 @@ fn hash_sender_queues(hasher: &mut Sha256, sender_queues: &[ReplaySenderQueue]) 
     }
 }
 
+/// Returns the current lifecycle status for a transaction after replaying all events.
 pub fn current_lifecycle(events: &[EventEnvelope], hash: TxHash) -> Option<TxLifecycleStatus> {
     let mut sorted = events.to_vec();
     sort_deterministic(&mut sorted);

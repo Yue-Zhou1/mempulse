@@ -1,3 +1,5 @@
+//! Ingest pipelines for turning live mempool inputs into canonical event-log records.
+
 #![forbid(unsafe_code)]
 
 use common::TxHash;
@@ -11,12 +13,19 @@ pub mod tx_decode;
 
 type SharedError = Arc<dyn StdError + Send + Sync>;
 
+/// Errors returned by ingest services when they talk to upstream providers or
+/// normalize provider responses into internal events.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum IngestError {
+    /// The upstream pending-hash source could not be reached or responded with
+    /// an RPC-layer failure.
     #[error("RPC connection failed: {0}")]
     RpcConnect(SharedError),
+    /// A transaction-specific fetch failed after a hash had already been
+    /// accepted for processing.
     #[error("transaction fetch failed for {hash}: {source}")]
     TxFetch { hash: String, source: SharedError },
+    /// Any other ingest error that does not need a more specific label.
     #[error(transparent)]
     Other(SharedError),
 }

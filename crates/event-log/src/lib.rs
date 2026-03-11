@@ -1,9 +1,13 @@
+//! Canonical event contracts used to move transaction lifecycle data between
+//! ingest, runtime, storage, and replay components.
+
 #![forbid(unsafe_code)]
 
 use common::{Address, BlockHash, PeerId, SourceId, TxHash};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
+/// Top-level event envelope carrying ingest metadata and one typed payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub seq_id: u64,
@@ -14,6 +18,8 @@ pub struct EventEnvelope {
 }
 
 impl EventEnvelope {
+    /// Returns the deterministic ordering key used when events need a stable
+    /// sort independent of original insertion order.
     pub fn order_key(&self) -> EventOrderKey {
         EventOrderKey {
             seq_id: self.seq_id,
@@ -23,6 +29,7 @@ impl EventEnvelope {
     }
 }
 
+/// Monotonic sequencer for assigning globally ordered event ids.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalSequencer {
     next_seq_id: u64,
@@ -35,23 +42,27 @@ impl Default for GlobalSequencer {
 }
 
 impl GlobalSequencer {
+    /// Creates a sequencer that continues after the supplied latest sequence id.
     pub fn from_latest_seq_id(latest_seq_id: Option<u64>) -> Self {
         let next_seq_id = latest_seq_id.unwrap_or(0).saturating_add(1).max(1);
         Self { next_seq_id }
     }
 
+    /// Reserves and returns the next global sequence id.
     pub fn next_seq_id(&mut self) -> u64 {
         let seq_id = self.next_seq_id;
         self.next_seq_id = self.next_seq_id.saturating_add(1);
         seq_id
     }
 
+    /// Assigns the next sequence id to an event envelope.
     pub fn assign(&mut self, mut event: EventEnvelope) -> EventEnvelope {
         event.seq_id = self.next_seq_id();
         event
     }
 }
 
+/// Stable sort key for event envelopes.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct EventOrderKey {
     pub seq_id: u64,
@@ -59,6 +70,7 @@ pub struct EventOrderKey {
     pub hash: TxHash,
 }
 
+/// Canonical event payload variants emitted across the pipeline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
@@ -81,6 +93,7 @@ pub enum EventPayload {
 }
 
 impl EventPayload {
+    /// Returns the primary transaction hash associated with the payload.
     pub fn primary_hash(&self) -> TxHash {
         match self {
             EventPayload::TxSeen(e) => e.hash,
@@ -103,6 +116,7 @@ impl EventPayload {
     }
 }
 
+/// First observation of a transaction hash from an ingest source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxSeen {
     pub hash: TxHash,
@@ -111,12 +125,14 @@ pub struct TxSeen {
     pub seen_at_mono_ns: u64,
 }
 
+/// Notification that a full transaction payload was fetched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxFetched {
     pub hash: TxHash,
     pub fetched_at_unix_ms: i64,
 }
 
+/// Decoded transaction fields normalized for downstream consumers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxDecoded {
     pub hash: TxHash,
@@ -143,6 +159,7 @@ pub struct TxDecoded {
     pub calldata_len: Option<u32>,
 }
 
+/// Scheduler signal that a transaction is ready for execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxReady {
     pub hash: TxHash,
@@ -150,6 +167,7 @@ pub struct TxReady {
     pub nonce: u64,
 }
 
+/// Scheduler signal that a transaction is blocked behind a nonce gap.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxBlocked {
     pub hash: TxHash,
@@ -159,6 +177,7 @@ pub struct TxBlocked {
     pub expected_nonce: Option<u64>,
 }
 
+/// Searcher candidate produced from one or more transactions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateQueued {
     pub candidate_id: String,
@@ -184,6 +203,7 @@ pub struct CandidateQueued {
     pub detected_unix_ms: i64,
 }
 
+/// Simulation task dispatched for a searcher candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimDispatched {
     pub candidate_id: String,
@@ -193,6 +213,7 @@ pub struct SimDispatched {
     pub block_number: u64,
 }
 
+/// Opportunity detected for a transaction or bundle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OppDetected {
     pub hash: TxHash,
@@ -207,6 +228,7 @@ pub struct OppDetected {
     pub reasons: Vec<String>,
 }
 
+/// Completed simulation result attached to a transaction hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SimCompleted {
     pub hash: TxHash,
@@ -223,6 +245,7 @@ pub struct SimCompleted {
     pub tx_count: Option<u32>,
 }
 
+/// Builder assembly decision applied to one candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssemblyDecisionApplied {
     pub candidate_id: String,
@@ -235,6 +258,7 @@ pub struct AssemblyDecisionApplied {
     pub block_number: u64,
 }
 
+/// Relay submission result for a bundle or block template.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BundleSubmitted {
     pub hash: TxHash,
@@ -247,18 +271,21 @@ pub struct BundleSubmitted {
     pub strategy_version: String,
 }
 
+/// Replacement relation between two transaction hashes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxReplaced {
     pub hash: TxHash,
     pub replaced_by: TxHash,
 }
 
+/// Drop classification for a transaction hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxDropped {
     pub hash: TxHash,
     pub reason: String,
 }
 
+/// Confirmation record for a transaction hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxConfirmed {
     pub hash: TxHash,
@@ -266,6 +293,7 @@ pub struct TxConfirmed {
     pub block_hash: BlockHash,
 }
 
+/// Reorg record describing the block transition for a transaction hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxReorged {
     pub hash: TxHash,
@@ -273,10 +301,12 @@ pub struct TxReorged {
     pub new_block_hash: BlockHash,
 }
 
+/// Compares two events using the canonical deterministic order.
 pub fn cmp_deterministic(a: &EventEnvelope, b: &EventEnvelope) -> Ordering {
     a.order_key().cmp(&b.order_key())
 }
 
+/// Sorts a slice of events in canonical deterministic order.
 pub fn sort_deterministic(events: &mut [EventEnvelope]) {
     events.sort_by(cmp_deterministic);
 }

@@ -1,3 +1,5 @@
+//! In-memory state machines used by replay to reconstruct mempool and candidate lifecycles.
+
 use ahash::RandomState;
 use common::{Address, BlockHash, TxHash};
 use event_log::{EventEnvelope, EventPayload, TxBlocked, TxDecoded, TxDropped, TxReady, TxReorged};
@@ -9,12 +11,14 @@ type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<T> = HashSet<T, RandomState>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Replay-time queue state for a sender/nonce position.
 pub enum ReplayQueueState {
     Ready,
     Blocked { expected_nonce: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Queue entry emitted in replay snapshots.
 pub struct ReplaySenderQueueEntry {
     pub hash: TxHash,
     pub nonce: u64,
@@ -22,12 +26,14 @@ pub struct ReplaySenderQueueEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Replay snapshot of one sender queue.
 pub struct ReplaySenderQueue {
     pub sender: Address,
     pub queued: Vec<ReplaySenderQueueEntry>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Accumulated lifecycle data for one candidate across queueing, simulation, and assembly.
 pub struct CandidateLifecycleEntry {
     #[serde(default)]
     pub tx_hash: TxHash,
@@ -68,6 +74,7 @@ pub struct CandidateLifecycleEntry {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Candidate lifecycle snapshot captured at a particular sequence id.
 pub struct CandidateLifecycleSnapshot {
     pub seq_id: u64,
     #[serde(default)]
@@ -75,6 +82,7 @@ pub struct CandidateLifecycleSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Current replayed lifecycle status for a transaction hash.
 pub enum TxLifecycleStatus {
     Pending,
     Replaced {
@@ -94,6 +102,7 @@ pub enum TxLifecycleStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// State change emitted while applying one event to the replay model.
 pub enum StateTransition {
     Pending {
         hash: TxHash,
@@ -141,6 +150,7 @@ struct TxEntry {
 }
 
 #[derive(Clone, Debug, Default)]
+/// In-memory transaction lifecycle model reconstructed from event-log payloads.
 pub struct MempoolState {
     txs: FastMap<TxHash, TxEntry>,
     sender_queues: BTreeMap<Address, BTreeMap<u64, TxHash>>,
@@ -148,12 +158,14 @@ pub struct MempoolState {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Tracks lifecycle details for searcher candidates across downstream stages.
 pub struct CandidateLifecycleState {
     candidates: BTreeMap<String, CandidateLifecycleEntry>,
     tx_candidates: BTreeMap<TxHash, BTreeSet<String>>,
 }
 
 impl MempoolState {
+    /// Seeds replay state from a set of hashes that are already known to be pending.
     pub fn from_pending_hashes(pending_hashes: &[TxHash]) -> Self {
         let mut state = Self::default();
         for hash in pending_hashes {
@@ -170,6 +182,7 @@ impl MempoolState {
         state
     }
 
+    /// Seeds replay state from a checkpoint that already includes sender queue reconstruction.
     pub fn from_checkpoint(pending_hashes: &[TxHash], sender_queues: &[ReplaySenderQueue]) -> Self {
         let mut state = Self::from_pending_hashes(pending_hashes);
         for queue in sender_queues {
@@ -190,6 +203,7 @@ impl MempoolState {
         state
     }
 
+    /// Applies one event and returns the resulting transaction state transitions.
     pub fn apply_event(&mut self, event: &EventEnvelope) -> Vec<StateTransition> {
         match &event.payload {
             EventPayload::TxDecoded(decoded) => self.apply_decoded(decoded),
@@ -289,10 +303,12 @@ impl MempoolState {
         }
     }
 
+    /// Returns the replayed lifecycle for a transaction hash.
     pub fn lifecycle(&self, hash: &TxHash) -> Option<&TxLifecycleStatus> {
         self.txs.get(hash).map(|entry| &entry.status)
     }
 
+    /// Returns all hashes currently considered pending by the replay state.
     pub fn pending_hashes(&self) -> Vec<TxHash> {
         self.txs
             .iter()
@@ -303,6 +319,7 @@ impl MempoolState {
             .collect()
     }
 
+    /// Reconstructs sender queues with ready/blocked classification for pending transactions.
     pub fn sender_queues(&self) -> Vec<ReplaySenderQueue> {
         self.sender_queues
             .iter()
@@ -576,6 +593,7 @@ impl MempoolState {
 }
 
 impl CandidateLifecycleState {
+    /// Applies one event to the candidate lifecycle model.
     pub fn apply_event(&mut self, event: &EventEnvelope) {
         match &event.payload {
             EventPayload::CandidateQueued(queued) => {
@@ -637,6 +655,7 @@ impl CandidateLifecycleState {
         }
     }
 
+    /// Captures the current candidate lifecycle snapshot at the provided sequence id.
     pub fn snapshot(&self, seq_id: u64) -> CandidateLifecycleSnapshot {
         CandidateLifecycleSnapshot {
             seq_id,

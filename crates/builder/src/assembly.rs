@@ -1,3 +1,5 @@
+//! Candidate assembly logic for turning searcher output into block templates.
+
 use anyhow::Result;
 use common::TxHash;
 use searcher::{OpportunityCandidate, StrategyKind};
@@ -9,12 +11,14 @@ use std::time::{Duration, Instant};
 use crate::{BlockTemplate, RelayClient, RelayDryRunResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Distinguishes single-transaction candidates from synthesized bundles.
 pub enum AssemblyCandidateKind {
     Transaction,
     Bundle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Simulation approval metadata attached to an assembly candidate.
 pub struct SimulationApproval {
     pub sim_id: String,
     // This is currently audit metadata only. Runtime callers remain responsible for clearing
@@ -24,6 +28,7 @@ pub struct SimulationApproval {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Candidate inserted into the assembly engine after search and simulation.
 pub struct AssemblyCandidate {
     pub candidate_id: String,
     pub tx_hashes: Vec<TxHash>,
@@ -34,11 +39,13 @@ pub struct AssemblyCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Errors returned while converting a simulated opportunity into an assembly candidate.
 pub enum AssemblyCandidateBuildError {
     MissingSimulationResult { tx_hash: TxHash },
 }
 
 impl AssemblyCandidate {
+    /// Builds an assembly candidate by joining a ranked opportunity with its simulation results.
     pub fn from_simulated_opportunity(
         opportunity: &OpportunityCandidate,
         simulation: &SimulationBatchResult,
@@ -85,6 +92,7 @@ impl AssemblyCandidate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Limits applied while constructing the in-memory block template.
 pub struct AssemblyConfig {
     pub block_gas_limit: u64,
 }
@@ -98,6 +106,7 @@ impl Default for AssemblyConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Objective value for the currently selected candidate set.
 pub struct AssemblyObjective {
     pub total_priority_score: u64,
     pub total_gas_used: u64,
@@ -105,6 +114,7 @@ pub struct AssemblyObjective {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Snapshot of the active candidate set and its aggregate objective.
 pub struct AssemblySnapshot {
     pub candidates: Vec<AssemblyCandidate>,
     pub objective: AssemblyObjective,
@@ -112,6 +122,7 @@ pub struct AssemblySnapshot {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+/// Counters describing insert, reject, rollback, and latency behavior inside the engine.
 pub struct AssemblyMetrics {
     pub inserted_total: u64,
     pub replaced_total: u64,
@@ -129,6 +140,7 @@ pub struct AssemblyMetrics {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Context used to derive relay-facing block template metadata.
 pub struct RelayBuildContext {
     pub slot: u64,
     pub parent_hash: String,
@@ -136,6 +148,7 @@ pub struct RelayBuildContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Outcome of attempting to insert a candidate into the live assembly set.
 pub enum AssemblyDecision {
     Inserted {
         candidate_id: String,
@@ -148,6 +161,7 @@ pub enum AssemblyDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Outcome of removing a candidate from the live assembly set.
 pub enum AssemblyRollbackDecision {
     RolledBack { candidate_id: String },
     NotFound { candidate_id: String },
@@ -157,6 +171,7 @@ pub enum AssemblyRollbackDecision {
 // entries across block boundaries. Runtime callers should reset or roll back stale candidates
 // when the target block changes.
 #[derive(Clone, Debug, Default)]
+/// Maintains the best currently approved candidate set for a target block.
 pub struct AssemblyEngine {
     config: AssemblyConfig,
     candidates: Vec<AssemblyCandidate>,
@@ -164,6 +179,7 @@ pub struct AssemblyEngine {
 }
 
 impl AssemblyEngine {
+    /// Creates an empty assembly engine with the provided selection constraints.
     pub fn new(config: AssemblyConfig) -> Self {
         Self {
             config,
@@ -172,6 +188,7 @@ impl AssemblyEngine {
         }
     }
 
+    /// Attempts to insert a candidate and updates decision latency metrics.
     pub fn insert(&mut self, candidate: AssemblyCandidate) -> AssemblyDecision {
         let started_at = Instant::now();
         let decision = self.insert_inner(candidate);
@@ -179,6 +196,7 @@ impl AssemblyEngine {
         decision
     }
 
+    /// Removes a previously inserted candidate by id.
     pub fn remove_candidate(&mut self, candidate_id: &str) -> AssemblyRollbackDecision {
         let started_at = Instant::now();
         let decision = self.remove_candidate_inner(candidate_id);
@@ -186,6 +204,7 @@ impl AssemblyEngine {
         decision
     }
 
+    /// Returns the current candidate set and aggregate objective.
     pub fn snapshot(&self) -> AssemblySnapshot {
         AssemblySnapshot {
             candidates: self.candidates.clone(),
@@ -193,10 +212,12 @@ impl AssemblyEngine {
         }
     }
 
+    /// Returns cumulative engine metrics.
     pub fn metrics(&self) -> AssemblyMetrics {
         self.metrics
     }
 
+    /// Builds a relay-facing block template from the currently selected candidates.
     pub fn build_relay_template(&self, context: &RelayBuildContext) -> Option<BlockTemplate> {
         if self.candidates.is_empty() {
             return None;
@@ -216,6 +237,7 @@ impl AssemblyEngine {
         })
     }
 
+    /// Submits the current block template to a relay in dry-run mode when candidates exist.
     pub async fn submit_relay_dry_run(
         &self,
         context: &RelayBuildContext,

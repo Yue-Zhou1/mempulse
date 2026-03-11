@@ -1,3 +1,6 @@
+//! Searcher ranking pipeline for converting featured transactions into
+//! opportunity candidates.
+
 #![forbid(unsafe_code)]
 
 mod scoring;
@@ -14,15 +17,18 @@ pub use scoring::ScoreBreakdown as OpportunityScoreBreakdown;
 pub use scoring::scorer_version;
 pub use strategies::{StrategyKind, strategy_version};
 
+/// Searcher-facing transaction input with borrowed or owned calldata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearcherInputTx<'a> {
     pub decoded: TxDecoded,
     pub calldata: Cow<'a, [u8]>,
 }
 
+/// Owned variant of [`SearcherInputTx`].
 pub type OwnedSearcherInputTx = SearcherInputTx<'static>;
 
 impl<'a> SearcherInputTx<'a> {
+    /// Creates a searcher input that borrows calldata from the caller.
     pub fn borrowed(decoded: TxDecoded, calldata: &'a [u8]) -> Self {
         Self {
             decoded,
@@ -30,6 +36,7 @@ impl<'a> SearcherInputTx<'a> {
         }
     }
 
+    /// Creates a searcher input that owns its calldata buffer.
     pub fn owned(decoded: TxDecoded, calldata: Vec<u8>) -> OwnedSearcherInputTx {
         OwnedSearcherInputTx {
             decoded,
@@ -38,6 +45,7 @@ impl<'a> SearcherInputTx<'a> {
     }
 }
 
+/// Ranking thresholds for one searcher batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearcherConfig {
     pub min_score: u32,
@@ -53,6 +61,7 @@ impl Default for SearcherConfig {
     }
 }
 
+/// Ranked opportunity candidate emitted by the searcher.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OpportunityCandidate {
     pub tx_hash: TxHash,
@@ -68,6 +77,7 @@ pub struct OpportunityCandidate {
     pub reasons: Vec<String>,
 }
 
+/// Batch-level metrics produced during opportunity ranking.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearcherBatchMetrics {
     pub input_transactions: usize,
@@ -77,12 +87,15 @@ pub struct SearcherBatchMetrics {
     pub bundle_candidates_generated: usize,
 }
 
+/// Ranked searcher output plus batch-level metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearcherBatchResult {
     pub candidates: Vec<OpportunityCandidate>,
     pub metrics: SearcherBatchMetrics,
 }
 
+/// Ranks a batch of transactions into standalone and bundle opportunity
+/// candidates.
 pub fn rank_opportunity_batch(
     batch: &[SearcherInputTx<'_>],
     config: SearcherConfig,
@@ -152,6 +165,8 @@ fn build_bundle_candidates(inputs: &[BundleInput]) -> Vec<OpportunityCandidate> 
             continue;
         }
 
+        // Bundle candidates are synthesized from adjacent nonces by the same
+        // sender when the individual opportunities share the same market shape.
         let breakdown = ScoreBreakdown {
             mev_component: left
                 .candidate

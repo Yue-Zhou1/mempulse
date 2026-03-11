@@ -1,23 +1,32 @@
+//! Shared primitive types and alert-threshold helpers used across the workspace.
+
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
+/// Canonical 32-byte transaction hash.
 pub type TxHash = [u8; 32];
+/// Canonical 32-byte block hash.
 pub type BlockHash = [u8; 32];
+/// Canonical 20-byte EVM address.
 pub type Address = [u8; 20];
+/// Opaque peer identifier used by ingest and propagation tracking.
 pub type PeerId = String;
 
+/// Stable source label attached to every ingested event stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub String);
 
 impl SourceId {
+    /// Creates a new source identifier from any owned or borrowed string.
     #[inline]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// Returns the source identifier as a borrowed string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -36,11 +45,13 @@ impl Display for SourceId {
 pub struct CandidateId(pub String);
 
 impl CandidateId {
+    /// Creates a new candidate identifier.
     #[inline]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// Returns the candidate identifier as a borrowed string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -91,11 +102,13 @@ impl Deref for CandidateId {
 pub struct StrategyId(pub String);
 
 impl StrategyId {
+    /// Creates a new strategy identifier.
     #[inline]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    /// Returns the strategy identifier as a borrowed string slice.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -141,6 +154,7 @@ impl Deref for StrategyId {
     }
 }
 
+/// Threshold configuration for translating runtime metrics into alert booleans.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AlertThresholdConfig {
     pub peer_churn_spike: u32,
@@ -166,6 +180,7 @@ impl Default for AlertThresholdConfig {
     }
 }
 
+/// Snapshot of the operational metrics evaluated by the alert gate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MetricSnapshot {
     pub peer_disconnects_total: u64,
@@ -180,6 +195,7 @@ pub struct MetricSnapshot {
     pub queue_depth_capacity: u64,
 }
 
+/// Boolean alert outcomes derived from one metric snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AlertDecisions {
     pub peer_churn: bool,
@@ -192,6 +208,7 @@ pub struct AlertDecisions {
 }
 
 #[must_use]
+/// Evaluates whether a metric snapshot crosses any configured alert threshold.
 pub fn evaluate_alerts(
     snapshot: &MetricSnapshot,
     thresholds: &AlertThresholdConfig,

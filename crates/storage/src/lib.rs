@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! In-memory event storage, derived tables, and async persistence plumbing.
+
 mod backfill;
 mod clickhouse_schema;
 mod wal;
@@ -33,13 +35,16 @@ pub use clickhouse_schema::{
 };
 pub use wal::StorageWal;
 
+/// Hash map alias used for hot-path in-memory indices.
 pub type FastMap<K, V> = HashMap<K, V, RandomState>;
+/// Hash set alias used for hot-path in-memory indices.
 pub type FastSet<T> = HashSet<T, RandomState>;
 
 type Result<T> = std::result::Result<T, StorageError>;
 type SharedError = Arc<dyn StdError + Send + Sync>;
 
 #[derive(Clone, Debug, thiserror::Error)]
+/// Errors surfaced by storage, WAL, ClickHouse, and export operations.
 pub enum StorageError {
     #[error("WAL write failed: {0}")]
     WalWrite(SharedError),
@@ -82,6 +87,7 @@ impl StorageError {
 }
 
 #[derive(Clone, Debug)]
+/// Capacity limits for the in-memory storage model.
 pub struct StorageConfig {
     pub event_capacity: usize,
     pub recent_tx_capacity: usize,
@@ -101,6 +107,7 @@ impl Default for StorageConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Latest `TxSeen` projection for a transaction hash.
 pub struct TxSeenRecord {
     pub hash: TxHash,
     pub peer: PeerId,
@@ -110,6 +117,7 @@ pub struct TxSeenRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Full decoded transaction payload stored for query APIs.
 pub struct TxFullRecord {
     pub hash: TxHash,
     pub tx_type: u8,
@@ -128,6 +136,7 @@ pub struct TxFullRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Feature-engine projection stored alongside a transaction.
 pub struct TxFeaturesRecord {
     pub hash: TxHash,
     #[serde(default)]
@@ -142,6 +151,7 @@ pub struct TxFeaturesRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Searcher opportunity projection derived from candidate queue events.
 pub struct OpportunityRecord {
     pub tx_hash: TxHash,
     #[serde(default)]
@@ -158,6 +168,7 @@ pub struct OpportunityRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Builder-stage lifecycle projection for one candidate.
 pub struct BuilderLifecycleRecord {
     pub candidate_id: String,
     pub tx_hash: TxHash,
@@ -169,6 +180,7 @@ pub struct BuilderLifecycleRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Transaction lifecycle projection derived from event-log status changes.
 pub struct TxLifecycleRecord {
     pub hash: TxHash,
     pub status: String,
@@ -177,6 +189,7 @@ pub struct TxLifecycleRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Peer-level throughput and quality statistics.
 pub struct PeerStatsRecord {
     pub peer: PeerId,
     pub throughput_tps: u32,
@@ -185,6 +198,7 @@ pub struct PeerStatsRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Compact transaction summary used by recent-transaction views.
 pub struct RecentTransactionRecord {
     pub hash: TxHash,
     pub sender: Address,
@@ -195,6 +209,7 @@ pub struct RecentTransactionRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Aggregated feature bucket used by dashboard summary views.
 pub struct FeatureSummaryBucket {
     pub protocol: String,
     pub category: String,
@@ -202,6 +217,7 @@ pub struct FeatureSummaryBucket {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Coarse market-level counters derived from stored transaction features.
 pub struct MarketStatsSnapshot {
     pub total_signal_volume: u64,
     pub total_tx_count: u64,
@@ -215,6 +231,7 @@ fn default_feature_engine_version() -> String {
 }
 
 #[auto_impl(&mut, Box)]
+/// Minimal append/list/scan interface for ordered event stores.
 pub trait EventStore {
     fn append_event(&mut self, event: EventEnvelope);
     #[must_use]
@@ -225,11 +242,13 @@ pub trait EventStore {
     fn latest_seq_id(&self) -> Option<u64>;
 }
 
+/// Returns the first index containing events strictly after `from_seq_id`.
 pub fn scan_events_cursor_start(events: &[EventEnvelope], from_seq_id: u64) -> usize {
     events.partition_point(|event| event.seq_id <= from_seq_id)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Restart-time plan describing whether scheduler state can be rehydrated from storage.
 pub struct SchedulerRehydrationPlan {
     pub snapshot: Option<PersistedSchedulerSnapshot>,
     pub replay_events: Vec<EventEnvelope>,
@@ -237,6 +256,7 @@ pub struct SchedulerRehydrationPlan {
 }
 
 #[derive(Clone, Debug)]
+/// In-memory read model backed by ordered events plus derived lookup tables.
 pub struct InMemoryStorage {
     config: StorageConfig,
     events: VecDeque<EventEnvelope>,
@@ -275,20 +295,24 @@ impl Default for InMemoryStorage {
 
 impl InMemoryStorage {
     #[inline]
+    /// Creates storage with default capacities.
     pub fn new() -> Self {
         Self::default()
     }
 
     #[inline]
+    /// Returns the number of retained events.
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
     #[inline]
+    /// Returns whether no events are retained.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
+    /// Creates storage with normalized capacity settings.
     pub fn with_config(config: StorageConfig) -> Self {
         let config = StorageConfig {
             event_capacity: config.event_capacity.max(1),
@@ -328,6 +352,7 @@ impl InMemoryStorage {
         }
     }
 
+    /// Upserts the latest `TxSeen` projection for a hash.
     pub fn upsert_tx_seen(&mut self, record: TxSeenRecord) {
         let start = Instant::now();
         push_bounded_hash_indexed(
@@ -343,6 +368,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Upserts the latest full transaction projection for a hash.
     pub fn upsert_tx_full(&mut self, record: TxFullRecord) {
         let start = Instant::now();
         push_bounded_hash_indexed(
@@ -357,6 +383,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Upserts the latest feature projection and updates summary counters.
     pub fn upsert_tx_features(&mut self, record: TxFeaturesRecord) {
         let start = Instant::now();
         let mev_score = record.mev_score;
@@ -401,6 +428,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Stores a bounded opportunity projection.
     pub fn upsert_opportunity(&mut self, record: OpportunityRecord) {
         let start = Instant::now();
         push_bounded(&mut self.opportunities, record, self.config.table_capacity);
@@ -408,6 +436,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Stores a bounded builder lifecycle projection.
     pub fn upsert_builder_lifecycle(&mut self, record: BuilderLifecycleRecord) {
         let start = Instant::now();
         push_bounded(
@@ -419,6 +448,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Upserts the latest transaction lifecycle projection for a hash.
     pub fn upsert_tx_lifecycle(&mut self, record: TxLifecycleRecord) {
         let start = Instant::now();
         push_bounded_hash_indexed(
@@ -433,6 +463,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Stores peer statistics in a bounded table.
     pub fn upsert_peer_stats(&mut self, record: PeerStatsRecord) {
         let start = Instant::now();
         push_bounded(&mut self.peer_stats, record, self.config.table_capacity);
@@ -440,6 +471,7 @@ impl InMemoryStorage {
         self.bump_read_model_revision();
     }
 
+    /// Persists the most recent scheduler snapshot for restart-time rehydration.
     pub fn write_scheduler_snapshot(&mut self, snapshot: PersistedSchedulerSnapshot) {
         let start = Instant::now();
         self.scheduler_snapshot = Some(snapshot);
@@ -471,6 +503,7 @@ impl InMemoryStorage {
         self.tx_features_lookup.get(hash)
     }
 
+    /// Returns opportunities ordered from newest/highest priority in dashboard-friendly order.
     pub fn opportunities(&self) -> Vec<OpportunityRecord> {
         let mut out = self.opportunities.iter().cloned().collect::<Vec<_>>();
         out.sort_unstable_by(|a, b| {
@@ -486,6 +519,7 @@ impl InMemoryStorage {
         &self.builder_lifecycle
     }
 
+    /// Returns aggregated feature summary buckets sorted by count descending.
     pub fn dashboard_feature_summary(&self, limit: usize) -> Vec<FeatureSummaryBucket> {
         let target = limit.max(1);
         let mut out = self
@@ -524,6 +558,7 @@ impl InMemoryStorage {
         self.scheduler_snapshot.as_ref()
     }
 
+    /// Builds a restart plan describing whether scheduler state can be reused or must rebuild.
     pub fn scheduler_rehydration_plan(&self, max_finality_gap_ms: u64) -> SchedulerRehydrationPlan {
         let Some(snapshot) = self.scheduler_snapshot.clone() else {
             return SchedulerRehydrationPlan::default();
@@ -550,6 +585,7 @@ impl InMemoryStorage {
         }
     }
 
+    /// Returns recent unique transactions ordered by most recent observation.
     pub fn recent_transactions(&self, limit: usize) -> Vec<RecentTransactionRecord> {
         let target = limit.max(1);
         let mut out = Vec::with_capacity(target);
@@ -575,6 +611,7 @@ impl InMemoryStorage {
         out
     }
 
+    /// Returns the average write latency across the retained moving window.
     pub fn avg_write_latency_ns(&self) -> Option<u64> {
         if self.write_latency_ns.is_empty() {
             return None;
@@ -587,10 +624,12 @@ impl InMemoryStorage {
         )
     }
 
+    /// Returns the current market statistics snapshot.
     pub fn market_stats_snapshot(&self) -> MarketStatsSnapshot {
         self.market_stats
     }
 
+    /// Returns the read-model revision incremented on each storage mutation.
     pub fn read_model_revision(&self) -> u64 {
         self.read_model_revision
     }
@@ -665,7 +704,8 @@ impl EventStore for InMemoryStorage {
             );
         }
 
-        // Event append is the authority boundary; flat tables are derived here.
+        // Event append is the authority boundary; flat tables are derived here so replay and live
+        // ingest drive the same projection code path.
         if let EventPayload::CandidateQueued(queued) = &event.payload {
             self.upsert_opportunity(project_opportunity_from_candidate(queued));
         }
@@ -779,6 +819,7 @@ impl EventStore for InMemoryStorage {
 }
 
 #[derive(Clone, Debug)]
+/// Commands accepted by the async storage writer task.
 pub enum StorageWriteOp {
     AppendEvent(EventEnvelope),
     AppendPayload {
@@ -797,6 +838,7 @@ pub enum StorageWriteOp {
 }
 
 #[derive(Clone, Debug)]
+/// Queue and flushing settings for the async storage writer.
 pub struct StorageWriterConfig {
     pub queue_capacity: usize,
     pub flush_batch_size: usize,
@@ -816,21 +858,25 @@ impl Default for StorageWriterConfig {
 }
 
 #[derive(Clone)]
+/// Handle used by producers to enqueue writes into the storage writer task.
 pub struct StorageWriteHandle {
     tx: mpsc::Sender<StorageWriteOp>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Failure to enqueue a storage write without blocking.
 pub enum StorageTryEnqueueError {
     QueueFull,
     QueueClosed,
 }
 
 impl StorageWriteHandle {
+    /// Wraps an existing storage-writer sender.
     pub fn from_sender(tx: mpsc::Sender<StorageWriteOp>) -> Self {
         Self { tx }
     }
 
+    /// Enqueues a write, waiting for queue capacity if needed.
     pub async fn enqueue(&self, op: StorageWriteOp) -> AnyResult<()> {
         self.tx
             .send(op)
@@ -838,6 +884,7 @@ impl StorageWriteHandle {
             .map_err(|_| anyhow!("storage writer task is not running"))
     }
 
+    /// Attempts to enqueue a write without waiting.
     pub fn try_enqueue(
         &self,
         op: StorageWriteOp,
@@ -848,6 +895,7 @@ impl StorageWriteHandle {
         })
     }
 
+    /// Attempts to reserve queue capacity for a subsequent write.
     pub fn try_reserve(
         &self,
     ) -> std::result::Result<mpsc::Permit<'_, StorageWriteOp>, StorageTryEnqueueError> {
@@ -859,6 +907,7 @@ impl StorageWriteHandle {
 }
 
 #[async_trait]
+/// Sink for flushing event batches to external analytical storage.
 pub trait ClickHouseBatchSink: Send + Sync {
     async fn flush_event_batch(&self, events: Vec<EventEnvelope>) -> Result<()>;
 }
@@ -894,6 +943,7 @@ where
 }
 
 #[derive(Clone, Debug, Default)]
+/// No-op ClickHouse sink used when analytical export is disabled.
 pub struct NoopClickHouseSink;
 
 #[async_trait]
@@ -904,12 +954,14 @@ impl ClickHouseBatchSink for NoopClickHouseSink {
 }
 
 #[derive(Clone)]
+/// HTTP-backed ClickHouse sink that writes NDJSON batches.
 pub struct ClickHouseHttpSink {
     client: reqwest::Client,
     insert_url: String,
 }
 
 impl ClickHouseHttpSink {
+    /// Creates a ClickHouse sink for the given insert endpoint.
     pub fn new(insert_url: impl Into<String>) -> AnyResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -921,6 +973,7 @@ impl ClickHouseHttpSink {
         })
     }
 
+    /// Builds a sink from `CLICKHOUSE_EVENTS_INSERT_URL` when configured.
     pub fn from_env() -> AnyResult<Option<Self>> {
         let url = match std::env::var("CLICKHOUSE_EVENTS_INSERT_URL") {
             Ok(value) if !value.trim().is_empty() => value,
@@ -971,6 +1024,7 @@ impl ClickHouseBatchSink for ClickHouseHttpSink {
     }
 }
 
+/// Spawns the single storage writer task and returns its enqueue handle.
 pub fn spawn_single_writer(
     storage: Arc<RwLock<InMemoryStorage>>,
     sink: Arc<dyn ClickHouseBatchSink>,
@@ -1027,6 +1081,8 @@ pub fn spawn_single_writer(
 
                     {
                         let mut guard = storage.write();
+                        // Sequence assignment, WAL persistence, and read-model mutation happen in
+                        // one place so all producers observe the same ordering semantics.
                         apply_write_op(&mut guard, op, &mut batch, wal.as_ref(), &mut sequencer);
                     }
 
@@ -1176,10 +1232,12 @@ fn remove_event_from_sorted_index(events: &mut Vec<EventEnvelope>, target: &Even
     }
 }
 
+/// Serializes replay frames as pretty JSON.
 pub fn export_replay_frames_json(frames: &[ReplayFrame]) -> AnyResult<String> {
     serde_json::to_string_pretty(frames).map_err(|err| anyhow!(err))
 }
 
+/// Serializes replay frames as a simple CSV table.
 pub fn export_replay_frames_csv(frames: &[ReplayFrame]) -> String {
     let mut out = String::from("seq_hi,timestamp_unix_ms,pending_hashes\n");
     for frame in frames {
@@ -1197,6 +1255,7 @@ pub fn export_replay_frames_csv(frames: &[ReplayFrame]) -> String {
     out
 }
 
+/// Extension point for exporting replay frames to parquet-like formats.
 pub trait ParquetExporter {
     fn export_replay_frames_parquet(&self, _frames: &[ReplayFrame], _path: &str) -> Result<()> {
         Err(StorageError::parquet_export(std::io::Error::other(
@@ -1206,11 +1265,13 @@ pub trait ParquetExporter {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Placeholder exporter used when parquet support is unavailable.
 pub struct UnsupportedParquetExporter;
 
 impl ParquetExporter for UnsupportedParquetExporter {}
 
 #[derive(Clone, Debug, Default)]
+/// Minimal exporter that currently writes JSON payloads to a parquet-named file.
 pub struct ArrowParquetExporter;
 
 impl ParquetExporter for ArrowParquetExporter {

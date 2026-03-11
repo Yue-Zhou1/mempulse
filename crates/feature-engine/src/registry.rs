@@ -1,9 +1,12 @@
+//! Protocol registry loaded from JSON configuration.
+
 use common::Address;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::OnceLock;
 
+/// Error returned when loading or parsing the protocol registry.
 #[derive(Debug)]
 pub struct RegistryError(String);
 
@@ -15,6 +18,7 @@ impl Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+/// Address and selector based lookup table for protocol classification.
 #[derive(Debug)]
 pub struct ProtocolRegistry {
     by_address: HashMap<Address, &'static str>,
@@ -22,6 +26,7 @@ pub struct ProtocolRegistry {
 }
 
 impl ProtocolRegistry {
+    /// Parses a protocol registry from JSON configuration text.
     pub fn from_json(input: &str) -> Result<Self, RegistryError> {
         let parsed: RegistryConfig = serde_json::from_str(input)
             .map_err(|err| RegistryError(format!("invalid protocol registry json: {err}")))?;
@@ -50,6 +55,7 @@ impl ProtocolRegistry {
         })
     }
 
+    /// Returns the lazily loaded default mainnet protocol registry.
     pub fn default_mainnet() -> &'static Self {
         static REGISTRY: OnceLock<ProtocolRegistry> = OnceLock::new();
         REGISTRY.get_or_init(|| {
@@ -60,6 +66,8 @@ impl ProtocolRegistry {
         })
     }
 
+    /// Classifies a transaction by destination address first, then method
+    /// selector as a fallback.
     pub fn classify(&self, to: Option<Address>, selector: Option<[u8; 4]>) -> &'static str {
         if let Some(address) = to
             && let Some(protocol) = self.by_address.get(&address)
